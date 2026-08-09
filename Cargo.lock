@@ -761,6 +761,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "futures-util",
  "http",
  "miser-classifier",
  "miser-policy",

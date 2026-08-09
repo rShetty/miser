@@ -1,6 +1,8 @@
 mod auth;
 mod cache;
 
+use futures_util::{StreamExt, TryStreamExt};
+
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -10,7 +12,7 @@ use axum::{
 };
 use clap::Parser;
 use miser_classifier::Classifier;
-use miser_policy::{PolicyEngine, quality::deterministic_quality};
+use miser_policy::PolicyEngine;
 use miser_provider::{Provider, ProviderConfig, safe_response_headers};
 use miser_types::{ChatCompletionRequest, ComplexityTier, GatewayConfig};
 use serde_json::{Value, json};
@@ -185,78 +187,93 @@ async fn completions(
         }
     }
     let body = serde_json::to_value(&request).map_err(internal)?;
-    let mut upstream = state
+    let upstream = state
         .provider
         .forward(body.clone(), None)
         .await
         .map_err(internal)?;
-    let mut selected_route = route.clone();
-    if !stream_requested && upstream.status().is_success() && state.config.quality.enabled {
+    let selected_route = route.clone();
+    if !stream_requested && upstream.status().is_success() {
         let original_status = upstream.status();
         let original_headers = safe_response_headers(upstream.headers());
         let payload = upstream.bytes().await.map_err(internal)?;
-        if let Ok(response_json) = serde_json::from_slice::<Value>(&payload) {
-            let score = deterministic_quality(
-                &request,
-                &response_json,
-                &classification,
-                &state.config.quality,
-            );
-            if !score.passed && state.config.quality.escalate_on_failure {
-                if let Some(next_route) = state
-                    .policy
-                    .next(&request, &classification)
-                    .map_err(internal)?
-                {
-                    let mut retry_body = body;
-                    retry_body["model"] = Value::String(next_route.model.clone());
-                    if let Some(max_tokens) = next_route.max_tokens {
-                        retry_body["max_tokens"] = Value::from(max_tokens);
-                    }
-                    upstream = state
-                        .provider
-                        .forward(retry_body, None)
-                        .await
-                        .map_err(internal)?;
-                    selected_route = next_route;
-                } else {
-                    state.cache.store(
-                        cache_key,
-                        payload.clone(),
-                        original_status,
-                        original_headers.clone(),
-                    );
-                    let mut response = Response::builder().status(original_status);
-                    for (name, value) in &original_headers {
-                        response = response.header(name, value);
-                    }
-                    return response
-                        .header("x-miser-cache", HeaderValue::from_static("miss"))
-                        .body(axum::body::Body::from(payload))
-                        .map_err(internal);
-                }
-            } else {
-                state.cache.store(
-                    cache_key,
-                    payload.clone(),
-                    original_status,
-                    original_headers.clone(),
+        if let Ok(mut response_json) = serde_json::from_slice::<Value>(&payload) {
+            if let Some(obj) = response_json.as_object_mut() {
+                obj.insert(
+                    "x_miser".to_string(),
+                    json!({
+                        "tier": format_tier(classification.tier),
+                        "model": selected_route.model,
+                        "classifier": classification.classifier,
+                        "confidence": classification.confidence,
+                        "cache": "miss",
+                        "request_id": request_id,
+                    }),
                 );
-                let mut response = Response::builder().status(original_status);
-                for (name, value) in &original_headers {
-                    response = response.header(name, value);
-                }
-                return response
-                    .header("x-miser-cache", HeaderValue::from_static("miss"))
-                    .body(axum::body::Body::from(payload))
-                    .map_err(internal);
             }
+            let modified_payload =
+                serde_json::to_vec(&response_json).unwrap_or_else(|_| payload.to_vec());
+            state.cache.store(
+                cache_key,
+                modified_payload.clone().into(),
+                original_status,
+                original_headers.clone(),
+            );
+            let mut response = Response::builder().status(original_status);
+            for (name, value) in &original_headers {
+                response = response.header(name, value);
+            }
+            return response
+                .header(
+                    "x-miser-request-id",
+                    HeaderValue::from_str(&request_id).unwrap(),
+                )
+                .header("x-miser-cache", HeaderValue::from_static("miss"))
+                .header(
+                    "x-miser-tier",
+                    HeaderValue::from_str(&format_tier(classification.tier)).unwrap(),
+                )
+                .header(
+                    "x-miser-model",
+                    HeaderValue::from_str(&selected_route.model).unwrap(),
+                )
+                .header(
+                    "x-miser-classifier",
+                    HeaderValue::from_str(&classification.classifier).unwrap(),
+                )
+                .header(
+                    "x-miser-confidence",
+                    HeaderValue::from_str(&classification.confidence.to_string()).unwrap(),
+                )
+                .body(axum::body::Body::from(modified_payload))
+                .map_err(internal);
         } else {
             let mut response = Response::builder().status(original_status);
             for (name, value) in &original_headers {
                 response = response.header(name, value);
             }
             return response
+                .header(
+                    "x-miser-request-id",
+                    HeaderValue::from_str(&request_id).unwrap(),
+                )
+                .header("x-miser-cache", HeaderValue::from_static("miss"))
+                .header(
+                    "x-miser-tier",
+                    HeaderValue::from_str(&format_tier(classification.tier)).unwrap(),
+                )
+                .header(
+                    "x-miser-model",
+                    HeaderValue::from_str(&selected_route.model).unwrap(),
+                )
+                .header(
+                    "x-miser-classifier",
+                    HeaderValue::from_str(&classification.classifier).unwrap(),
+                )
+                .header(
+                    "x-miser-confidence",
+                    HeaderValue::from_str(&classification.confidence.to_string()).unwrap(),
+                )
                 .body(axum::body::Body::from(payload))
                 .map_err(internal);
         }
@@ -264,6 +281,14 @@ async fn completions(
     let status = upstream.status();
     let safe_headers = safe_response_headers(upstream.headers());
     let stream = upstream.bytes_stream();
+    let metadata_chunk = format!(
+        "data: {}\n\ndata: ",
+        json!({"x_miser": {"tier": format_tier(classification.tier), "model": selected_route.model, "classifier": classification.classifier, "confidence": classification.confidence, "cache": "miss", "request_id": request_id}})
+    );
+    let metadata_stream = futures_util::stream::once(async move {
+        Ok::<_, std::io::Error>(bytes::Bytes::from(metadata_chunk))
+    });
+    let combined = metadata_stream.chain(stream.map_err(std::io::Error::other));
     let mut response = Response::builder().status(status);
     for (name, value) in &safe_headers {
         response = response.header(name, value);
@@ -291,7 +316,7 @@ async fn completions(
             HeaderValue::from_str(&classification.confidence.to_string()).unwrap(),
         );
     response
-        .body(axum::body::Body::from_stream(stream))
+        .body(axum::body::Body::from_stream(combined))
         .map_err(internal)
 }
 

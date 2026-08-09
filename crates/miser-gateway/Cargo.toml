@@ -12,6 +12,7 @@ axum.workspace = true
 toml.workspace = true
 bytes.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 http.workspace = true
 miser-classifier = { path = "../miser-classifier" }
 miser-policy = { path = "../miser-policy" }
