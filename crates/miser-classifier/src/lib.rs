@@ -174,6 +174,7 @@ impl Classifier {
         request: &ChatCompletionRequest,
         started: Instant,
     ) -> ClassificationResult {
+        let classification_task = task(text);
         let mut reasons = Vec::new();
         let mut scores = [
             (ComplexityTier::Trivial, 0_i32),
@@ -208,6 +209,10 @@ impl Classifier {
             scores[2].1 += 2;
             reasons.push("structured-output".into());
         }
+        if classification_task == Some(TaskType::Coding) {
+            scores[2].1 += 5;
+            reasons.push("coding-task".into());
+        }
         let last = scores
             .iter()
             .max_by_key(|(_, score)| *score)
@@ -224,7 +229,7 @@ impl Classifier {
             "heuristic",
             reasons,
             started,
-            task(text),
+            classification_task,
         )
     }
 
@@ -306,7 +311,18 @@ fn override_tier(text: &str) -> Option<(ComplexityTier, String)> {
 
 fn task(text: &str) -> Option<TaskType> {
     let lower = text.to_lowercase();
-    if lower.contains("code") || lower.contains("implement") || lower.contains("function") {
+    if lower.contains("code")
+        || lower.contains("implement")
+        || lower.contains("function")
+        || lower.contains("python")
+        || lower.contains("typescript")
+        || lower.contains("debug")
+        || lower.contains("api")
+        || lower.contains("endpoint")
+        || lower.contains("retry")
+        || lower.contains("bug")
+        || lower.contains("rest")
+    {
         Some(TaskType::Coding)
     } else if lower.contains("prove") || lower.contains("derive") || lower.contains("algorithm") {
         Some(TaskType::Reasoning)
