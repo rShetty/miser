@@ -12,6 +12,10 @@ allow = [
   "ISC",
   "Unicode-3.0",
   "Zlib",
+  "CDLA-Permissive-2.0",
+  "MPL-2.0",
+  "OpenSSL",
+  "BSL-1.0",
 ]
 confidence-threshold = 0.8
 
