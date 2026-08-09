@@ -130,16 +130,31 @@ The VPS live benchmark runner is `scripts/completion_quality_vps.py` and records
 
 ### Comparison with other AI gateways
 
-Miser is compared against publicly documented 2026 gateway benchmarks. Gateway overhead and cost figures come from each vendor's own published benchmarks and community measurements.
+Miser is compared against publicly documented 2026 gateway benchmarks. Gateway overhead, cost, and latency figures come from each vendor's own published benchmarks and community measurements. Classification accuracy is from Miser's own VPS evaluation corpus.
 
-| Gateway | Language | Gateway overhead (p99) | Semantic caching | Cost per 1M requests | Classification routing | Open source |
-|---|---|---:|---|---:|---|---|
-| **Miser** | Rust | <1ms | Exact + TF-IDF similarity | ~$0.000175 | Heuristic + local LLM + cloud LLM + hybrid | MIT |
-| LiteLLM Rust (beta) | Rust | 0.7ms | Redis-backed | ~$0.000175 | No classification routing | MIT |
-| Portkey | Node.js | 2.3ms | Yes (hosted) | ~$0.001042 | No classification routing | Apache 2.0 (core) |
-| Bifrost | Rust | 4.5ms | No | ~$0.001008 | No classification routing | Proprietary |
-| LiteLLM Python | Python | 257.7ms | Redis-backed | ~$0.015354 | No classification routing | MIT |
-| OpenRouter | Hosted | 100-150ms | No (exact match only) | 5.5% markup on credits | Auto Router (NotDiamond) | No |
+| Gateway | Language | Gateway overhead (p99) | Classification accuracy | Classification latency (p50) | Semantic caching | Cost per 1M requests | Open source |
+|---|---|---:|---:|---:|---|---:|---|
+| **Miser** | Rust | <1ms | 92% exact / 92% adjacent | <1ms (heuristic) | Exact + TF-IDF similarity | ~$0.000175 | MIT |
+| LiteLLM Rust (beta) | Rust | 0.7ms | N/A (no classification) | N/A | Redis-backed | ~$0.000175 | MIT |
+| Portkey | Node.js | 2.3ms | N/A (no classification) | N/A | Yes (hosted) | ~$0.001042 | Apache 2.0 (core) |
+| Bifrost | Rust | 4.5ms | N/A (no classification) | N/A | No | ~$0.001008 | Proprietary |
+| LiteLLM Python | Python | 257.7ms | N/A (no classification) | N/A | Redis-backed | ~$0.015354 | MIT |
+| OpenRouter Auto | Hosted | 100-150ms | 52% exact / 84% adjacent (Miser corpus) | 4.16s (NotDiamond) | No (exact match only) | 5.5% markup on credits | No |
+| GPT-4.1-mini (fixed) | N/A | 0ms | N/A (single model) | N/A | No | Token cost only | N/A |
+
+Classification accuracy was measured on the same 25-case Miser evaluation corpus across heuristics, cloud LLM (GPT-4.1-mini as classifier), and OpenRouter Auto. Miser heuristics achieved 92% exact accuracy at sub-millisecond latency; OpenRouter Auto achieved 52% exact at 4.16s p50. No other gateway in this comparison performs per-request complexity classification, so their classification accuracy is marked N/A.
+
+Completion-quality benchmark (10 coding/reasoning/general/structured cases, VPS, 2026-08-09):
+
+| Strategy | Mean quality | Quality pass rate | p50 latency | p95 latency | p99 latency | Output tokens | Est. cost |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **Miser Auto** | **0.9667** | **90%** | 10.65s | 18.23s | 18.23s | 6,428 | $0.014 |
+| OpenRouter Auto | 0.9000 | 70% | 4.81s | 13.80s | 13.80s | 2,933 | $0.000* |
+| GPT-4.1-mini | 0.8583 | 70% | 8.89s | 28.85s | 28.85s | 3,441 | $0.005 |
+
+*OpenRouter Auto cost was not reliably calculable from provider metadata in this run.
+
+Miser led on quality and pass rate. Latency is higher due to quality escalation retries on ambiguous coding tasks; the semantic cache is expected to reduce repeat-request latency to <1ms on cache hits. Cost is higher because Miser routes to stronger models for quality-critical tasks; the cost-per-quality-point ratio improves when semantic caching eliminates repeated inference.
 
 Miser's differentiators:
 
