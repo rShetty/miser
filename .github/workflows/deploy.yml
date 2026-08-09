@@ -84,13 +84,15 @@ jobs:
 
             OPENROUTER_API_KEY="${{ secrets.OPENROUTER_API_KEY }}"
 
-            if [ ! -d /opt/miser ]; then
+            if [ ! -d /opt/miser/.git ]; then
+              rm -rf /opt/miser
               git clone https://github.com/rShetty/miser.git /opt/miser
             fi
 
             cd /opt/miser
             git fetch origin main
             git reset --hard origin/main
+            git clean -fd
 
             # Preserve existing env, update OPENROUTER_API_KEY
             if [ -f /etc/miser/miser.env ]; then
