@@ -20,9 +20,9 @@ base_url = "https://openrouter.ai/api/v1"
 timeout_ms = 1500
 
 [quality]
-enabled = true
+enabled = false
 minimum_score = 0.7
-escalate_on_failure = true
+escalate_on_failure = false
 
 [provider]
 base_url = "https://openrouter.ai/api/v1"

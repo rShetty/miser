@@ -210,7 +210,7 @@ impl Classifier {
             reasons.push("structured-output".into());
         }
         if classification_task == Some(TaskType::Coding) {
-            scores[2].1 += 5;
+            scores[2].1 += 10;
             reasons.push("coding-task".into());
         }
         let last = scores
