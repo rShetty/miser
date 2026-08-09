@@ -1,36 +1,46 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
-  <title id="title">Miser Gateway</title>
-  <desc id="desc">A sharp copper routing core inside a dark shield</desc>
+  <title id="title">Miser cost-saving AI gateway</title>
+  <desc id="desc">A shield gateway routing requests toward lower cost</desc>
   <defs>
-    <linearGradient id="bg" x1="64" y1="32" x2="448" y2="480" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#172033"/>
-      <stop offset="1" stop-color="#070B14"/>
+    <linearGradient id="shield" x1="78" y1="38" x2="431" y2="474" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1E293B"/>
+      <stop offset="1" stop-color="#090E1A"/>
     </linearGradient>
-    <linearGradient id="copper" x1="128" y1="96" x2="384" y2="416" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFCD70"/>
-      <stop offset=".45" stop-color="#F97316"/>
-      <stop offset="1" stop-color="#B42318"/>
-    </linearGradient>
-    <linearGradient id="cyan" x1="96" y1="128" x2="416" y2="384" gradientUnits="userSpaceOnUse">
+    <linearGradient id="edge" x1="84" y1="64" x2="428" y2="440" gradientUnits="userSpaceOnUse">
       <stop stop-color="#67E8F9"/>
-      <stop offset="1" stop-color="#0891B2"/>
+      <stop offset="1" stop-color="#0E7490"/>
     </linearGradient>
-    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur stdDeviation="9" result="blur"/>
+    <linearGradient id="coin" x1="146" y1="124" x2="356" y2="388" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFE29A"/>
+      <stop offset=".5" stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#C2410C"/>
+    </linearGradient>
+    <filter id="soft-glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
       <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
-    <clipPath id="shield"><path d="M256 24 452 92v145c0 123-78 208-196 251C138 445 60 360 60 237V92L256 24Z"/></clipPath>
+    <clipPath id="shield-clip"><path d="M256 24 444 91v146c0 119-73 207-188 251C141 444 68 356 68 237V91L256 24Z"/></clipPath>
   </defs>
-  <path d="M256 24 452 92v145c0 123-78 208-196 251C138 445 60 360 60 237V92L256 24Z" fill="url(#bg)" stroke="#334155" stroke-width="10"/>
-  <g clip-path="url(#shield)" opacity=".16" stroke="#67E8F9" stroke-width="2">
-    <path d="M0 160h512M0 256h512M0 352h512M160 0v512M256 0v512M352 0v512"/>
+  <path d="M256 24 444 91v146c0 119-73 207-188 251C141 444 68 356 68 237V91L256 24Z" fill="url(#shield)" stroke="url(#edge)" stroke-width="10"/>
+  <g clip-path="url(#shield-clip)" opacity=".14" stroke="#94A3B8" stroke-width="2">
+    <path d="M50 142h412M50 206h412M50 270h412M50 334h412M154 20v460M256 20v460M358 20v460"/>
   </g>
-  <path d="M116 168 196 88h120l80 80v176l-80 80H196l-80-80V168Z" fill="#0B1220" stroke="url(#cyan)" stroke-width="7" filter="url(#glow)"/>
-  <path d="M256 112 350 166v108l-94 54-94-54V166l94-54Z" fill="url(#copper)" stroke="#FFE7B3" stroke-width="5"/>
-  <path d="m256 146 58 34v68l-58 34-58-34v-68l58-34Z" fill="#111827" stroke="#FCA55B" stroke-width="4"/>
-  <path d="M256 164v103M208 193l96 55M304 193l-96 55" stroke="url(#cyan)" stroke-width="8" stroke-linecap="round"/>
-  <circle cx="256" cy="216" r="17" fill="#F8FAFC"/>
-  <path d="M92 256h76M344 256h76M256 72v56M256 384v56" stroke="url(#copper)" stroke-width="10" stroke-linecap="round"/>
-  <circle cx="92" cy="256" r="9" fill="#FFCD70"/><circle cx="420" cy="256" r="9" fill="#FFCD70"/>
-  <circle cx="256" cy="72" r="9" fill="#67E8F9"/><circle cx="256" cy="440" r="9" fill="#67E8F9"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" filter="url(#soft-glow)">
+    <path d="M101 185h78l38 38h79l38-38h78" stroke="#67E8F9" stroke-width="9"/>
+    <path d="M101 327h69l34-34h104l34 34h69" stroke="#38BDF8" stroke-width="9"/>
+    <path d="M256 88v55M256 369v55" stroke="#67E8F9" stroke-width="9"/>
+  </g>
+  <g fill="#E0F2FE" stroke="#22D3EE" stroke-width="5">
+    <circle cx="101" cy="185" r="12"/><circle cx="411" cy="185" r="12"/>
+    <circle cx="101" cy="327" r="12"/><circle cx="411" cy="327" r="12"/>
+    <circle cx="256" cy="88" r="12"/><circle cx="256" cy="424" r="12"/>
+  </g>
+  <circle cx="256" cy="238" r="90" fill="#020617" opacity=".9"/>
+  <circle cx="256" cy="238" r="86" fill="url(#coin)" stroke="#FEF3C7" stroke-width="7"/>
+  <circle cx="256" cy="238" r="68" fill="none" stroke="#B45309" stroke-width="4" opacity=".65"/>
+  <path d="M275 183c-7-7-16-10-28-10-18 0-30 9-30 23 0 15 11 21 35 27 23 6 34 13 34 29 0 16-14 26-35 26-15 0-27-5-38-15M256 158v160" fill="none" stroke="#FFF7D6" stroke-width="10" stroke-linecap="round"/>
+  <path d="M213 304h86" stroke="#FFF7D6" stroke-width="10" stroke-linecap="round"/>
+  <path d="M349 265 384 300l-35 35" fill="none" stroke="#FDE68A" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M384 300h-59" fill="none" stroke="#FDE68A" stroke-width="12" stroke-linecap="round"/>
+  <path d="M163 404c28 14 60 22 93 22s65-8 93-22" fill="none" stroke="#F59E0B" stroke-width="7" stroke-linecap="round" opacity=".8"/>
 </svg>
