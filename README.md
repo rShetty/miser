@@ -2,7 +2,9 @@
 
 Miser is an open-source, Rust-based AI gateway that routes OpenAI-compatible requests to the cheapest capable model through OpenRouter.
 
-![Miser Gateway](docs/icon.svg)
+<p align="center">
+  <img src="./docs/icon.svg?v=2" alt="Miser cost-saving AI gateway" width="220">
+</p>
 
 ## Documentation
 
