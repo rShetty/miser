@@ -29,12 +29,43 @@ jobs:
       - name: Scan tracked files for credentials
         shell: bash
         run: |
-          if git grep -n -I -E 'sk-(or-)?[A-Za-z0-9_-]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|OPENROUTER_API_KEY=[^r$<{[]' -- ':!README.md' ':!config/miser.env.example'; then
+          if git grep -n -I -E 'BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|OPENROUTER_API_KEY[[:space:]]*=[[:space:]]*(sk-|openrouter)' -- ':!.github/workflows/deploy.yml' ':!README.md' ':!config/miser.env.example'; then
             exit 1
           fi
 
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install security tooling
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+      - name: Cargo audit
+        run: cargo audit
+      - name: Cargo deny
+        run: cargo deny check advisories bans licenses sources
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
   deploy:
-    needs: verify
+    needs: [verify, security]
     runs-on: ubuntu-latest
     environment: production
     steps:
