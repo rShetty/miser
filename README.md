@@ -106,6 +106,28 @@ Run timestamp: 2026-08-09T09:48:53Z. The corpus contains trivial, simple, standa
 
 This is a **classification benchmark**, not a completion-quality benchmark. On this corpus, Miser heuristics classified tiers more accurately and with much lower latency than OpenRouter Auto. The completion-quality harness is `evals/quality_cases.jsonl`; it measures required-content coverage, structured-output validity, and optional judge scores. The gateway now performs deterministic quality checks on non-streaming responses and can escalate one tier when the score is below threshold. Local Qwen is not viable synchronously on this 2-vCPU CPU-only VPS. Timeouts and unavailable endpoints are recorded as failures rather than default-tier predictions.
 
+### Completion-quality benchmark
+
+A verified VPS run on 2026-08-09 used the same 10 coding, reasoning, general, and structured-output prompts for every strategy. GLM 5.2 was intentionally excluded from this run.
+
+| Strategy | Cases | Successes | Mean quality | Quality pass | p50 latency | p95 latency | Output tokens |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **Miser Auto** | 10 | 10 | **0.9667** | **90%** | 10.65s | 18.23s | 6,428 |
+| OpenRouter Auto | 10 | 10 | 0.9000 | 70% | 4.81s | 13.80s | 2,933 |
+| GPT-4.1-mini | 10 | 10 | 0.8583 | 70% | 8.89s | 28.85s | 3,441 |
+
+On this corpus, Miser produced the highest measured quality and pass rate, at the cost of higher latency and more output tokens. Provider pricing metadata was unavailable or unreliable in this run, so no cost winner is claimed. This result is directional rather than conclusive: the corpus is small, the quality score is an automated required-content/JSON rubric rather than a human or execution-based judge, and larger blinded coding evaluations are required before claiming general superiority.
+
+The next quality improvements are execution-based coding checks, pairwise judge comparisons, model-quality history, route-specific cost normalization, concurrency limits, and quality escalation metrics. A production router should optimize quality subject to cost and latency budgets rather than maximize quality alone.
+
+Run the offline quality harness:
+
+```bash
+cargo run -p miser-evals -- --quality evals/quality_cases.jsonl
+```
+
+The VPS live benchmark runner is `scripts/completion_quality_vps.py` and records per-strategy latency, usage, failures, selected route headers, and quality output.
+
 Run the VPS baseline:
 
 ```bash

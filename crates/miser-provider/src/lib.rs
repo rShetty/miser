@@ -7,12 +7,10 @@ use serde_json::{Map, Value};
 use std::time::Duration;
 use thiserror::Error;
 
-const SAFE_RESPONSE_HEADERS: [&str; 7] = [
+const SAFE_RESPONSE_HEADERS: [&str; 5] = [
     "content-type",
     "cache-control",
     "content-encoding",
-    "content-length",
-    "transfer-encoding",
     "x-request-id",
     "openrouter-processing-time",
 ];
