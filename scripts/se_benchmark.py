@@ -7,7 +7,7 @@ CASES = [json.loads(x) for x in (ROOT/'evals/se_quality_cases.jsonl').read_text(
 KEY = re.search(r'sk-[A-Za-z0-9_-]+', os.environ.get('OPENROUTER_API_KEY','')).group(0) if os.environ.get('OPENROUTER_API_KEY') else ''
 OR = 'https://openrouter.ai/api/v1/chat/completions'
 GATEWAY = 'http://127.0.0.1:8787/v1/chat/completions'
-MISER_KEY = os.environ.get('MISER_USER_KEY', 'miser_TBovBnnvjjyn0Ne92vsnVtYdUNZzXtH2UWXdTY2MrXL')
+MISER_KEY = os.environ.get('MISER_USER_KEY', '')
 MODELS = [('miser_auto', GATEWAY, 'auto', MISER_KEY), ('openrouter_auto', OR, 'openrouter/auto', KEY), ('gpt_4_1_mini', OR, 'openai/gpt-4.1-mini', KEY), ('glm_5_2', OR, 'z-ai/glm-5.2', KEY), ('claude_sonnet', OR, 'anthropic/claude-sonnet-4', KEY)]
 
 TIERS = ["trivial", "simple", "standard", "hard", "reasoning"]

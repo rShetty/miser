@@ -1,0 +1,13 @@
+title = "Miser Gitleaks Config"
+
+[allowlist]
+description = "Allowlisted paths and patterns"
+paths = [
+  '''prototypes/typescript/.*''',
+]
+regexes = [
+  '''MISER_USER_KEY''',
+  '''miser_local''',
+  '''replace-me''',
+  '''sk-or-v1-\.\.\.''',
+]
