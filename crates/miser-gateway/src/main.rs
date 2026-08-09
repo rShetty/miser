@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
         policy: PolicyEngine::new(config.clone()),
         provider: Provider::new(provider_config)?,
         cache: Arc::new(cache::ResponseCache::new(10000, 300)),
-        semantic_cache: Arc::new(semantic_cache::SemanticCache::new(1000, 300, 0.85)),
+        semantic_cache: Arc::new(semantic_cache::SemanticCache::new(1000, 300, 0.95)),
         config,
     };
     let address = format!("{}:{}", state.config.host, state.config.port);
