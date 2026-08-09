@@ -34,11 +34,11 @@ sort = "price"
 allow_fallbacks = true
 
 [tiers.trivial]
-model = "deepseek/deepseek-chat"
-max_tokens = 4096
+model = "openai/gpt-4.1-mini"
+max_tokens = 2048
 
 [tiers.simple]
-model = "deepseek/deepseek-chat"
+model = "openai/gpt-4.1-mini"
 max_tokens = 4096
 
 [tiers.standard]
