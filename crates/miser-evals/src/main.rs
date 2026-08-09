@@ -2,6 +2,8 @@ use clap::Parser;
 use miser_classifier::Classifier;
 use miser_types::{ChatCompletionRequest, ClassifierConfig, ClassifierMode, ComplexityTier};
 use serde::Deserialize;
+mod quality;
+
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -14,6 +16,8 @@ struct Args {
     corpus: String,
     #[arg(long, default_value = "heuristic")]
     mode: String,
+    #[arg(long)]
+    quality: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +30,9 @@ struct Case {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Some(path) = args.quality.as_deref() {
+        return quality::run(path);
+    }
     let mode = match args.mode.as_str() {
         "heuristic" => ClassifierMode::Heuristic,
         "local_llm" => ClassifierMode::LocalLlm,

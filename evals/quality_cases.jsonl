@@ -1,0 +1,10 @@
+{"id":"code-01","task":"coding","prompt":"Write a Python function `is_palindrome(value: str) -> bool` that ignores case and non-alphanumeric characters. Include a short explanation and three examples.","required":["def is_palindrome","isalnum","lower"]}
+{"id":"code-02","task":"coding","prompt":"Write a TypeScript function `groupBy<T>(items: T[], key: keyof T)` that returns a Record keyed by the selected property. Include types and an example.","required":["function groupBy","Record","keyof"]}
+{"id":"code-03","task":"coding","prompt":"Implement an HTTP retry helper with exponential backoff, a maximum of three attempts, and no retry for 4xx responses. Provide pseudocode and explain the policy.","required":["backoff","3","4xx"]}
+{"id":"code-04","task":"coding","prompt":"Find the bug conceptually: a cache uses a read lock while mutating its LRU list. Explain the race and give a safe correction.","required":["lock","race","LRU"]}
+{"id":"code-05","task":"coding","prompt":"Design a REST endpoint for cursor pagination. Specify request parameters, stable ordering, response shape, and handling an invalid cursor.","required":["cursor","limit","next","invalid"]}
+{"id":"general-01","task":"general","prompt":"Explain the difference between authentication and authorization with one concrete example of each.","required":["authentication","authorization"]}
+{"id":"general-02","task":"general","prompt":"Summarize why semantic caching can reduce LLM cost and identify one correctness risk.","required":["cache","cost","risk"]}
+{"id":"reasoning-01","task":"reasoning","prompt":"Explain why retrying a non-idempotent payment request can create duplicate charges and give two safeguards.","required":["idempot","duplicate","retry"]}
+{"id":"reasoning-02","task":"reasoning","prompt":"Give a concise proof that the sum of two odd integers is even.","required":["odd","2k","even"]}
+{"id":"structured-01","task":"structured","prompt":"Return JSON with keys `name`, `language`, and `safe`; use values Miser, Rust, and true.","required":["name","language","safe"]}

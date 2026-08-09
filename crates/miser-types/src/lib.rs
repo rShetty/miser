@@ -294,6 +294,8 @@ pub struct GatewayConfig {
     pub tiers: BTreeMap<ComplexityTier, TierModelRouteConfig>,
     pub provider: ProviderConfig,
     #[serde(default)]
+    pub quality: QualityConfig,
+    #[serde(default)]
     pub cache: CacheConfig,
     #[serde(flatten)]
     pub extra: ExtraFields,
@@ -304,6 +306,36 @@ fn default_host() -> String {
 }
 fn default_port() -> u16 {
     8787
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QualityConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_quality_threshold")]
+    pub minimum_score: f32,
+    #[serde(default)]
+    pub escalate_on_failure: bool,
+    #[serde(default)]
+    pub judge: Option<ClassifierEndpointConfig>,
+    #[serde(flatten)]
+    pub extra: ExtraFields,
+}
+
+impl Default for QualityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            minimum_score: 0.7,
+            escalate_on_failure: true,
+            judge: None,
+            extra: ExtraFields::new(),
+        }
+    }
+}
+
+fn default_quality_threshold() -> f32 {
+    0.7
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

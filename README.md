@@ -104,7 +104,7 @@ The Rust gateway was evaluated on the deployed VPS on 2026-08-09:
 
 Run timestamp: 2026-08-09T09:48:53Z. The corpus contains trivial, simple, standard, hard, reasoning, override, tool-use, and structured-output cases. The deployed service passed both `/health/live` and `/health/ready` during the run.
 
-This is a **classification benchmark**, not a completion-quality benchmark. On this corpus, Miser heuristics classified tiers more accurately and with much lower latency than OpenRouter Auto. That does not by itself prove routed answers are higher quality; the next evaluation must compare answer quality, cost, retries, and user-success rate against fixed-model and OpenRouter Auto baselines. Local Qwen is not viable synchronously on this 2-vCPU CPU-only VPS. Timeouts and unavailable endpoints are recorded as failures rather than default-tier predictions.
+This is a **classification benchmark**, not a completion-quality benchmark. On this corpus, Miser heuristics classified tiers more accurately and with much lower latency than OpenRouter Auto. The completion-quality harness is `evals/quality_cases.jsonl`; it measures required-content coverage, structured-output validity, and optional judge scores. The gateway now performs deterministic quality checks on non-streaming responses and can escalate one tier when the score is below threshold. Local Qwen is not viable synchronously on this 2-vCPU CPU-only VPS. Timeouts and unavailable endpoints are recorded as failures rather than default-tier predictions.
 
 Run the VPS baseline:
 

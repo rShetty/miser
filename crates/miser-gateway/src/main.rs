@@ -7,7 +7,7 @@ use axum::{
 };
 use clap::Parser;
 use miser_classifier::Classifier;
-use miser_policy::PolicyEngine;
+use miser_policy::{PolicyEngine, quality::deterministic_quality};
 use miser_provider::{Provider, ProviderConfig, safe_response_headers};
 use miser_types::{ChatCompletionRequest, ComplexityTier, GatewayConfig};
 use serde_json::{Value, json};
@@ -122,7 +122,11 @@ async fn completions(
         .classify(&request)
         .await
         .map_err(internal)?;
-    let route = state.policy.select(&classification).map_err(internal)?;
+    let route = state
+        .policy
+        .select(&request, &classification)
+        .map_err(internal)?;
+    let stream_requested = request.stream.unwrap_or(false);
     request.model = route.model.clone();
     if let Some(max_tokens) = route.max_tokens {
         request.max_tokens = Some(max_tokens);
@@ -130,8 +134,88 @@ async fn completions(
     if let Some(temperature) = route.temperature {
         request.temperature = Some(temperature);
     }
-    let body = serde_json::to_value(request).map_err(internal)?;
-    let upstream = state.provider.forward(body, None).await.map_err(internal)?;
+    let body = serde_json::to_value(&request).map_err(internal)?;
+    let initial_upstream = state
+        .provider
+        .forward(body.clone(), None)
+        .await
+        .map_err(internal)?;
+    let mut upstream = Some(initial_upstream);
+    let mut selected_route = route.clone();
+    if !stream_requested
+        && upstream
+            .as_ref()
+            .is_some_and(|response| response.status().is_success())
+        && state.config.quality.enabled
+    {
+        let original = upstream.take().expect("initial upstream response");
+        let original_status = original.status();
+        let original_headers = safe_response_headers(original.headers());
+        let payload = original.bytes().await.map_err(internal)?;
+        if let Ok(response_json) = serde_json::from_slice::<Value>(&payload) {
+            let score = deterministic_quality(
+                &request,
+                &response_json,
+                &classification,
+                &state.config.quality,
+            );
+            if !score.passed && state.config.quality.escalate_on_failure {
+                if let Some(next_route) = state
+                    .policy
+                    .next(&request, &classification)
+                    .map_err(internal)?
+                {
+                    let mut retry_body = body;
+                    retry_body["model"] = Value::String(next_route.model.clone());
+                    if let Some(max_tokens) = next_route.max_tokens {
+                        retry_body["max_tokens"] = Value::from(max_tokens);
+                    }
+                    upstream = Some(
+                        state
+                            .provider
+                            .forward(retry_body, None)
+                            .await
+                            .map_err(internal)?,
+                    );
+                    selected_route = next_route;
+                } else {
+                    let mut response = Response::builder().status(original_status);
+                    for (name, value) in &original_headers {
+                        response = response.header(name, value);
+                    }
+                    response = response
+                        .header(
+                            "x-miser-request-id",
+                            HeaderValue::from_str(&request_id).unwrap(),
+                        )
+                        .header(
+                            "x-miser-tier",
+                            HeaderValue::from_str(&format_tier(classification.tier)).unwrap(),
+                        )
+                        .header(
+                            "x-miser-model",
+                            HeaderValue::from_str(&route.model).unwrap(),
+                        )
+                        .header(
+                            "x-miser-classifier",
+                            HeaderValue::from_str(&classification.classifier).unwrap(),
+                        )
+                        .header(
+                            "x-miser-confidence",
+                            HeaderValue::from_str(&classification.confidence.to_string()).unwrap(),
+                        )
+                        .header(
+                            "x-miser-quality-score",
+                            HeaderValue::from_str(&score.score.to_string()).unwrap(),
+                        );
+                    return response
+                        .body(axum::body::Body::from(payload))
+                        .map_err(internal);
+                }
+            }
+        }
+    }
+    let upstream = upstream.expect("upstream response required");
     let status = upstream.status();
     let safe_headers = safe_response_headers(upstream.headers());
     let stream = upstream.bytes_stream();
@@ -150,7 +234,7 @@ async fn completions(
         )
         .header(
             "x-miser-model",
-            HeaderValue::from_str(&route.model).unwrap(),
+            HeaderValue::from_str(&selected_route.model).unwrap(),
         )
         .header(
             "x-miser-classifier",
