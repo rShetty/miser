@@ -90,6 +90,31 @@ cargo run -p miser-evals -- --mode heuristic
 
 The evaluator reports exact and adjacent-tier accuracy plus a confusion matrix. Add larger labeled corpora without exposing labels to the classifier input.
 
+### VPS benchmark
+
+The Rust gateway was evaluated on the deployed VPS on 2026-08-09:
+
+| Benchmark | Hardware | Cases | Exact | Adjacent | Classification cost |
+|---|---|---:|---:|---:|---:|
+| Rust heuristic classifier | 2 vCPU, 7.8 GiB RAM, 8 GiB swap, no GPU | 25 | 92.0% | 92.0% | $0 |
+
+The corpus contains trivial, simple, standard, hard, reasoning, override, tool-use, and structured-output cases. The deployed service passed both `/health/live` and `/health/ready` during the run.
+
+This is an offline classifier benchmark, not a completion-quality benchmark. Local-LLM and cloud-LLM scores must be reported separately after their endpoints are enabled; a timeout or unavailable endpoint must be recorded as a failure rather than counted as a default-tier prediction.
+
+Run the VPS baseline:
+
+```bash
+/usr/local/bin/miser-evals --corpus /opt/miser/evals/cases.jsonl --mode heuristic
+```
+
+Run configured model-assisted modes when available:
+
+```bash
+/usr/local/bin/miser-evals --corpus /opt/miser/evals/cases.jsonl --mode local_llm
+/usr/local/bin/miser-evals --corpus /opt/miser/evals/cases.jsonl --mode cloud_llm
+```
+
 ## Deployment
 
 The included `Dockerfile` creates a non-root image. `deploy/miser.service` provides a hardened systemd unit. Copy `config/miser.toml` and a mode-600 environment file containing `OPENROUTER_API_KEY` to the server.
