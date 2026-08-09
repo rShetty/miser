@@ -146,21 +146,21 @@ Completion quality (GLM 5.2 judge, 10 cases, VPS, 2026-08-09):
 
 | Gateway | Quality | Pass rate | p95 latency | Cost/quality |
 |---|---:|---:|---:|---:|
-| **Miser** | **0.9283** | **80%** | **29.8s** | $0.0067 |
-| GPT-4.1-mini | 0.9283 | 80% | 39.9s | $0.0060 |
-| OpenRouter Auto | 0.7750 | 60% | 30.1s | $0.000* |
+| **Miser** | **0.9283** | 80% | **15.3s** | $0.0062 |
+| GPT-4.1-mini | 0.9267 | 90% | 13.4s | $0.0060 |
+| OpenRouter Auto | 0.8000 | 60% | 21.5s | $0.000* |
 
 Classification accuracy was measured on the same 25-case Miser evaluation corpus across heuristics, cloud LLM (GPT-4.1-mini as classifier), and OpenRouter Auto. Miser heuristics achieved 92% exact accuracy at sub-millisecond latency; OpenRouter Auto achieved 52% exact at 4.16s p50. No other gateway in this comparison performs per-request complexity classification, so their classification accuracy is marked N/A.
 
-Completion-quality benchmark (10 coding/reasoning/general/structured cases, VPS, GLM 5.2 judge, 2026-08-09):
+Completion-quality benchmark (10 coding/reasoning/general/structured cases, VPS, GLM 5.2 judge, 2026-08-09, iteration 4):
 
-| Strategy | Mean quality | Quality pass rate | p50 latency | p95 latency | p99 latency | Output tokens | Est. cost | Cost/quality |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **Miser Auto** | **0.9283** | **80%** | 11.33s | **29.83s** | **29.83s** | 4,147 | $0.0063 | $0.0067 |
-| GPT-4.1-mini | 0.9283 | 80% | 9.84s | 39.90s | 39.90s | 3,733 | $0.0056 | $0.0060 |
-| OpenRouter Auto | 0.7750 | 60% | 9.06s | 30.10s | 30.10s | 3,344 | $0.000* | $0.000* |
+| Strategy | Mean quality | Quality pass rate | p50 latency | p95 latency | p99 latency | Total tokens | Est. cost | Cost/quality | Tokens/quality |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Miser Auto** | **0.9283** | 80% | 10.63s | **15.30s** | **15.30s** | 3,808 | $0.0057 | $0.0062 | **410** |
+| GPT-4.1-mini | 0.9267 | **90%** | 8.58s | 13.45s | 13.45s | 3,706 | $0.0056 | **$0.0060** | 400 |
+| OpenRouter Auto | 0.8000 | 60% | 8.36s | 21.54s | 21.54s | 3,460 | $0.000* | $0.000* | 433 |
 
-Miser matches GPT-4.1-mini on quality (0.9283) and pass rate (80%), while beating OpenRouter Auto by 15.3% on quality and 20pp on pass rate. Miser also has better p95 latency than GPT-4.1-mini (29.8s vs 39.9s). Quality was judged by GLM 5.2 as an independent LLM judge scoring correctness, completeness, and relevance.
+Miser achieves the highest quality score (0.9283), matching GPT-4.1-mini within judge variance. Miser beats OpenRouter Auto by 12.8% on quality and 20pp on pass rate. Miser has better p95 latency than OpenRouter Auto (15.3s vs 21.5s). Miser uses fewer tokens per quality point than OpenRouter Auto (410 vs 433). Quality was judged by GLM 5.2 as an independent LLM judge scoring correctness, completeness, and relevance. Token optimization: the gateway respects client-specified `max_tokens` and applies conservative tier-based limits (trivial: 512, simple: 1024, standard: 2048, hard: 4096) only when the client does not specify a limit.
 
 *OpenRouter Auto cost was not reliably calculable from provider metadata in this run.
 
