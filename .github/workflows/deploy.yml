@@ -77,9 +77,10 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
         run: |
           install -d -m 700 ~/.ssh
-          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+          ssh-keyscan -t ed25519 -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh -o StrictHostKeyChecking=no -o BatchMode=yes "${{ secrets.VPS_USER }}@${VPS_HOST}" 'echo SSH_OK'
       - name: Upload source
         shell: bash
         env:
@@ -87,7 +88,7 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
           tar --exclude=.git --exclude=.env --exclude=target -czf /tmp/miser-source.tgz .
-          scp /tmp/miser-source.tgz "${VPS_USER}@${VPS_HOST}:/tmp/miser-source.tgz"
+          scp -o StrictHostKeyChecking=no /tmp/miser-source.tgz "${VPS_USER}@${VPS_HOST}:/tmp/miser-source.tgz"
       - name: Build and restart gateway
         shell: bash
         env:
@@ -95,8 +96,8 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          printf '%s' "$OPENROUTER_API_KEY" | ssh "${VPS_USER}@${VPS_HOST}" 'umask 077; cat > /tmp/openrouter.key'
-          ssh "${VPS_USER}@${VPS_HOST}" 'bash -s' -- /tmp/openrouter.key <<'REMOTE'
+          printf '%s' "$OPENROUTER_API_KEY" | ssh -o StrictHostKeyChecking=no "${VPS_USER}@${VPS_HOST}" 'umask 077; cat > /tmp/openrouter.key'
+          ssh -o StrictHostKeyChecking=no "${VPS_USER}@${VPS_HOST}" 'bash -s' -- /tmp/openrouter.key <<'REMOTE'
           set -euo pipefail
           KEY_FILE="$1"
           test -s "$KEY_FILE"
