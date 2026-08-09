@@ -189,6 +189,62 @@ Run configured model-assisted modes when available:
 /usr/local/bin/miser-evals --corpus /opt/miser/evals/cases.jsonl --mode cloud_llm
 ```
 
+## Authentication
+
+Miser supports API key authentication for all `/v1/` endpoints. Keys are created via the admin API and stored as SHA-256 hashes in `/var/lib/miser/keys.json`.
+
+### Admin API
+
+Set `MISER_ADMIN_KEY` in `/etc/miser/miser.env`:
+
+```bash
+MISER_ADMIN_KEY=miser_admin_<your-secret>
+```
+
+Create a user API key:
+
+```bash
+curl -X POST https://miser.rajeev.me/admin/keys \
+  -H "Authorization: Bearer miser_admin_<your-secret>" \
+  -H "Content-Type: application/json" \
+  -d '{"owner": "your-name"}'
+```
+
+List keys:
+
+```bash
+curl https://miser.rajeev.me/admin/keys \
+  -H "Authorization: Bearer miser_admin_<your-secret>"
+```
+
+Delete a key:
+
+```bash
+curl -X DELETE https://miser.rajeev.me/admin/keys/{key_id} \
+  -H "Authorization: Bearer miser_admin_<your-secret>"
+```
+
+### Using API keys
+
+```json
+{
+  "provider": {
+    "miser": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Miser Gateway",
+      "options": {
+        "baseURL": "https://miser.rajeev.me/v1",
+        "apiKey": "miser_<your-key>"
+      },
+      "models": { "auto": { "name": "Miser Auto" } }
+    }
+  },
+  "model": "miser/auto"
+}
+```
+
+Keys are validated on every request using constant-time hash comparison. The raw key is returned only once at creation time.
+
 ## Deployment
 
 The included `Dockerfile` creates a non-root image. `deploy/miser.service` provides a hardened systemd unit. Copy `config/miser.toml` and a mode-600 environment file containing `OPENROUTER_API_KEY` to the server.

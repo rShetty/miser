@@ -24,6 +24,8 @@ enabled = false
 minimum_score = 0.7
 escalate_on_failure = false
 
+admin_key = "{env:MISER_ADMIN_KEY}"
+
 [provider]
 base_url = "https://openrouter.ai/api/v1"
 api_key = ""

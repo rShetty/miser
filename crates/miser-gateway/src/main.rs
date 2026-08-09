@@ -1,11 +1,12 @@
+mod auth;
 mod cache;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderValue, StatusCode},
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use clap::Parser;
 use miser_classifier::Classifier;
@@ -31,6 +32,8 @@ struct AppState {
     policy: PolicyEngine,
     provider: Provider,
     cache: Arc<cache::ResponseCache>,
+    auth: Arc<auth::AuthManager>,
+    admin_key: String,
 }
 
 #[tokio::main]
@@ -64,11 +67,23 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(serde_json::to_value)
         .transpose()?;
+    let admin_key = std::env::var("MISER_ADMIN_KEY").unwrap_or_else(|_| {
+        config
+            .extra
+            .get("admin_key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    });
+    let auth_path =
+        std::env::var("MISER_KEYS_FILE").unwrap_or_else(|_| "/etc/miser/keys.json".to_string());
     let state = AppState {
         classifier: Arc::new(Classifier::new(config.classifier.clone())?),
         policy: PolicyEngine::new(config.clone()),
         provider: Provider::new(provider_config)?,
         cache: Arc::new(cache::ResponseCache::new(10000, 300)),
+        auth: Arc::new(auth::AuthManager::new(std::path::PathBuf::from(auth_path))),
+        admin_key,
         config,
     };
     let address = format!("{}:{}", state.config.host, state.config.port);
@@ -77,6 +92,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/health/ready", get(ready))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(completions))
+        .route("/admin/keys", post(create_key))
+        .route("/admin/keys", get(list_keys))
+        .route("/admin/keys/{id}", get(get_key))
+        .route("/admin/keys/{id}", delete(delete_key))
         .with_state(Arc::new(state))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http());
@@ -108,21 +127,23 @@ async fn completions(
     headers: axum::http::HeaderMap,
     Json(mut request): Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
-    if let Some(expected) = state
-        .config
-        .api_key
-        .as_deref()
-        .filter(|key| !key.is_empty())
-    {
-        let supplied = headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if supplied != format!("Bearer {expected}") {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error":{"message":"unauthorized"}})),
-            ));
+    let bearer = auth::extract_bearer(&headers).unwrap_or_default();
+    if state.admin_key.is_empty() && state.auth.list_keys().map(|k| k.is_empty()).unwrap_or(true) {
+        // No auth configured — open access for initial setup
+    } else {
+        match state.auth.validate(&bearer) {
+            Ok(_api_key) => {}
+            Err(auth::AuthError::Inactive) => {
+                return Err(auth::json_error("API key inactive", StatusCode::FORBIDDEN));
+            }
+            Err(_) => {
+                if !auth::admin_auth(&headers, &state.admin_key) {
+                    return Err(auth::json_error(
+                        "invalid API key",
+                        StatusCode::UNAUTHORIZED,
+                    ));
+                }
+            }
         }
     }
     let request_id = Uuid::new_v4().to_string();
@@ -285,4 +306,99 @@ fn internal<E: std::fmt::Display>(error: E) -> (StatusCode, Json<Value>) {
         StatusCode::BAD_GATEWAY,
         Json(json!({"error":{"message":error.to_string()}})),
     )
+}
+
+async fn create_key(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    let owner = body
+        .get("owner")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    match state.auth.create_key(owner) {
+        Ok(raw_key) => Ok(Json(json!({
+            "key": raw_key,
+            "message": "Store this key securely. It will not be shown again."
+        }))),
+        Err(_) => Err(auth::json_error(
+            "failed to create key",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
+async fn list_keys(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    match state.auth.list_keys() {
+        Ok(keys) => Ok(Json(json!({"keys": keys}))),
+        Err(_) => Err(auth::json_error(
+            "failed to list keys",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
+async fn get_key(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    match state.auth.list_keys() {
+        Ok(keys) => {
+            if let Some(key) = keys.into_iter().find(|k| k.id == id) {
+                Ok(Json(json!(key)))
+            } else {
+                Err(auth::json_error("key not found", StatusCode::NOT_FOUND))
+            }
+        }
+        Err(_) => Err(auth::json_error(
+            "failed to get key",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
+async fn delete_key(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    match state.auth.delete_key(&id) {
+        Ok(_) => Ok(Json(json!({"message": "key deleted"}))),
+        Err(auth::AuthError::NotFound) => {
+            Err(auth::json_error("key not found", StatusCode::NOT_FOUND))
+        }
+        Err(_) => Err(auth::json_error(
+            "failed to delete key",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
 }
