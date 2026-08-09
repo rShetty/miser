@@ -1,0 +1,22 @@
+[Unit]
+Description=Miser AI Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=miser
+Group=miser
+EnvironmentFile=/etc/miser/miser.env
+ExecStart=/usr/local/bin/miser-gateway --config /etc/miser/miser.toml
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/miser
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

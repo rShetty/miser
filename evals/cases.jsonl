@@ -1,0 +1,25 @@
+{"id":"t01","expected_tier":"trivial","request":{"model":"auto","messages":[{"role":"user","content":"Hello"}]}}
+{"id":"t02","expected_tier":"trivial","request":{"model":"auto","messages":[{"role":"user","content":"What is 2 + 2?"}]}}
+{"id":"t03","expected_tier":"trivial","request":{"model":"auto","messages":[{"role":"user","content":"Run git status"}]}}
+{"id":"t04","expected_tier":"trivial","request":{"model":"auto","messages":[{"role":"user","content":"Rename the local variable usr to user"}]}}
+{"id":"s01","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Explain DNS to a junior developer"}]}}
+{"id":"s02","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Write a small TypeScript function that reverses a string"}]}}
+{"id":"s03","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Compare REST and GraphQL at a high level"}]}}
+{"id":"s04","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Convert this CSV row into JSON"}]}}
+{"id":"n01","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Implement rate limiting middleware for an Express API"}]}}
+{"id":"n02","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Debug why my Node service returns ECONNRESET during startup"}]}}
+{"id":"n03","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Write integration tests for a REST API with JWT authentication"}]}}
+{"id":"n04","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Refactor this module to use dependency injection"}]}}
+{"id":"h01","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Architect a distributed cache with invalidation across five regions"}]}}
+{"id":"h02","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Analyze a production incident where database pools exhausted across 40 services"}]}}
+{"id":"h03","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Threat-model this authentication system and identify exploitable trust-boundary failures"}]}}
+{"id":"h04","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Plan a zero-downtime migration from a monolith to services"}]}}
+{"id":"r01","expected_tier":"reasoning","request":{"model":"auto","messages":[{"role":"user","content":"Prove that the square root of 2 is irrational"}]}}
+{"id":"r02","expected_tier":"reasoning","request":{"model":"auto","messages":[{"role":"user","content":"Design an algorithm for this constrained scheduling problem and prove its optimality"}]}}
+{"id":"r03","expected_tier":"reasoning","request":{"model":"auto","messages":[{"role":"user","content":"Determine whether this first-order logic theory is satisfiable and justify each inference"}]}}
+{"id":"r04","expected_tier":"reasoning","request":{"model":"auto","messages":[{"role":"user","content":"Derive the tight asymptotic bound for this recurrence"}]}}
+{"id":"o01","expected_tier":"trivial","request":{"model":"auto","messages":[{"role":"user","content":"@route:trivial\nProve the Riemann hypothesis"}]}}
+{"id":"o02","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"@route:hard\nWhat is 2 + 2?"}]}}
+{"id":"o03","expected_tier":"reasoning","request":{"model":"auto","messages":[{"role":"user","content":"@route:reasoning\nReply with OK"}]}}
+{"id":"tool01","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Read package.json, run the test script, and report whether it passed"}],"tools":[{"type":"function","function":{"name":"read_file","description":"Read a file"}},{"type":"function","function":{"name":"shell","description":"Run a command"}}]}}
+{"id":"schema01","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Extract customer name, invoice number, and total from this text"}],"response_format":{"type":"json_schema"}}}

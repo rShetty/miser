@@ -1,0 +1,76 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "miser",
+      "devDependencies": {
+        "@types/bun": "latest",
+        "typescript": "^5.8.0",
+      },
+    },
+    "packages/benchmark": {
+      "name": "@miser/benchmark",
+      "version": "0.1.0",
+      "bin": "src/bin.ts",
+      "dependencies": {
+        "@miser/classifier": "workspace:*",
+        "@miser/config": "workspace:*",
+        "@miser/router": "workspace:*",
+      },
+    },
+    "packages/classifier": {
+      "name": "@miser/classifier",
+      "version": "0.1.0",
+      "dependencies": {
+        "@miser/config": "workspace:*",
+      },
+    },
+    "packages/config": {
+      "name": "@miser/config",
+      "version": "0.1.0",
+    },
+    "packages/proxy": {
+      "name": "@miser/proxy",
+      "version": "0.1.0",
+      "bin": "src/bin.ts",
+      "dependencies": {
+        "@miser/classifier": "workspace:*",
+        "@miser/config": "workspace:*",
+        "@miser/router": "workspace:*",
+        "hono": "^4.7.0",
+      },
+    },
+    "packages/router": {
+      "name": "@miser/router",
+      "version": "0.1.0",
+      "dependencies": {
+        "@miser/classifier": "workspace:*",
+        "@miser/config": "workspace:*",
+      },
+    },
+  },
+  "packages": {
+    "@miser/benchmark": ["@miser/benchmark@workspace:packages/benchmark"],
+
+    "@miser/classifier": ["@miser/classifier@workspace:packages/classifier"],
+
+    "@miser/config": ["@miser/config@workspace:packages/config"],
+
+    "@miser/proxy": ["@miser/proxy@workspace:packages/proxy"],
+
+    "@miser/router": ["@miser/router@workspace:packages/router"],
+
+    "@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
+
+    "@types/node": ["@types/node@26.2.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg=="],
+
+    "bun-types": ["bun-types@1.3.14", "", { "dependencies": { "@types/node": "*" } }, "sha512-4N0ig0fEomHt5R0KCFWjovxow98rIoRwKolrYdCcknNwMekCXRnWEUvgu5soYV8QXtVsrUD8B95MBOZGPvr6KQ=="],
+
+    "hono": ["hono@4.13.1", "", {}, "sha512-kdJoFVv2xmayw6cY09H7AbMJMt8Jn5jdlEdXsP7AGBdF2DIptVlKlOLKXP41yPip4/a3yQPv9gVcJYI8YY04dw=="],
+
+    "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
+
+    "undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
+  }
+}

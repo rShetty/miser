@@ -1,0 +1,26 @@
+{
+  "name": "miser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Intelligent LLM router proxy that classifies prompts and routes to the cheapest capable model via OpenRouter",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --filter '*' dev",
+    "build": "bun --filter '*' build",
+    "test": "bun --filter '*' test",
+    "lint": "bun --filter '*' lint",
+    "typecheck": "bun --filter '*' typecheck",
+    "start": "bun --filter @miser/proxy start",
+    "benchmark": "bun --filter @miser/benchmark start"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "bun": ">=1.3.0"
+  }
+}

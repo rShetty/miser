@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+target/
+results/
+*.log
+.DS_Store
+prototypes/typescript/node_modules/
+prototypes/typescript/packages/*/node_modules/
+node_modules/

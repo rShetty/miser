@@ -1,0 +1,61 @@
+server:
+  host: "127.0.0.1"
+  port: 8787
+  api_key: ""
+
+classifier:
+  mode: "hybrid"
+  stages: ["override", "structural", "heuristic", "ml", "local_llm", "cloud_llm"]
+  confidence_threshold: 0.55
+  ml_model: "Xenova/all-MiniLM-L6-v2"
+  local_llm:
+    enabled: true
+    model: "gemma4:26b"
+    base_url: "http://127.0.0.1:11434/v1"
+    api_key: ""
+    timeout_ms: 60000
+  cloud_llm:
+    enabled: false
+    model: "openai/gpt-4.1-mini"
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: "{env:OPENROUTER_API_KEY}"
+    timeout_ms: 30000
+
+cache:
+  enabled: true
+  max_entries: 10000
+  similarity_threshold: 0.92
+  embedding_model: "Xenova/all-MiniLM-L6-v2"
+
+tiers:
+  trivial:
+    model: "meta-llama/llama-3.2-3b-instruct:free"
+    max_tokens: 2048
+    temperature: 0
+  simple:
+    model: "deepseek/deepseek-chat"
+    max_tokens: 4096
+    temperature: 0
+  standard:
+    model: "anthropic/claude-sonnet-4"
+    max_tokens: 8192
+    temperature: 0
+  hard:
+    model: "anthropic/claude-opus-4"
+    max_tokens: 16384
+    temperature: 0
+  reasoning:
+    model: "openai/o4-mini"
+    max_tokens: 16384
+    temperature: 0
+
+openrouter:
+  api_key: "{env:OPENROUTER_API_KEY}"
+  base_url: "https://openrouter.ai/api/v1"
+  provider_preferences:
+    sort: "price"
+    allow_fallbacks: true
+
+quality_check:
+  enabled: true
+  retry_with_higher_tier: true

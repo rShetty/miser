@@ -1,0 +1,21 @@
+{
+  "name": "@miser/proxy",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": "src/bin.ts",
+  "scripts": {
+    "dev": "bun run src/bin.ts",
+    "start": "bun run src/bin.ts",
+    "build": "bun build src/bin.ts --outdir dist --target bun --compile",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'no lint configured'",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@miser/config": "workspace:*",
+    "@miser/classifier": "workspace:*",
+    "@miser/router": "workspace:*",
+    "hono": "^4.7.0"
+  }
+}
