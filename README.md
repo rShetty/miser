@@ -128,6 +128,18 @@ cargo run -p miser-evals -- --quality evals/quality_cases.jsonl
 
 The VPS live benchmark runner is `scripts/completion_quality_vps.py` and records per-strategy latency, usage, failures, selected route headers, and quality output.
 
+### Software engineering benchmark (100 real-world cases, GLM 5.2 judge)
+
+A comprehensive benchmark of 100 real-world software engineering prompts across refactor, bugfix, feature, testing, devops, database, review, docs, performance, security, algorithm, and architecture categories. Quality scored by GLM 5.2 as independent LLM judge. Classification accuracy measures correct tier assignment.
+
+| Strategy | Quality | Pass rate | Classification accuracy | p50 | p95 | p99 | Tokens | Tokens/quality |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Miser Auto** | 0.5928 | 62% | **54%** | 9.3s | 30.0s | 37.3s | 44,533 | 1,503 |
+| OpenRouter Auto | 0.5683 | 52% | 0% | 9.6s | 19.0s | 26.8s | 20,251 | 713 |
+| GPT-4.1-mini | 0.7901 | 82% | 0% | 11.0s | 15.9s | 22.8s | 20,084 | 508 |
+| GLM 5.2 | 0.3520 | 36% | 0% | 9.7s | 22.1s | 23.1s | 26,599 | 1,511 |
+| Claude Sonnet 4 | 0.7868 | 82% | 0% | 8.4s | 14.5s | 17.1s | 24,245 | 616 |
+
 ### Comparison with other AI gateways
 
 Miser is compared against publicly documented 2026 gateway benchmarks. Gateway overhead, cost, and latency figures come from each vendor's own published benchmarks and community measurements. Classification accuracy is from Miser's own VPS evaluation corpus.
