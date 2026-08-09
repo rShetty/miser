@@ -5,7 +5,7 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "Miser Router",
       "options": {
-        "baseURL": "http://127.0.0.1:8787/v1",
+        "baseURL": "https://miser.rajeev.me/v1",
         "apiKey": "miser-local"
       },
       "models": {
