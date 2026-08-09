@@ -14,6 +14,7 @@ PRICING = {
     'deepseek/deepseek-chat': (0.14, 0.28),
     'anthropic/claude-sonnet-4': (3.0, 15.0),
     'openai/o4-mini': (1.10, 4.40),
+    'openai/gpt-4.1-mini': (0.40, 1.60),
     'z-ai/glm-5.2': (0.59, 0.59),
     'openrouter/auto': (0.0, 0.0),
 }
