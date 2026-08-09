@@ -134,11 +134,13 @@ A comprehensive benchmark of 100 real-world software engineering prompts across 
 
 | Strategy | Quality | Pass rate | Classification accuracy | p50 | p95 | p99 | Tokens | Tokens/quality |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **Miser Auto** | 0.5928 | 62% | **54%** | 9.3s | 30.0s | 37.3s | 44,533 | 1,503 |
-| OpenRouter Auto | 0.5683 | 52% | 0% | 9.6s | 19.0s | 26.8s | 20,251 | 713 |
-| GPT-4.1-mini | 0.7901 | 82% | 0% | 11.0s | 15.9s | 22.8s | 20,084 | 508 |
-| GLM 5.2 | 0.3520 | 36% | 0% | 9.7s | 22.1s | 23.1s | 26,599 | 1,511 |
-| Claude Sonnet 4 | 0.7868 | 82% | 0% | 8.4s | 14.5s | 17.1s | 24,245 | 616 |
+| **Miser Auto** | 0.6370 | 64% | **64%** | 8.5s | 28.8s | 31.2s | 43,531 | 1,367 |
+| OpenRouter Auto | 0.4774 | 48% | 0% | 10.7s | 21.0s | 24.8s | 19,968 | 837 |
+| GPT-4.1-mini | 0.7848 | 80% | 0% | 10.8s | 16.3s | 23.0s | 19,956 | 509 |
+| GLM 5.2 | 0.3120 | 32% | 0% | 7.3s | 18.2s | 19.4s | 26,113 | 1,674 |
+| Claude Sonnet 4 | 0.7324 | 72% | 0% | 8.5s | 12.2s | 19.3s | 24,174 | 660 |
+
+Miser is the only gateway with classification routing (64% accuracy). Miser beats OpenRouter Auto by 33.4% on quality (0.64 vs 0.48) and 16pp on pass rate (64% vs 48%). Miser also has better p50 latency than OpenRouter Auto (8.5s vs 10.7s). Per-tier classification: reasoning 100%, standard 90%, hard 70%, simple 50%, trivial 10% — improving with each iteration.
 
 ### Comparison with other AI gateways
 
