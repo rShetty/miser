@@ -5,19 +5,19 @@ api_key = ""
 [classifier]
 mode = "hybrid"
 stages = ["override", "structural", "heuristic", "local_llm", "cloud_llm"]
-confidence_threshold = 0.72
+confidence_threshold = 0.65
 
 [classifier.local_llm]
 enabled = true
 model = "qwen3:1.7b"
 base_url = "http://127.0.0.1:11434/v1"
-timeout_ms = 1500
+timeout_ms = 800
 
 [classifier.cloud_llm]
 enabled = true
 model = "openai/gpt-4.1-mini"
 base_url = "https://openrouter.ai/api/v1"
-timeout_ms = 2500
+timeout_ms = 1500
 
 [quality]
 enabled = true
@@ -34,7 +34,7 @@ sort = "price"
 allow_fallbacks = true
 
 [tiers.trivial]
-model = "meta-llama/llama-3.2-3b-instruct:free"
+model = "deepseek/deepseek-chat"
 max_tokens = 2048
 
 [tiers.simple]

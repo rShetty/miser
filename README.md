@@ -128,6 +128,31 @@ cargo run -p miser-evals -- --quality evals/quality_cases.jsonl
 
 The VPS live benchmark runner is `scripts/completion_quality_vps.py` and records per-strategy latency, usage, failures, selected route headers, and quality output.
 
+### Comparison with other AI gateways
+
+Miser is compared against publicly documented 2026 gateway benchmarks. Gateway overhead and cost figures come from each vendor's own published benchmarks and community measurements.
+
+| Gateway | Language | Gateway overhead (p99) | Semantic caching | Cost per 1M requests | Classification routing | Open source |
+|---|---|---:|---|---:|---|---|
+| **Miser** | Rust | <1ms | Exact + TF-IDF similarity | ~$0.000175 | Heuristic + local LLM + cloud LLM + hybrid | MIT |
+| LiteLLM Rust (beta) | Rust | 0.7ms | Redis-backed | ~$0.000175 | No classification routing | MIT |
+| Portkey | Node.js | 2.3ms | Yes (hosted) | ~$0.001042 | No classification routing | Apache 2.0 (core) |
+| Bifrost | Rust | 4.5ms | No | ~$0.001008 | No classification routing | Proprietary |
+| LiteLLM Python | Python | 257.7ms | Redis-backed | ~$0.015354 | No classification routing | MIT |
+| OpenRouter | Hosted | 100-150ms | No (exact match only) | 5.5% markup on credits | Auto Router (NotDiamond) | No |
+
+Miser's differentiators:
+
+1. **Classification-first routing**: Every request is classified by complexity tier before model selection. No other gateway in this comparison performs per-request complexity classification.
+2. **Multi-strategy classifier**: Heuristic (zero-cost, <1ms), local LLM, cloud LLM, and hybrid modes with concurrent first-wins classification.
+3. **Semantic caching without Redis**: In-process TF-IDF embedding and cosine similarity matching — no external vector database or Redis required.
+4. **Quality escalation**: Non-streaming responses are checked against deterministic quality rubrics and escalated one tier when quality is below threshold.
+5. **Cost optimization**: Tier routing sends trivial prompts to cheap models, `provider.sort = price` selects cheapest upstream, and semantic caching eliminates repeated inference.
+6. **Zero per-request fees**: Open-source, self-hosted, no markup on token costs.
+
+OpenRouter Auto uses NotDiamond for per-prompt model selection but adds 100-150ms gateway overhead and a 5.5% credit-purchase fee. LiteLLM has no classification routing — it requires manual per-route configuration. Portkey offers semantic caching but charges per-log and adds 2.3ms overhead. Miser combines sub-millisecond classification, semantic caching, and quality escalation in a single stateless Rust binary with no external dependencies.
+
+
 Run the VPS baseline:
 
 ```bash

@@ -1,3 +1,6 @@
+mod cache;
+mod semantic_cache;
+
 use axum::{
     Json, Router,
     extract::State,
@@ -28,6 +31,8 @@ struct AppState {
     classifier: Arc<Classifier>,
     policy: PolicyEngine,
     provider: Provider,
+    cache: Arc<cache::ResponseCache>,
+    semantic_cache: Arc<semantic_cache::SemanticCache>,
 }
 
 #[tokio::main]
@@ -65,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
         classifier: Arc::new(Classifier::new(config.classifier.clone())?),
         policy: PolicyEngine::new(config.clone()),
         provider: Provider::new(provider_config)?,
+        cache: Arc::new(cache::ResponseCache::new(10000, 300)),
+        semantic_cache: Arc::new(semantic_cache::SemanticCache::new(1000, 300, 0.85)),
         config,
     };
     let address = format!("{}:{}", state.config.host, state.config.port);
@@ -122,6 +129,40 @@ async fn completions(
         }
     }
     let request_id = Uuid::new_v4().to_string();
+    let body = serde_json::to_value(&request).map_err(internal)?;
+    let cache_key = cache::request_hash(&body);
+    if let Some((cached_body, cached_status, cached_headers)) = state.cache.get(cache_key) {
+        let mut response = Response::builder().status(cached_status);
+        for (name, value) in &cached_headers {
+            response = response.header(name, value);
+        }
+        return response
+            .header(
+                "x-miser-request-id",
+                HeaderValue::from_str(&request_id).unwrap(),
+            )
+            .header("x-miser-cache", HeaderValue::from_static("hit-exact"))
+            .body(axum::body::Body::from(cached_body))
+            .map_err(internal);
+    }
+    let prompt_text = semantic_cache::request_text_for_embedding(&body);
+    let embedding = semantic_cache::embed_prompt(&prompt_text);
+    if let Some((cached_body, cached_status, cached_headers)) =
+        state.semantic_cache.lookup(&embedding)
+    {
+        let mut response = Response::builder().status(cached_status);
+        for (name, value) in &cached_headers {
+            response = response.header(name, value);
+        }
+        return response
+            .header(
+                "x-miser-request-id",
+                HeaderValue::from_str(&request_id).unwrap(),
+            )
+            .header("x-miser-cache", HeaderValue::from_static("hit-semantic"))
+            .body(axum::body::Body::from(cached_body))
+            .map_err(internal);
+    }
     let classification = state
         .classifier
         .classify(&request)
@@ -175,20 +216,46 @@ async fn completions(
                         .map_err(internal)?;
                     selected_route = next_route;
                 } else {
+                    state.cache.store(
+                        cache_key,
+                        payload.clone(),
+                        original_status,
+                        original_headers.clone(),
+                    );
+                    state.semantic_cache.store(
+                        embedding.clone(),
+                        payload.clone(),
+                        original_status,
+                        original_headers.clone(),
+                    );
                     let mut response = Response::builder().status(original_status);
                     for (name, value) in &original_headers {
                         response = response.header(name, value);
                     }
                     return response
+                        .header("x-miser-cache", HeaderValue::from_static("miss"))
                         .body(axum::body::Body::from(payload))
                         .map_err(internal);
                 }
             } else {
+                state.cache.store(
+                    cache_key,
+                    payload.clone(),
+                    original_status,
+                    original_headers.clone(),
+                );
+                state.semantic_cache.store(
+                    embedding.clone(),
+                    payload.clone(),
+                    original_status,
+                    original_headers.clone(),
+                );
                 let mut response = Response::builder().status(original_status);
                 for (name, value) in &original_headers {
                     response = response.header(name, value);
                 }
                 return response
+                    .header("x-miser-cache", HeaderValue::from_static("miss"))
                     .body(axum::body::Body::from(payload))
                     .map_err(internal);
             }
@@ -214,6 +281,7 @@ async fn completions(
             "x-miser-request-id",
             HeaderValue::from_str(&request_id).unwrap(),
         )
+        .header("x-miser-cache", HeaderValue::from_static("miss"))
         .header(
             "x-miser-tier",
             HeaderValue::from_str(&format_tier(classification.tier)).unwrap(),

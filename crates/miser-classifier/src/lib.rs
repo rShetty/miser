@@ -107,23 +107,63 @@ impl Classifier {
                 if heuristic.confidence >= self.config.confidence_threshold {
                     return Ok(heuristic);
                 }
-                if self.config.local_llm.enabled {
-                    if let Ok(local) = self
-                        .llm(request, &self.config.local_llm, "local_llm", started)
-                        .await
-                    {
-                        return Ok(local);
+                let local_fut = if self.config.local_llm.enabled {
+                    Some(Box::pin(self.llm(
+                        request,
+                        &self.config.local_llm,
+                        "local_llm",
+                        started,
+                    )))
+                } else {
+                    None
+                };
+                let cloud_fut = if self.config.cloud_llm.enabled {
+                    Some(Box::pin(self.llm(
+                        request,
+                        &self.config.cloud_llm,
+                        "cloud_llm",
+                        started,
+                    )))
+                } else {
+                    None
+                };
+                match (local_fut, cloud_fut) {
+                    (Some(local), Some(cloud)) => {
+                        let mut local = local;
+                        let mut cloud = cloud;
+                        tokio::select! {
+                            result = &mut local => match result {
+                                Ok(r) if r.confidence >= self.config.confidence_threshold => Ok(r),
+                                Ok(local_result) => {
+                                    match cloud.as_mut().await {
+                                        Ok(cloud_result) if cloud_result.confidence >= self.config.confidence_threshold => Ok(cloud_result),
+                                        Ok(_) => Ok(local_result),
+                                        Err(_) => Ok(local_result),
+                                    }
+                                }
+                                Err(_) => match cloud.as_mut().await {
+                                    Ok(r) => Ok(r),
+                                    Err(_) => Ok(heuristic),
+                                },
+                            },
+                            result = &mut cloud => match result {
+                                Ok(r) if r.confidence >= self.config.confidence_threshold => Ok(r),
+                                Ok(cloud_result) => match local.as_mut().await {
+                                    Ok(local_result) if local_result.confidence >= self.config.confidence_threshold => Ok(local_result),
+                                    Ok(_) => Ok(cloud_result),
+                                    Err(_) => Ok(cloud_result),
+                                },
+                                Err(_) => match local.as_mut().await {
+                                    Ok(r) => Ok(r),
+                                    Err(_) => Ok(heuristic),
+                                },
+                            },
+                        }
                     }
+                    (Some(mut local), None) => local.as_mut().await.or(Ok(heuristic)),
+                    (None, Some(mut cloud)) => cloud.as_mut().await.or(Ok(heuristic)),
+                    (None, None) => Ok(heuristic),
                 }
-                if self.config.cloud_llm.enabled {
-                    if let Ok(cloud) = self
-                        .llm(request, &self.config.cloud_llm, "cloud_llm", started)
-                        .await
-                    {
-                        return Ok(cloud);
-                    }
-                }
-                Ok(heuristic)
             }
         }
     }
