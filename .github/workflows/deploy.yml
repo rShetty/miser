@@ -70,82 +70,97 @@ jobs:
     environment: production
     steps:
       - uses: actions/checkout@v4
-      - name: Configure SSH
-        shell: bash
-        env:
-          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-        run: |
-          install -d -m 700 ~/.ssh
-          printf '%s' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -t ed25519 -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          ssh -o StrictHostKeyChecking=no -o BatchMode=yes "${{ secrets.VPS_USER }}@${VPS_HOST}" 'echo SSH_OK'
-      - name: Upload source
-        shell: bash
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-        run: |
-          tar --exclude=.git --exclude=.env --exclude=target -czf /tmp/miser-source.tgz .
-          scp -o StrictHostKeyChecking=no /tmp/miser-source.tgz "${VPS_USER}@${VPS_HOST}:/tmp/miser-source.tgz"
-      - name: Build and restart gateway
-        shell: bash
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: |
-          printf '%s' "$OPENROUTER_API_KEY" | ssh -o StrictHostKeyChecking=no "${VPS_USER}@${VPS_HOST}" 'umask 077; cat > /tmp/openrouter.key'
-          ssh -o StrictHostKeyChecking=no "${VPS_USER}@${VPS_HOST}" 'bash -s' -- /tmp/openrouter.key <<'REMOTE'
-          set -euo pipefail
-          KEY_FILE="$1"
-          test -s "$KEY_FILE"
-          command -v cargo >/dev/null
-          command -v systemctl >/dev/null
-          rm -rf /opt/miser.new
-          mkdir -p /opt/miser.new
-          tar -xzf /tmp/miser-source.tgz -C /opt/miser.new
-          cd /opt/miser.new
-          cargo build --release -p miser-gateway -p miser-evals
-          id miser >/dev/null 2>&1 || useradd --system --home-dir /var/lib/miser --create-home --shell /usr/sbin/nologin miser
-          install -d -m 755 /opt/miser /etc/miser
-          install -m 755 target/release/miser-gateway /usr/local/bin/miser-gateway.new
-          install -m 755 target/release/miser-evals /usr/local/bin/miser-evals.new
-          install -m 644 config/miser.toml /etc/miser/miser.toml.new
-          install -m 644 deploy/miser.service /etc/systemd/system/miser.service.new
-          OR_KEY=$(cat "$KEY_FILE")
-          if [ -f /etc/miser/miser.env ]; then
-            cp /etc/miser/miser.env /etc/miser/miser.env.new
-          else
-            : > /etc/miser/miser.env.new
-          fi
-          sed -i "s|^OPENROUTER_API_KEY=.*|OPENROUTER_API_KEY=${OR_KEY}|" /etc/miser/miser.env.new
-          grep -q "^OPENROUTER_API_KEY=" /etc/miser/miser.env.new || echo "OPENROUTER_API_KEY=${OR_KEY}" >> /etc/miser/miser.env.new
-          grep -q "^RUST_LOG=" /etc/miser/miser.env.new || echo "RUST_LOG=info" >> /etc/miser/miser.env.new
-          grep -q "^MISER_KEYS_FILE=" /etc/miser/miser.env.new || echo "MISER_KEYS_FILE=/var/lib/miser/keys.json" >> /etc/miser/miser.env.new
-          chmod 600 /etc/miser/miser.env.new
-          mkdir -p /var/lib/miser
-          chown miser:miser /var/lib/miser
-          if [ ! -f /var/lib/miser/keys.json ]; then
-            echo '{"keys":[]}' > /var/lib/miser/keys.json
-            chown miser:miser /var/lib/miser/keys.json
-            chmod 600 /var/lib/miser/keys.json
-          fi
-          mv /usr/local/bin/miser-gateway.new /usr/local/bin/miser-gateway
-          mv /usr/local/bin/miser-evals.new /usr/local/bin/miser-evals
-          mv /etc/miser/miser.toml.new /etc/miser/miser.toml
-          mv /etc/systemd/system/miser.service.new /etc/systemd/system/miser.service
-          rm -rf /opt/miser
-          mv /opt/miser.new /opt/miser
-          systemctl daemon-reload
-          systemctl enable miser
-          systemctl restart miser
-          sleep 5
-          if ! systemctl is-active --quiet miser; then
-            journalctl -u miser -n 20 --no-pager
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+
+            OPENROUTER_API_KEY="${{ secrets.OPENROUTER_API_KEY }}"
+
+            if [ ! -d /opt/miser ]; then
+              git clone https://github.com/rShetty/miser.git /opt/miser
+            fi
+
+            cd /opt/miser
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Preserve existing env, update OPENROUTER_API_KEY
+            if [ -f /etc/miser/miser.env ]; then
+              cp /etc/miser/miser.env /etc/miser/miser.env.bak
+            else
+              : > /etc/miser/miser.env
+            fi
+            sed -i "s|^OPENROUTER_API_KEY=.*|OPENROUTER_API_KEY=${OPENROUTER_API_KEY}|" /etc/miser/miser.env
+            grep -q "^OPENROUTER_API_KEY=" /etc/miser/miser.env || echo "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}" >> /etc/miser/miser.env
+            grep -q "^RUST_LOG=" /etc/miser/miser.env || echo "RUST_LOG=info" >> /etc/miser/miser.env
+            grep -q "^MISER_KEYS_FILE=" /etc/miser/miser.env || echo "MISER_KEYS_FILE=/var/lib/miser/keys.json" >> /etc/miser/miser.env
+            chmod 600 /etc/miser/miser.env
+
+            # Copy config
+            cp config/miser.toml /etc/miser/miser.toml
+
+            # Build
+            source "$HOME/.cargo/env"
+            cargo build --release -p miser-gateway -p miser-evals
+
+            # Install binaries
+            install -m 755 target/release/miser-gateway /usr/local/bin/miser-gateway
+            install -m 755 target/release/miser-evals /usr/local/bin/miser-evals
+
+            # Ensure user and key store
+            id miser >/dev/null 2>&1 || useradd --system --home-dir /var/lib/miser --create-home --shell /usr/sbin/nologin miser
+            mkdir -p /var/lib/miser
+            chown miser:miser /var/lib/miser
+            if [ ! -f /var/lib/miser/keys.json ]; then
+              echo '{"keys":[]}' > /var/lib/miser/keys.json
+              chown miser:miser /var/lib/miser/keys.json
+              chmod 600 /var/lib/miser/keys.json
+            fi
+
+            # Install systemd unit
+            cp deploy/miser.service /etc/systemd/system/miser.service
+            systemctl daemon-reload
+            systemctl enable miser
+            systemctl restart miser
+
+            # Health check with retries
+            sleep 5
+            for i in 1 2 3 4 5; do
+              if curl -sf http://127.0.0.1:8787/health/live; then
+                echo ""
+                echo "DEPLOY SUCCESS: miser.rajeev.me is healthy"
+                exit 0
+              fi
+              echo "Health check attempt $i failed, waiting..."
+              sleep 5
+            done
+
+            echo "ERROR: Health check failed"
+            journalctl -u miser -n 30 --no-pager
             exit 1
-          fi
-          curl --fail --silent http://127.0.0.1:8787/health/live
-          rm -f /tmp/miser-source.tgz "$KEY_FILE"
-          REMOTE
+
+      - name: Retry deploy if SSH failed
+        if: failure()
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          timeout: 90s
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+            source "$HOME/.cargo/env"
+            cd /opt/miser
+            systemctl restart miser
+            sleep 5
+            curl -sf http://127.0.0.1:8787/health/live && echo "DEPLOY SUCCESS (retry)" || (journalctl -u miser -n 20 --no-pager && exit 1)
