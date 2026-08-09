@@ -96,9 +96,10 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           printf '%s' "$OPENROUTER_API_KEY" | ssh "${VPS_USER}@${VPS_HOST}" 'umask 077; cat > /tmp/openrouter.key'
-          ssh "${VPS_USER}@${VPS_HOST}" 'bash -s' <<'REMOTE'
+          ssh "${VPS_USER}@${VPS_HOST}" 'bash -s' -- /tmp/openrouter.key <<'REMOTE'
           set -euo pipefail
-          test -s /tmp/openrouter.key
+          KEY_FILE="$1"
+          test -s "$KEY_FILE"
           command -v cargo >/dev/null
           command -v systemctl >/dev/null
           rm -rf /opt/miser.new
@@ -112,14 +113,14 @@ jobs:
           install -m 755 target/release/miser-evals /usr/local/bin/miser-evals.new
           install -m 644 config/miser.toml /etc/miser/miser.toml.new
           install -m 644 deploy/miser.service /etc/systemd/system/miser.service.new
-          install -m 600 /tmp/openrouter.key /etc/miser/openrouter.key.new
+          OR_KEY=$(cat "$KEY_FILE")
           if [ -f /etc/miser/miser.env ]; then
             cp /etc/miser/miser.env /etc/miser/miser.env.new
           else
-            echo "" > /etc/miser/miser.env.new
+            : > /etc/miser/miser.env.new
           fi
-          sed -i "s/^OPENROUTER_API_KEY=.*/OPENROUTER_API_KEY=$(cat \/etc\/miser\/openrouter.key.new)/" /etc/miser/miser.env.new
-          grep -q "^OPENROUTER_API_KEY=" /etc/miser/miser.env.new || echo "OPENROUTER_API_KEY=$(cat /etc/miser/openrouter.key.new)" >> /etc/miser/miser.env.new
+          sed -i "s|^OPENROUTER_API_KEY=.*|OPENROUTER_API_KEY=${OR_KEY}|" /etc/miser/miser.env.new
+          grep -q "^OPENROUTER_API_KEY=" /etc/miser/miser.env.new || echo "OPENROUTER_API_KEY=${OR_KEY}" >> /etc/miser/miser.env.new
           grep -q "^RUST_LOG=" /etc/miser/miser.env.new || echo "RUST_LOG=info" >> /etc/miser/miser.env.new
           grep -q "^MISER_KEYS_FILE=" /etc/miser/miser.env.new || echo "MISER_KEYS_FILE=/var/lib/miser/keys.json" >> /etc/miser/miser.env.new
           chmod 600 /etc/miser/miser.env.new
@@ -134,8 +135,6 @@ jobs:
           mv /usr/local/bin/miser-evals.new /usr/local/bin/miser-evals
           mv /etc/miser/miser.toml.new /etc/miser/miser.toml
           mv /etc/systemd/system/miser.service.new /etc/systemd/system/miser.service
-          mv /etc/miser/openrouter.key.new /etc/miser/openrouter.key
-          mv /etc/miser/miser.env.new /etc/miser/miser.env
           rm -rf /opt/miser
           mv /opt/miser.new /opt/miser
           systemctl daemon-reload
@@ -147,5 +146,5 @@ jobs:
             exit 1
           fi
           curl --fail --silent http://127.0.0.1:8787/health/live
-          rm -f /tmp/miser-source.tgz /tmp/openrouter.key
+          rm -f /tmp/miser-source.tgz "$KEY_FILE"
           REMOTE
