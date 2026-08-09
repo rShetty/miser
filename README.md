@@ -94,13 +94,17 @@ The evaluator reports exact and adjacent-tier accuracy plus a confusion matrix. 
 
 The Rust gateway was evaluated on the deployed VPS on 2026-08-09:
 
-| Benchmark | Hardware | Cases | Exact | Adjacent | Classification cost |
-|---|---|---:|---:|---:|---:|
-| Rust heuristic classifier | 2 vCPU, 7.8 GiB RAM, 8 GiB swap, no GPU | 25 | 92.0% | 92.0% | $0 |
+| Strategy | Hardware | Cases | Exact | Adjacent | Under-route | Failures | p50 latency | p95 latency |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Rust heuristics | 2 vCPU, 7.8 GiB RAM, no GPU | 25 | **92.0%** | **92.0%** | 0.0% | 0 | <1ms | <1ms |
+| Cloud GPT-4.1-mini | same VPS + OpenRouter | 25 | 60.0% | 84.0% | 20.0% | 0 | 1.84s | 20.69s |
+| OpenRouter Auto | same VPS + OpenRouter | 25 | 52.0% | 84.0% | 32.0% | 0 | 4.16s | 6.37s |
+| Local Qwen 1.7B | 2-vCPU CPU-only Ollama | 25 | 4.0% | 20.0% | 12.0% | 19 | 8.03s | 12.03s |
+| Hybrid cascade | same VPS | 25 | 64.0% | 72.0% | 8.0% | 7 | <1ms | 11.87s |
 
-The corpus contains trivial, simple, standard, hard, reasoning, override, tool-use, and structured-output cases. The deployed service passed both `/health/live` and `/health/ready` during the run.
+Run timestamp: 2026-08-09T09:48:53Z. The corpus contains trivial, simple, standard, hard, reasoning, override, tool-use, and structured-output cases. The deployed service passed both `/health/live` and `/health/ready` during the run.
 
-This is an offline classifier benchmark, not a completion-quality benchmark. Local-LLM and cloud-LLM scores must be reported separately after their endpoints are enabled; a timeout or unavailable endpoint must be recorded as a failure rather than counted as a default-tier prediction.
+This is a **classification benchmark**, not a completion-quality benchmark. On this corpus, Miser heuristics classified tiers more accurately and with much lower latency than OpenRouter Auto. That does not by itself prove routed answers are higher quality; the next evaluation must compare answer quality, cost, retries, and user-success rate against fixed-model and OpenRouter Auto baselines. Local Qwen is not viable synchronously on this 2-vCPU CPU-only VPS. Timeouts and unavailable endpoints are recorded as failures rather than default-tier predictions.
 
 Run the VPS baseline:
 
