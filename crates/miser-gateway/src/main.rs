@@ -1,5 +1,4 @@
 mod cache;
-mod semantic_cache;
 
 use axum::{
     Json, Router,
@@ -32,7 +31,6 @@ struct AppState {
     policy: PolicyEngine,
     provider: Provider,
     cache: Arc<cache::ResponseCache>,
-    semantic_cache: Arc<semantic_cache::SemanticCache>,
 }
 
 #[tokio::main]
@@ -71,7 +69,6 @@ async fn main() -> anyhow::Result<()> {
         policy: PolicyEngine::new(config.clone()),
         provider: Provider::new(provider_config)?,
         cache: Arc::new(cache::ResponseCache::new(10000, 300)),
-        semantic_cache: Arc::new(semantic_cache::SemanticCache::new(0, 0, 1.0)),
         config,
     };
     let address = format!("{}:{}", state.config.host, state.config.port);
@@ -145,24 +142,6 @@ async fn completions(
             .body(axum::body::Body::from(cached_body))
             .map_err(internal);
     }
-    let prompt_text = semantic_cache::request_text_for_embedding(&body);
-    let embedding = semantic_cache::embed_prompt(&prompt_text);
-    if let Some((cached_body, cached_status, cached_headers)) =
-        state.semantic_cache.lookup(&embedding)
-    {
-        let mut response = Response::builder().status(cached_status);
-        for (name, value) in &cached_headers {
-            response = response.header(name, value);
-        }
-        return response
-            .header(
-                "x-miser-request-id",
-                HeaderValue::from_str(&request_id).unwrap(),
-            )
-            .header("x-miser-cache", HeaderValue::from_static("hit-semantic"))
-            .body(axum::body::Body::from(cached_body))
-            .map_err(internal);
-    }
     let classification = state
         .classifier
         .classify(&request)
@@ -174,11 +153,15 @@ async fn completions(
         .map_err(internal)?;
     let stream_requested = request.stream.unwrap_or(false);
     request.model = route.model.clone();
-    if let Some(max_tokens) = route.max_tokens {
-        request.max_tokens = Some(max_tokens);
+    if request.max_tokens.is_none() {
+        if let Some(max_tokens) = route.max_tokens {
+            request.max_tokens = Some(max_tokens);
+        }
     }
-    if let Some(temperature) = route.temperature {
-        request.temperature = Some(temperature);
+    if request.temperature.is_none() {
+        if let Some(temperature) = route.temperature {
+            request.temperature = Some(temperature);
+        }
     }
     let body = serde_json::to_value(&request).map_err(internal)?;
     let mut upstream = state
@@ -222,12 +205,6 @@ async fn completions(
                         original_status,
                         original_headers.clone(),
                     );
-                    state.semantic_cache.store(
-                        embedding.clone(),
-                        payload.clone(),
-                        original_status,
-                        original_headers.clone(),
-                    );
                     let mut response = Response::builder().status(original_status);
                     for (name, value) in &original_headers {
                         response = response.header(name, value);
@@ -240,12 +217,6 @@ async fn completions(
             } else {
                 state.cache.store(
                     cache_key,
-                    payload.clone(),
-                    original_status,
-                    original_headers.clone(),
-                );
-                state.semantic_cache.store(
-                    embedding.clone(),
                     payload.clone(),
                     original_status,
                     original_headers.clone(),
