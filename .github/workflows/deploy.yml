@@ -1,0 +1,102 @@
+name: Deploy Miser Gateway
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: miser-production
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo check --workspace
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Scan tracked files for credentials
+        shell: bash
+        run: |
+          if git grep -n -I -E 'sk-(or-)?[A-Za-z0-9_-]{20,}|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|OPENROUTER_API_KEY=[^r$<{[]' -- ':!README.md' ':!config/miser.env.example'; then
+            exit 1
+          fi
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure SSH
+        shell: bash
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+      - name: Upload source
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          tar --exclude=.git --exclude=.env --exclude=target -czf /tmp/miser-source.tgz .
+          scp /tmp/miser-source.tgz "${VPS_USER}@${VPS_HOST}:/tmp/miser-source.tgz"
+      - name: Build and restart gateway
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          printf '%s' "$OPENROUTER_API_KEY" | ssh "${VPS_USER}@${VPS_HOST}" 'umask 077; cat > /tmp/openrouter.key'
+          ssh "${VPS_USER}@${VPS_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          test -s /tmp/openrouter.key
+          command -v cargo >/dev/null
+          command -v systemctl >/dev/null
+          rm -rf /opt/miser.new
+          mkdir -p /opt/miser.new
+          tar -xzf /tmp/miser-source.tgz -C /opt/miser.new
+          cd /opt/miser.new
+          cargo build --release -p miser-gateway -p miser-evals
+          id miser >/dev/null 2>&1 || useradd --system --home-dir /var/lib/miser --create-home --shell /usr/sbin/nologin miser
+          install -d -m 755 /opt/miser /etc/miser
+          install -m 755 target/release/miser-gateway /usr/local/bin/miser-gateway.new
+          install -m 755 target/release/miser-evals /usr/local/bin/miser-evals.new
+          install -m 644 config/miser.toml /etc/miser/miser.toml.new
+          install -m 644 deploy/miser.service /etc/systemd/system/miser.service.new
+          install -m 600 /tmp/openrouter.key /etc/miser/openrouter.key.new
+          printf 'OPENROUTER_API_KEY=%s\nRUST_LOG=info\n' "$(cat /etc/miser/openrouter.key.new)" > /etc/miser/miser.env.new
+          chmod 600 /etc/miser/miser.env.new
+          mv /usr/local/bin/miser-gateway.new /usr/local/bin/miser-gateway
+          mv /usr/local/bin/miser-evals.new /usr/local/bin/miser-evals
+          mv /etc/miser/miser.toml.new /etc/miser/miser.toml
+          mv /etc/systemd/system/miser.service.new /etc/systemd/system/miser.service
+          mv /etc/miser/openrouter.key.new /etc/miser/openrouter.key
+          mv /etc/miser/miser.env.new /etc/miser/miser.env
+          rm -rf /opt/miser
+          mv /opt/miser.new /opt/miser
+          systemctl daemon-reload
+          systemctl enable miser
+          systemctl restart miser
+          sleep 3
+          systemctl is-active --quiet miser
+          curl --fail --silent http://127.0.0.1:8787/health/live
+          rm -f /tmp/miser-source.tgz /tmp/openrouter.key
+          REMOTE
