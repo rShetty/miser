@@ -48,16 +48,22 @@ pub fn deterministic_quality(
             };
         }
     }
-    if classification.task == Some(TaskType::Coding) || content.contains("```") {
+    if classification.task == Some(TaskType::Coding)
+        || classification.task == Some(TaskType::Agentic)
+        || content.contains("```")
+    {
         let has_code = content.contains("```")
             || content.contains("fn ")
             || content.contains("function ")
-            || content.contains("def ");
+            || content.contains("def ")
+            || content.contains("tool_call")
+            || content.contains("```shell")
+            || content.contains("```bash");
         if !has_code && content.len() < 80 {
             return QualityScore {
                 score: 0.3,
                 passed: false,
-                reason: "insufficient-code-output",
+                reason: "insufficient-output",
             };
         }
     }

@@ -49,22 +49,25 @@ impl Classifier {
                 .expect("client construction"),
             trivial: RegexSet::new([
                 r"(?i)^\s*(hello|hi|hey|thanks|thank you|ok|okay)\s*[!.]*\s*$",
-                r"(?i)\b(git status|git diff|git log|list (the )?files?)\b",
-                r"(?i)^(what is|what's)\s+[^?]{0,80}\??$",
+                r"(?i)\b(git status|git diff|git log)\b",
+                r"(?i)^(what is|what's)\s+(your\s+name|2\s*\+\s*2|the\s+time|the\s+date|my\s+name)\b",
                 r"(?i)\b(rename|uppercase|lowercase|trim)\b.*\b(variable|file|string|line)\b",
                 r"(?i)^\s*(yes|no|true|false)\s*[.!]?\s*$",
             ])?,
             simple: RegexSet::new([
-                r"(?i)\b(explain|summarize|compare|convert|translate|format)\b",
-                r"(?i)\b(write|create)\s+(a|an)\s+(small|simple)?\s*(function|class|regex|script|interface)\b",
+                r"(?i)\b(explain|summarize|compare|convert|translate|format|describe|tell\s+me)\b",
+                r"(?i)\b(write|create)\s+(a|an)\s+(small|simple)?\s*\w*\s*(function|class|regex|script|interface)\b",
                 r"(?i)\b(add|change|fix)\s+(a|the)\s+(comment|null check|format)\b",
-                r"(?i)\b(dockerfile|docker-compose|readme|migration)\b",
+                r"(?i)\b(dockerfile|docker-compose|readme|migration|docker)\b",
                 r"(?i)\b(sql|query|select|insert|index)\b.*\b(write|create|add|optimize)\b",
                 r"(?i)\b(unit test|snapshot test|test for)\b",
                 r"(?i)\b(cors|semicolon|trailing|whitespace|quotes|tab|spaces)\b",
                 r"(?i)\b(git command|curl command|shell command)\b",
                 r"(?i)\b(type|interface|schema)\b.*\b(for|with)\b.*\b(id|name|email|field)\b",
                 r"(?i)\b(dependency|package|install|import)\b.*\b(add|fix|update)\b",
+                r"(?i)^(what is|what's|what are)\s+",
+                r"(?i)\b(npm|yarn|pip|cargo)\b.*\b(what|how|explain|difference)\b",
+                r"(?i)\b(ci.cd|pipeline|workflow)\b.*\b(what|how|explain|about|tell)\b",
             ])?,
             standard: RegexSet::new([
                 r"(?i)\b(implement|build|integrate|debug|refactor|test|endpoint|migration)\b",
@@ -204,7 +207,7 @@ impl Classifier {
         let mut reasons = Vec::new();
         let mut scores = [
             (ComplexityTier::Trivial, 0_i32),
-            (ComplexityTier::Simple, 0),
+            (ComplexityTier::Simple, 1),
             (ComplexityTier::Standard, 0),
             (ComplexityTier::Hard, 0),
             (ComplexityTier::Reasoning, 0),
@@ -235,17 +238,37 @@ impl Classifier {
             scores[2].1 += 2;
             reasons.push("structured-output".into());
         }
-        if classification_task == Some(TaskType::Coding) {
+        if has_explanatory_context(text) && scores[0].1 == 0 {
+            scores[1].1 += 5;
+            reasons.push("explanatory-context".into());
+        }
+        if classification_task == Some(TaskType::Coding) && scores[1].1 <= 1 {
             scores[2].1 += 10;
             reasons.push("coding-task".into());
+        }
+        if classification_task == Some(TaskType::Agentic) {
+            scores[3].1 += 15;
+            reasons.push("agentic-task".into());
+        }
+        if has_agentic_tools(request) {
+            scores[3].1 += 12;
+            reasons.push("agentic-tools".into());
+        }
+        if has_tool_history(request) {
+            scores[3].1 += 20;
+            reasons.push("tool-history".into());
+        }
+        if has_multi_step_intent(text) {
+            scores[3].1 += 8;
+            reasons.push("multi-step-intent".into());
         }
         let last = scores
             .iter()
             .max_by_key(|(_, score)| *score)
             .copied()
             .unwrap_or((ComplexityTier::Standard, 0));
-        let confidence = if last.1 == 0 {
-            0.0
+        let confidence = if last.1 <= 1 {
+            0.5
         } else {
             (0.55 + last.1 as f32 / 30.0).min(0.95)
         };
@@ -337,6 +360,19 @@ fn override_tier(text: &str) -> Option<(ComplexityTier, String)> {
 
 fn task(text: &str) -> Option<TaskType> {
     let lower = text.to_lowercase();
+    if has_explanatory_context(&lower) {
+        return coding_or_reasoning(&lower);
+    }
+    if has_action_agentic(&lower) {
+        return Some(TaskType::Agentic);
+    }
+    if has_light_agentic(&lower) {
+        return Some(TaskType::Coding);
+    }
+    coding_or_reasoning(&lower)
+}
+
+fn coding_or_reasoning(lower: &str) -> Option<TaskType> {
     if lower.contains("code")
         || lower.contains("implement")
         || lower.contains("function")
@@ -355,6 +391,94 @@ fn task(text: &str) -> Option<TaskType> {
     } else {
         Some(TaskType::Chat)
     }
+}
+
+fn has_explanatory_context(lower: &str) -> bool {
+    static EXPLANATORY: std::sync::OnceLock<RegexSet> = std::sync::OnceLock::new();
+    let regex = EXPLANATORY.get_or_init(|| {
+        RegexSet::new([
+            r"(?i)^(explain|what is|what's|what are|how to|how do|how does|describe|tell me|show me how|why|difference between)\b",
+            r"(?i)\b(explain|describe)\b.*\b(how|what|why)\b",
+            r"(?i)\b(what is|what's|what are)\b",
+            r"(?i)\b(write|create)\s+(a|an|the)?\s*(unit\s+test|test|snapshot|integration\s+test)\b",
+        ])
+        .expect("explanatory regex")
+    });
+    regex.is_match(lower)
+}
+
+fn has_action_agentic(lower: &str) -> bool {
+    static ACTION: std::sync::OnceLock<RegexSet> = std::sync::OnceLock::new();
+    let regex = ACTION.get_or_init(|| {
+        RegexSet::new([
+            r"(?i)^\s*(run|execute|deploy|install|start|stop|restart|migrate|seed|scaffold|init|commit|push|publish)\b",
+            r"(?i)\b(run|execute)\s+(the\s+)?(test|build|command|script|migration|server|service|app|application|suite|pipeline|linter|lint)\b",
+            r"(?i)\b(deploy|publish|push)\s+(to|the)\b",
+            r"(?i)\b(install|uninstall)\s+(the\s+)?(dependencies|deps|packages|package)\b",
+            r"(?i)\b(start|stop|restart)\s+(the\s+)?(server|service|app|database|proxy)\b",
+            r"(?i)\b(migrate|seed)\s+(the\s+)?(database|db)\b",
+            r"(?i)\b(npm|yarn|cargo|pip|docker|kubectl|terraform|ansible|make)\s+(run|test|build|install|deploy|exec|apply|playbook|start|stop)\b",
+            r"(?i)\bgit\s+(commit|push|pull|checkout|clone|merge|rebase)\b",
+            r"(?i)\b(build|rebuild)\s+(the\s+)?(project|image|docker|binary|app|application)\b",
+            r"(?i)\b(create|write|edit|delete|remove)\s+(a\s+|the\s+|new\s+)*file\b",
+            r"(?i)\b(run|execute)\s+(npm|yarn|cargo|pip|docker|kubectl|terraform|ansible|make)\b",
+            r"(?i)\bagent\b",
+            r"(?i)\b(deploy|ship|release)\s+(to\s+)?(production|staging|prod)\b",
+            r"(?i)\b(run|execute)\s+.+\s+and\s+(fix|report|show|deploy|push|commit|verify)\b",
+            r"(?i)\b(build|test).+\band\s+(push|deploy|publish|ship|release)\b",
+            r"(?i)\b(migrate).+\band\s+(seed|rollback|verify)\b",
+        ])
+        .expect("action-agentic regex")
+    });
+    regex.is_match(lower)
+}
+
+fn has_light_agentic(lower: &str) -> bool {
+    static LIGHT: std::sync::OnceLock<RegexSet> = std::sync::OnceLock::new();
+    let regex = LIGHT.get_or_init(|| {
+        RegexSet::new([
+            r"(?i)\b(check|show|display|list|read|view|get|print)\s+(the\s+)?(status|output|result|logs|files|config|version|diff|tree)\b",
+            r"(?i)\b(git\s+status|git\s+log|git\s+diff|git\s+branch|git\s+show)\b",
+            r"(?i)\b(list|show)\s+(the\s+)?(files|directories|services|containers|pods)\b",
+            r"(?i)\b(read|cat|head|tail|less|more)\s+(a\s+|the\s+)?file\b",
+            r"(?i)\b(check|verify|inspect|examine)\s+(if|whether|that|the)\b",
+        ])
+        .expect("light-agentic regex")
+    });
+    regex.is_match(lower)
+}
+
+fn has_agentic_tools(request: &ChatCompletionRequest) -> bool {
+    request.tools.as_ref().is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            let tool_str = tool.to_string().to_lowercase();
+            tool_str.contains("shell")
+                || tool_str.contains("bash")
+                || tool_str.contains("execute")
+                || tool_str.contains("run")
+                || tool_str.contains("file")
+                || tool_str.contains("search")
+                || tool_str.contains("grep")
+                || tool_str.contains("command")
+                || tool_str.contains("terminal")
+        })
+    })
+}
+
+fn has_tool_history(request: &ChatCompletionRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|msg| msg.tool_calls.is_some() || msg.tool_call_id.is_some() || msg.role == "tool")
+}
+
+fn has_multi_step_intent(text: &str) -> bool {
+    static MULTI_STEP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let regex = MULTI_STEP.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b\w+\s+.+\s+and\s+(fix|report|show|deploy|push|commit|verify|seed|rollback|publish|ship|release|install|start|stop|restart|configure|create|delete|edit|update)\b")
+            .expect("multi-step regex")
+    });
+    regex.is_match(text)
 }
 
 fn result(
@@ -448,6 +572,192 @@ mod tests {
                 .unwrap()
                 .tier,
             ComplexityTier::Trivial
+        );
+    }
+
+    #[tokio::test]
+    async fn agentic_keywords_route_to_hard() {
+        let mut config = ClassifierConfig {
+            mode: ClassifierMode::Heuristic,
+            ..serde_json::from_str("{}").unwrap()
+        };
+        config.confidence_threshold = 0.7;
+        let classifier = Classifier::new(config).unwrap();
+        assert_eq!(
+            classifier
+                .classify(&request("Run the test suite and report results"))
+                .await
+                .unwrap()
+                .tier,
+            ComplexityTier::Hard
+        );
+        assert_eq!(
+            classifier
+                .classify(&request("Execute the build pipeline"))
+                .await
+                .unwrap()
+                .tier,
+            ComplexityTier::Hard
+        );
+        assert_eq!(
+            classifier
+                .classify(&request("Deploy the service to production"))
+                .await
+                .unwrap()
+                .tier,
+            ComplexityTier::Hard
+        );
+    }
+
+    #[tokio::test]
+    async fn agentic_tools_route_to_hard() {
+        let config = ClassifierConfig {
+            mode: ClassifierMode::Heuristic,
+            ..serde_json::from_str("{}").unwrap()
+        };
+        let classifier = Classifier::new(config).unwrap();
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"auto",
+            "messages":[{"role":"user","content":"run the test suite"}],
+            "tools":[{"type":"function","function":{"name":"shell","description":"Run a shell command"}}]
+        }))
+        .unwrap();
+        let result = classifier.classify(&req).await.unwrap();
+        assert!(
+            result.tier >= ComplexityTier::Hard,
+            "agentic tools with action intent should floor to at least Hard, got {:?}",
+            result.tier
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_history_routes_to_hard() {
+        let config = ClassifierConfig {
+            mode: ClassifierMode::Heuristic,
+            ..serde_json::from_str("{}").unwrap()
+        };
+        let classifier = Classifier::new(config).unwrap();
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"auto",
+            "messages":[
+                {"role":"user","content":"run the tests"},
+                {"role":"assistant","content":"Running tests.","tool_calls":[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"c1","content":"passed"},
+                {"role":"user","content":"now fix the failing one"}
+            ]
+        }))
+        .unwrap();
+        let result = classifier.classify(&req).await.unwrap();
+        assert!(
+            result.tier >= ComplexityTier::Hard,
+            "tool history should floor to at least Hard, got {:?}",
+            result.tier
+        );
+    }
+
+    #[tokio::test]
+    async fn explanatory_context_not_agentic() {
+        let config = ClassifierConfig {
+            mode: ClassifierMode::Heuristic,
+            ..serde_json::from_str("{}").unwrap()
+        };
+        let classifier = Classifier::new(config).unwrap();
+        let r = classifier
+            .classify(&request("Explain how to run tests in a Node project"))
+            .await
+            .unwrap();
+        assert!(
+            r.tier <= ComplexityTier::Standard,
+            "explanatory context should not be agentic, got {:?} ({:?})",
+            r.tier,
+            r.reasons
+        );
+        let r = classifier
+            .classify(&request("What is a shell script?"))
+            .await
+            .unwrap();
+        assert!(
+            r.tier <= ComplexityTier::Standard,
+            "explanatory 'what is' should not be agentic, got {:?}",
+            r.tier
+        );
+        let r = classifier
+            .classify(&request(
+                "Write a unit test for a function that adds two numbers",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            r.tier <= ComplexityTier::Standard,
+            "write a test should be coding not agentic, got {:?}",
+            r.tier
+        );
+        let r = classifier
+            .classify(&request("Describe how Docker build works"))
+            .await
+            .unwrap();
+        assert!(
+            r.tier <= ComplexityTier::Standard,
+            "describe how should not be agentic, got {:?}",
+            r.tier
+        );
+    }
+
+    #[tokio::test]
+    async fn light_agentic_routes_to_standard() {
+        let config = ClassifierConfig {
+            mode: ClassifierMode::Heuristic,
+            ..serde_json::from_str("{}").unwrap()
+        };
+        let classifier = Classifier::new(config).unwrap();
+        let r = classifier
+            .classify(&request("Check the status of the deployment"))
+            .await
+            .unwrap();
+        assert!(
+            r.tier <= ComplexityTier::Standard,
+            "light agentic (check status) should not be Hard, got {:?}",
+            r.tier
+        );
+        let r = classifier
+            .classify(&request("Show me the logs from the API server"))
+            .await
+            .unwrap();
+        assert!(
+            r.tier <= ComplexityTier::Standard,
+            "light agentic (show logs) should not be Hard, got {:?}",
+            r.tier
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_step_agentic_routes_to_hard() {
+        let config = ClassifierConfig {
+            mode: ClassifierMode::Heuristic,
+            ..serde_json::from_str("{}").unwrap()
+        };
+        let classifier = Classifier::new(config).unwrap();
+        let r = classifier
+            .classify(&request("Run the test suite and deploy if all tests pass"))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.tier,
+            ComplexityTier::Hard,
+            "multi-step agentic should be Hard, got {:?}",
+            r.tier
+        );
+        let r = classifier
+            .classify(&request(
+                "Build the project and push the image to the registry",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.tier,
+            ComplexityTier::Hard,
+            "multi-step agentic should be Hard, got {:?}",
+            r.tier
         );
     }
 }

@@ -1,6 +1,6 @@
 {"id":"t01","expected_tier":"trivial","request":{"model":"auto","messages":[{"role":"user","content":"Hello"}]}}
 {"id":"t02","expected_tier":"trivial","request":{"model":"auto","messages":[{"role":"user","content":"What is 2 + 2?"}]}}
-{"id":"t03","expected_tier":"trivial","request":{"model":"auto","messages":[{"role":"user","content":"Run git status"}]}}
+{"id":"t03","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Run git status"}]}}
 {"id":"t04","expected_tier":"trivial","request":{"model":"auto","messages":[{"role":"user","content":"Rename the local variable usr to user"}]}}
 {"id":"s01","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Explain DNS to a junior developer"}]}}
 {"id":"s02","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Write a small TypeScript function that reverses a string"}]}}
@@ -21,5 +21,41 @@
 {"id":"o01","expected_tier":"trivial","request":{"model":"auto","messages":[{"role":"user","content":"@route:trivial\nProve the Riemann hypothesis"}]}}
 {"id":"o02","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"@route:hard\nWhat is 2 + 2?"}]}}
 {"id":"o03","expected_tier":"reasoning","request":{"model":"auto","messages":[{"role":"user","content":"@route:reasoning\nReply with OK"}]}}
-{"id":"tool01","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Read package.json, run the test script, and report whether it passed"}],"tools":[{"type":"function","function":{"name":"read_file","description":"Read a file"}},{"type":"function","function":{"name":"shell","description":"Run a command"}}]}}
+{"id":"tool01","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Read package.json, run the test script, and report whether it passed"}],"tools":[{"type":"function","function":{"name":"read_file","description":"Read a file"}},{"type":"function","function":{"name":"shell","description":"Run a command"}}]}}
 {"id":"schema01","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Extract customer name, invoice number, and total from this text"}],"response_format":{"type":"json_schema"}}}
+{"id":"a01","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Run the test suite and report results"}]}}
+{"id":"a02","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Execute the build pipeline"}]}}
+{"id":"a03","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Deploy the service to production"}]}}
+{"id":"a04","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Install the dependencies and start the dev server"}]}}
+{"id":"a05","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Run npm test and fix any failures"}]}}
+{"id":"a06","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Build the Docker image and push to the registry"}]}}
+{"id":"a07","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Run the migration and seed the database"}]}}
+{"id":"a08","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Create a file called test.py and run it"}]}}
+{"id":"a09","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Run cargo build and show me the output"}]}}
+{"id":"a10","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Execute the shell command and show output"}],"tools":[{"type":"function","function":{"name":"shell","description":"Run a shell command"}}]}}
+{"id":"a11","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"check the status"},{"role":"assistant","content":"Let me check.","tool_calls":[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"git status\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"clean working tree"},{"role":"user","content":"now commit and push"}]}}
+{"id":"a12","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Run the linter and fix all warnings"}],"tools":[{"type":"function","function":{"name":"execute_command","description":"Execute a terminal command"}},{"type":"function","function":{"name":"edit_file","description":"Edit a file"}}]}}
+{"id":"e01","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Explain how to run tests in a Node project"}]}}
+{"id":"e02","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"What is a shell script?"}]}}
+{"id":"e03","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Write a unit test for a function that adds two numbers"}]}}
+{"id":"e04","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Describe how Docker build works"}]}}
+{"id":"e05","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"How do I configure nginx for TLS?"}]}}
+{"id":"e06","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Write a script to automate database backups"}]}}
+{"id":"e07","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"What is the difference between npm and yarn?"}]}}
+{"id":"e08","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Tell me about CI/CD pipelines"}]}}
+{"id":"e09","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Create a Terraform script for an S3 bucket"}]}}
+{"id":"e10","expected_tier":"simple","request":{"model":"auto","messages":[{"role":"user","content":"Explain what kubectl apply does"}]}}
+{"id":"l01","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Check the status of the deployment"}]}}
+{"id":"l02","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Show me the logs from the API server"}]}}
+{"id":"l03","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"List the files in the src directory"}]}}
+{"id":"l04","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Read the file package.json and show its contents"}]}}
+{"id":"l05","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Check if the database is running"}]}}
+{"id":"l06","expected_tier":"standard","request":{"model":"auto","messages":[{"role":"user","content":"Display the current git branch"}]}}
+{"id":"a13","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Run the test suite and deploy if all tests pass"}]}}
+{"id":"a14","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Build the project and push the image to the registry"}]}}
+{"id":"a15","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Install the package, run the migration, and restart the server"}]}}
+{"id":"a16","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Execute the test command and report the results"}]}}
+{"id":"a17","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Run npm install and then start the dev server"}]}}
+{"id":"a18","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Create a new file called deploy.sh and run it"}]}}
+{"id":"a19","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Run the build and show me the output"}]}}
+{"id":"a20","expected_tier":"hard","request":{"model":"auto","messages":[{"role":"user","content":"Run cargo test and fix the failing tests"}]}}

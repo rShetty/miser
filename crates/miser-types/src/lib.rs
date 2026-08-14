@@ -112,6 +112,7 @@ pub enum ComplexityTier {
 pub enum TaskType {
     Chat,
     Coding,
+    Agentic,
     Analysis,
     Creative,
     Summarization,
@@ -297,6 +298,8 @@ pub struct GatewayConfig {
     pub quality: QualityConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub session: SessionConfig,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -371,6 +374,33 @@ fn default_cache_entries() -> usize {
 }
 fn default_similarity() -> f32 {
     0.92
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_session_ttl_seconds")]
+    pub ttl_seconds: u64,
+    #[serde(default = "default_session_max_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl_seconds: 1800,
+            max_entries: 10_000,
+        }
+    }
+}
+
+fn default_session_ttl_seconds() -> u64 {
+    1800
+}
+fn default_session_max_entries() -> usize {
+    10_000
 }
 
 #[cfg(test)]

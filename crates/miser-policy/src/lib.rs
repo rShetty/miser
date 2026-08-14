@@ -1,5 +1,5 @@
 use miser_types::{
-    ChatCompletionRequest, ClassificationResult, ComplexityTier, GatewayConfig,
+    ChatCompletionRequest, ClassificationResult, ComplexityTier, GatewayConfig, TaskType,
     TierModelRouteConfig,
 };
 use thiserror::Error;
@@ -74,6 +74,12 @@ impl PolicyEngine {
         if classification.task == Some(miser_types::TaskType::Reasoning) {
             tier = max_tier(tier, ComplexityTier::Reasoning);
         }
+        if classification.task == Some(TaskType::Agentic) {
+            tier = max_tier(tier, ComplexityTier::Hard);
+        }
+        if has_tool_history(request) {
+            tier = max_tier(tier, ComplexityTier::Hard);
+        }
         tier
     }
 
@@ -84,6 +90,13 @@ impl PolicyEngine {
 
 fn max_tier(left: ComplexityTier, right: ComplexityTier) -> ComplexityTier {
     left.max(right)
+}
+
+fn has_tool_history(request: &ChatCompletionRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|m| m.tool_calls.is_some() || m.tool_call_id.is_some() || m.role == "tool")
 }
 
 fn next_tier(tier: ComplexityTier) -> Option<ComplexityTier> {
@@ -126,6 +139,65 @@ mod tests {
         assert_eq!(
             policy.effective_tier(&request, &classification),
             ComplexityTier::Standard
+        );
+    }
+
+    #[test]
+    fn agentic_task_gets_hard_floor() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "auto",
+            "messages": [{"role":"user","content":"run the test suite"}]
+        }))
+        .unwrap();
+        let classification = ClassificationResult {
+            tier: ComplexityTier::Simple,
+            confidence: 0.99,
+            reasons: vec![],
+            classifier: "test".into(),
+            latency_ms: 0,
+            task: Some(TaskType::Agentic),
+            risk: None,
+            privacy: None,
+            extra: Default::default(),
+        };
+        let config: GatewayConfig =
+            toml::from_str(include_str!("../../../config/miser.toml")).unwrap();
+        let policy = PolicyEngine::new(config);
+        assert_eq!(
+            policy.effective_tier(&request, &classification),
+            ComplexityTier::Hard
+        );
+    }
+
+    #[test]
+    fn tool_history_gets_hard_floor() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "auto",
+            "messages": [
+                {"role":"user","content":"run the tests"},
+                {"role":"assistant","content":"I'll run them.","tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"npm test\"}"}}]},
+                {"role":"tool","tool_call_id":"call_1","content":"All tests passed"},
+                {"role":"user","content":"now fix the failing one"}
+            ]
+        }))
+        .unwrap();
+        let classification = ClassificationResult {
+            tier: ComplexityTier::Simple,
+            confidence: 0.99,
+            reasons: vec![],
+            classifier: "test".into(),
+            latency_ms: 0,
+            task: None,
+            risk: None,
+            privacy: None,
+            extra: Default::default(),
+        };
+        let config: GatewayConfig =
+            toml::from_str(include_str!("../../../config/miser.toml")).unwrap();
+        let policy = PolicyEngine::new(config);
+        assert_eq!(
+            policy.effective_tier(&request, &classification),
+            ComplexityTier::Hard
         );
     }
 }

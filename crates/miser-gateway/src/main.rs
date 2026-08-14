@@ -1,5 +1,6 @@
 mod auth;
 mod cache;
+mod session;
 
 use axum::{
     Json, Router,
@@ -32,6 +33,7 @@ struct AppState {
     policy: PolicyEngine,
     provider: Provider,
     cache: Arc<cache::ResponseCache>,
+    session: Arc<session::SessionTracker>,
     auth: Arc<auth::AuthManager>,
     admin_key: String,
 }
@@ -82,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
         policy: PolicyEngine::new(config.clone()),
         provider: Provider::new(provider_config)?,
         cache: Arc::new(cache::ResponseCache::new(10000, 300)),
+        session: Arc::new(session::SessionTracker::new(
+            config.session.max_entries,
+            config.session.ttl_seconds,
+        )),
         auth: Arc::new(auth::AuthManager::new(std::path::PathBuf::from(auth_path))),
         admin_key,
         config,
@@ -163,15 +169,31 @@ async fn completions(
             .body(axum::body::Body::from(cached_body))
             .map_err(internal);
     }
-    let classification = state
+    let mut classification = state
         .classifier
         .classify(&request)
         .await
         .map_err(internal)?;
+    if state.config.session.enabled {
+        if let Some(key) = session::session_key(&request) {
+            if let Some(session_tier) = state.session.get(&key) {
+                if session_tier > classification.tier {
+                    classification.tier = session_tier;
+                    classification.reasons.push("session-continuity".into());
+                }
+            }
+        }
+    }
     let route = state
         .policy
         .select(&request, &classification)
         .map_err(internal)?;
+    let effective_tier = state.policy.effective_tier(&request, &classification);
+    if state.config.session.enabled {
+        if let Some(key) = session::session_key(&request) {
+            state.session.update(&key, effective_tier);
+        }
+    }
     let stream_requested = request.stream.unwrap_or(false);
     request.model = route.model.clone();
     if request.max_tokens.is_none() {
@@ -213,7 +235,7 @@ async fn completions(
             .header("x-miser-cache", HeaderValue::from_static("miss"))
             .header(
                 "x-miser-tier",
-                HeaderValue::from_str(&format_tier(classification.tier)).unwrap(),
+                HeaderValue::from_str(&format_tier(effective_tier)).unwrap(),
             )
             .header(
                 "x-miser-model",
@@ -245,7 +267,7 @@ async fn completions(
         .header("x-miser-cache", HeaderValue::from_static("miss"))
         .header(
             "x-miser-tier",
-            HeaderValue::from_str(&format_tier(classification.tier)).unwrap(),
+            HeaderValue::from_str(&format_tier(effective_tier)).unwrap(),
         )
         .header(
             "x-miser-model",
