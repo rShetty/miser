@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# OpenCode2 - Miser Gateway Management Script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+case "${1:-start}" in
+    start)
+        echo "🚀 Starting OpenCode2 background server..."
+        "$SCRIPT_DIR/start_server.sh"
+        ;;
+    stop)
+        echo "🛑 Stopping OpenCode2 background server..."
+        "$SCRIPT_DIR/stop_server.sh"
+        ;;
+    restart)
+        echo "🔄 Restarting OpenCode2 background server..."
+        "$SCRIPT_DIR/stop_server.sh"
+        sleep 1
+        "$SCRIPT_DIR/start_server.sh"
+        ;;
+    status)
+        if [ -f "$SCRIPT_DIR/server.pid" ]; then
+            PID=$(cat "$SCRIPT_DIR/server.pid")
+            if kill -0 $PID 2>/dev/null; then
+                echo "✅ OpenCode2 server is running (PID: $PID)"
+                echo "🔗 Health: curl http://localhost:8787/health/live"
+            else
+                echo "❌ Server not running (stale PID file)"
+            fi
+        else
+            echo "❌ OpenCode2 server is not running"
+        fi
+        ;;
+    logs)
+        if [ -f "$SCRIPT_DIR/server.log" ]; then
+            tail -f "$SCRIPT_DIR/server.log"
+        else
+            echo "❌ No log file found"
+        fi
+        ;;
+    help|--help|-h)
+        echo "OpenCode2 - Miser AI Gateway Management"
+        echo ""
+        echo "Usage: $0 [command]"
+        echo ""
+        echo "Commands:"
+        echo "  start     Start the background server (default)"
+        echo "  stop      Stop the background server"
+        echo "  restart   Restart the background server"
+        echo "  status    Check server status"
+        echo "  logs      Follow server logs"
+        echo "  help      Show this help message"
+        echo ""
+        echo "Server runs on http://localhost:8787"
+        ;;
+    *)
+        echo "❌ Unknown command: $1"
+        echo "Use '$0 help' for usage information"
+        exit 1
+        ;;
+esac

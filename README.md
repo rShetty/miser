@@ -276,6 +276,32 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Ecosystem
+
+Miser is part of a six-project AI governance ecosystem for enterprises:
+
+| Project | Role | Repo |
+|---|---|---|
+| **Hive** | Agent runtime & orchestration | [rShetty/hive](https://github.com/rShetty/hive) |
+| **Patroclus** | Authorization infrastructure | [rShetty/patroclus](https://github.com/rShetty/patroclus) |
+| **Relay** | MCP gateway & tool proxy | [rShetty/relay](https://github.com/rShetty/relay) |
+| **Miser** | LLM cost optimization | [rShetty/miser](https://github.com/rShetty/miser) |
+| **Sentiel** | Observability, DLP & compliance | [rShetty/sentiel](https://github.com/rShetty/sentiel) |
+| **Aegis** | Network egress & attestation | [rShetty/Aegis](https://github.com/rShetty/Aegis) |
+
+Hive agents route LLM calls through Miser by setting `OPENROUTER_BASE_URL` to
+Miser's endpoint. Miser classifies each request's complexity and routes to the
+cheapest capable model, reducing LLM costs by 80%+. Cost data flows to Sentiel
+for budget tracking and anomaly detection.
+
+Run the full ecosystem:
+```bash
+~/patroclus/scripts/start-ecosystem.sh start  # Starts all 6 services
+```
+
+See the [ecosystem documentation](https://github.com/rShetty/patroclus/blob/main/docs/ECOSYSTEM.md)
+for the complete integration guide.
+
 ## License
 
 MIT
