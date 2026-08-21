@@ -94,3 +94,9 @@ Keep the last known-good binary, configuration, and commit reference. Roll back 
 ## Capacity
 
 Monitor CPU, memory, open file descriptors, upstream latency, and active requests. Scale horizontally behind a TLS reverse proxy when one VPS is insufficient. Keep model selection and classifier policy identical across replicas.
+
+## Supply chain
+
+- All third-party GitHub Actions are pinned to full commit SHAs (tags kept as comments).
+- An SBOM (SPDX JSON) is generated per run via `cargo sbom` and uploaded as a workflow artifact (`miser-sbom-spdx`).
+- Artifact promotion plan: near-term goal is building the release binary in CI, generating its SBOM, signing it (cosign keyless), and promoting that exact artifact to the VPS instead of building ad hoc on the host. Until then, the VPS build is reproducible via the committed `Cargo.lock` (`--locked`).
