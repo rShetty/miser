@@ -524,3 +524,148 @@ mod quota_tests {
         assert!(!q.check_budget("k", 1.0));
     }
 }
+
+/// Append-only, hash-chained audit trail for admin key operations.
+///
+/// Each line records prev-hash/row-hash (SHA-256 over the canonical JSON),
+/// mirroring the patroclus design, so tampering is detectable via
+/// [`AuditLog::verify_chain`].
+pub struct AuditLog {
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub ts: u64,
+    pub actor: String,
+    pub action: String,
+    pub target: String,
+    pub prev_hash: String,
+    pub row_hash: String,
+}
+
+impl AuditLog {
+    pub fn new(path: PathBuf) -> Self {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        Self { path }
+    }
+
+    fn compute_row_hash(entry: &AuditEntry) -> String {
+        let canonical = json!({
+            "ts": entry.ts,
+            "actor": entry.actor,
+            "action": entry.action,
+            "target": entry.target,
+            "prev_hash": entry.prev_hash,
+        })
+        .to_string();
+        sha256_hex(&canonical)
+    }
+
+    /// Last row hash on chain, or empty string for a fresh log.
+    fn last_hash(&self) -> String {
+        match fs::read_to_string(&self.path) {
+            Ok(text) => text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .rfind(|_| true)
+                .and_then(|l| serde_json::from_str::<AuditEntry>(l).ok())
+                .map(|e| e.row_hash)
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    }
+
+    pub fn append(&self, actor: &str, action: &str, target: &str) -> Result<(), AuthError> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut entry = AuditEntry {
+            ts,
+            actor: actor.to_string(),
+            action: action.to_string(),
+            target: target.to_string(),
+            prev_hash: self.last_hash(),
+            row_hash: String::new(),
+        };
+        entry.row_hash = Self::compute_row_hash(&entry);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|_| AuthError::StoreError)?;
+        use std::io::Write as _;
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&entry).map_err(|_| AuthError::StoreError)?
+        )
+        .map_err(|_| AuthError::StoreError)?;
+        Ok(())
+    }
+
+    /// Recompute the full chain; returns Err with the first broken line number.
+    pub fn verify_chain(&self) -> Result<usize, String> {
+        let text =
+            fs::read_to_string(&self.path).map_err(|_| "audit log unreadable".to_string())?;
+        let mut prev = String::new();
+        let mut count = 0usize;
+        for (idx, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+            count += 1;
+            let entry: AuditEntry = serde_json::from_str(line)
+                .map_err(|_| format!("line {}: malformed entry", idx + 1))?;
+            if entry.prev_hash != prev {
+                return Err(format!("line {}: prev_hash mismatch", idx + 1));
+            }
+            if entry.row_hash != Self::compute_row_hash(&entry) {
+                return Err(format!("line {}: row_hash mismatch", idx + 1));
+            }
+            prev = entry.row_hash;
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn append_and_verify_chain() {
+        let path = std::env::temp_dir().join(format!(
+            "miser_audit_{}_{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = AuditLog::new(path.clone());
+        log.append("admin", "create_key", "key_a").unwrap();
+        log.append("admin", "delete_key", "key_b").unwrap();
+        assert_eq!(log.verify_chain().unwrap(), 2);
+    }
+
+    #[test]
+    fn tampering_is_detected() {
+        let path = std::env::temp_dir().join(format!(
+            "miser_audit_tamper_{}_{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = AuditLog::new(path.clone());
+        log.append("admin", "create_key", "key_a").unwrap();
+        log.append("admin", "delete_key", "key_b").unwrap();
+        // Tamper: rewrite line 1.
+        let text = fs::read_to_string(&path).unwrap();
+        let tampered = text.replacen("create_key", "HACKED", 1);
+        fs::write(&path, tampered).unwrap();
+        assert!(log.verify_chain().is_err());
+    }
+}

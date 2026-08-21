@@ -50,6 +50,7 @@ struct AppState {
     auth: Arc<auth::AuthManager>,
     quotas: Arc<auth::QuotaEnforcer>,
     metrics: Arc<metrics::Metrics>,
+    audit: Arc<auth::AuditLog>,
     admin_key: String,
 }
 
@@ -107,6 +108,10 @@ async fn main() -> anyhow::Result<()> {
         auth: Arc::new(auth::AuthManager::new(std::path::PathBuf::from(auth_path))),
         quotas: Arc::new(auth::QuotaEnforcer::new()),
         metrics: Arc::new(metrics::Metrics::new()?),
+        audit: Arc::new(auth::AuditLog::new(std::path::PathBuf::from(
+            std::env::var("MISER_AUDIT_FILE")
+                .unwrap_or_else(|_| "/var/lib/miser/audit.jsonl".to_string()),
+        ))),
         admin_key,
         config,
     };
@@ -183,6 +188,7 @@ fn build_router(state: AppState) -> Router {
         .route("/admin/keys", get(list_keys))
         .route("/admin/keys/{id}", get(get_key))
         .route("/admin/keys/{id}", patch(update_key))
+        .route("/admin/audit/verify", get(verify_audit))
         .route("/admin/keys/{id}", delete(delete_key))
         .route("/admin/keys/{id}/rotate", post(rotate_key))
         .with_state(Arc::new(state))
@@ -552,10 +558,13 @@ async fn create_key(
         monthly_budget_usd,
         expires_at,
     ) {
-        Ok(raw_key) => Ok(Json(json!({
-            "key": raw_key,
-            "message": "Store this key securely. It will not be shown again."
-        }))),
+        Ok(raw_key) => {
+            let _ = state.audit.append("admin", "create_key", owner);
+            Ok(Json(json!({
+                "key": raw_key,
+                "message": "Store this key securely. It will not be shown again."
+            })))
+        }
         Err(_) => Err(auth::json_error(
             "failed to create key",
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -649,6 +658,23 @@ async fn update_key(
     }
 }
 
+/// Verify the admin audit hash chain.
+async fn verify_audit(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    match state.audit.verify_chain() {
+        Ok(count) => Ok(Json(json!({"valid": true, "entries": count}))),
+        Err(e) => Ok(Json(json!({"valid": false, "error": e}))),
+    }
+}
+
 async fn delete_key(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -661,7 +687,10 @@ async fn delete_key(
         ));
     }
     match state.auth.delete_key(&id) {
-        Ok(_) => Ok(Json(json!({"message": "key deleted"}))),
+        Ok(_) => {
+            let _ = state.audit.append("admin", "delete_key", &id);
+            Ok(Json(json!({"message": "key deleted"})))
+        }
         Err(auth::AuthError::NotFound) => {
             Err(auth::json_error("key not found", StatusCode::NOT_FOUND))
         }
@@ -686,10 +715,13 @@ async fn rotate_key(
         ));
     }
     match state.auth.rotate_key(&id) {
-        Ok(raw_key) => Ok(Json(json!({
-            "key": raw_key,
-            "message": "Store this key securely. The previous key is now invalid."
-        }))),
+        Ok(raw_key) => {
+            let _ = state.audit.append("admin", "rotate_key", &id);
+            Ok(Json(json!({
+                "key": raw_key,
+                "message": "Store this key securely. The previous key is now invalid."
+            })))
+        }
         Err(auth::AuthError::NotFound) => {
             Err(auth::json_error("key not found", StatusCode::NOT_FOUND))
         }
@@ -746,6 +778,14 @@ mod integration_tests {
             auth: Arc::new(auth::AuthManager::new(keys_file)),
             quotas: Arc::new(auth::QuotaEnforcer::new()),
             metrics: Arc::new(metrics::Metrics::new().unwrap()),
+            audit: Arc::new(auth::AuditLog::new(std::env::temp_dir().join(format!(
+                "miser_test_audit_{}_{}.jsonl",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )))),
             admin_key: admin_key.to_string(),
             config,
         }
