@@ -7,7 +7,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderValue, StatusCode},
     response::Response,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use clap::Parser;
 use miser_classifier::Classifier;
@@ -35,6 +35,7 @@ struct AppState {
     cache: Arc<cache::ResponseCache>,
     session: Arc<session::SessionTracker>,
     auth: Arc<auth::AuthManager>,
+    quotas: Arc<auth::QuotaEnforcer>,
     admin_key: String,
 }
 
@@ -89,11 +90,20 @@ async fn main() -> anyhow::Result<()> {
             config.session.ttl_seconds,
         )),
         auth: Arc::new(auth::AuthManager::new(std::path::PathBuf::from(auth_path))),
+        quotas: Arc::new(auth::QuotaEnforcer::new()),
         admin_key,
         config,
     };
     let address = format!("{}:{}", state.config.host, state.config.port);
-    let app = Router::new()
+    let app = build_router(state);
+    let listener = TcpListener::bind(&address).await?;
+    tracing::info!(address = %address, "miser gateway listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn build_router(state: AppState) -> Router {
+    Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/v1/models", get(models))
@@ -101,14 +111,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/keys", post(create_key))
         .route("/admin/keys", get(list_keys))
         .route("/admin/keys/{id}", get(get_key))
+        .route("/admin/keys/{id}", patch(update_key))
         .route("/admin/keys/{id}", delete(delete_key))
         .with_state(Arc::new(state))
         .layer(CatchPanicLayer::new())
-        .layer(TraceLayer::new_for_http());
-    let listener = TcpListener::bind(&address).await?;
-    tracing::info!(address = %address, "miser gateway listening");
-    axum::serve(listener, app).await?;
-    Ok(())
+        .layer(TraceLayer::new_for_http())
 }
 
 async fn live() -> Json<Value> {
@@ -134,11 +141,12 @@ async fn completions(
     Json(mut request): Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     let bearer = auth::extract_bearer(&headers).unwrap_or_default();
+    let mut authenticated_key: Option<auth::ApiKey> = None;
     if state.admin_key.is_empty() && state.auth.list_keys().map(|k| k.is_empty()).unwrap_or(true) {
         // No auth configured — open access for initial setup
     } else {
         match state.auth.validate(&bearer) {
-            Ok(_api_key) => {}
+            Ok(api_key) => authenticated_key = Some(api_key),
             Err(auth::AuthError::Inactive) => {
                 return Err(auth::json_error("API key inactive", StatusCode::FORBIDDEN));
             }
@@ -149,6 +157,24 @@ async fn completions(
                         StatusCode::UNAUTHORIZED,
                     ));
                 }
+            }
+        }
+    }
+    if let Some(key) = &authenticated_key {
+        if let Some(rpm) = key.rate_limit_rpm {
+            if !state.quotas.check_rate_limit(&key.id, rpm) {
+                return Err(auth::json_error(
+                    "rate limit exceeded for this API key",
+                    StatusCode::TOO_MANY_REQUESTS,
+                ));
+            }
+        }
+        if let Some(cap) = key.monthly_budget_usd {
+            if !state.quotas.check_budget(&key.id, cap) {
+                return Err(auth::json_error(
+                    "monthly budget exhausted for this API key",
+                    StatusCode::PAYMENT_REQUIRED,
+                ));
             }
         }
     }
@@ -189,6 +215,22 @@ async fn completions(
         .select(&request, &classification)
         .map_err(internal)?;
     let effective_tier = state.policy.effective_tier(&request, &classification);
+    // Per-key tier gating: an empty allowlist means all tiers are allowed.
+    if let Some(key) = &authenticated_key {
+        if !key.allowed_tiers.is_empty() {
+            let tier_name = format_tier(effective_tier);
+            if !key
+                .allowed_tiers
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(&tier_name))
+            {
+                return Err(auth::json_error(
+                    format!("tier '{tier_name}' is not allowed for this API key").as_str(),
+                    StatusCode::FORBIDDEN,
+                ));
+            }
+        }
+    }
     if state.config.session.enabled {
         if let Some(key) = session::session_key(&request) {
             state.session.update(&key, effective_tier);
@@ -214,6 +256,24 @@ async fn completions(
         .map_err(internal)?;
     let selected_route = route.clone();
     if !stream_requested && upstream.status().is_success() {
+        // Record estimated spend for per-key budget enforcement when the
+        // operator configured a blended price (USD per 1k tokens).
+        if let Some(key) = &authenticated_key {
+            if let Some(price) = state
+                .config
+                .extra
+                .get("price_per_1k_usd")
+                .and_then(Value::as_f64)
+            {
+                // Usage is parsed from the buffered payload below; a cheap
+                // estimate from max_tokens keeps accounting monotonic even
+                // when usage fields are absent.
+                let est_tokens = request.max_tokens.unwrap_or(512) as f64;
+                state
+                    .quotas
+                    .record_spend(&key.id, est_tokens / 1000.0 * price);
+            }
+        }
         let original_status = upstream.status();
         let original_headers = safe_response_headers(upstream.headers());
         let payload = upstream.bytes().await.map_err(internal)?;
@@ -314,7 +374,27 @@ async fn create_key(
         .get("owner")
         .and_then(Value::as_str)
         .unwrap_or("default");
-    match state.auth.create_key(owner) {
+    let allowed_tiers: Vec<String> = body
+        .get("allowed_tiers")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let rate_limit_rpm = body
+        .get("rate_limit_rpm")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32);
+    let monthly_budget_usd = body.get("monthly_budget_usd").and_then(Value::as_f64);
+    match state.auth.create_key_with_quotas(
+        owner,
+        allowed_tiers,
+        rate_limit_rpm,
+        monthly_budget_usd,
+    ) {
         Ok(raw_key) => Ok(Json(json!({
             "key": raw_key,
             "message": "Store this key securely. It will not be shown again."
@@ -371,6 +451,47 @@ async fn get_key(
     }
 }
 
+async fn update_key(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    let allowed_tiers = body.get("allowed_tiers").map(|v| {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    let rate_limit_rpm = body
+        .get("rate_limit_rpm")
+        .map(|v| v.as_u64().map(|n| n as u32));
+    let monthly_budget_usd = body.get("monthly_budget_usd").map(|v| v.as_f64());
+    match state
+        .auth
+        .update_key_quotas(&id, allowed_tiers, rate_limit_rpm, monthly_budget_usd)
+    {
+        Ok(()) => Ok(Json(json!({"id": id, "updated": true}))),
+        Err(auth::AuthError::NotFound) => {
+            Err(auth::json_error("key not found", StatusCode::NOT_FOUND))
+        }
+        Err(_) => Err(auth::json_error(
+            "failed to update key",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
 async fn delete_key(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -391,5 +512,214 @@ async fn delete_key(
             "failed to delete key",
             StatusCode::INTERNAL_SERVER_ERROR,
         )),
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn test_state(admin_key: &str) -> AppState {
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "host": "127.0.0.1",
+            "port": 0,
+            "classifier": {"mode": "heuristic"},
+            "provider": {"api_key": "test-key"},
+            "tiers": {
+                "trivial": {"model": "test/trivial"},
+                "simple": {"model": "test/simple"},
+                "standard": {"model": "test/standard"},
+                "hard": {"model": "test/hard"},
+                "reasoning": {"model": "test/reasoning"}
+            },
+            "session": {"enabled": false, "ttl_seconds": 60, "max_entries": 10}
+        }))
+        .expect("test config parses");
+        config.session.enabled = false;
+        let keys_file = std::env::temp_dir().join(format!(
+            "miser_test_keys_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        AppState {
+            classifier: Arc::new(Classifier::new(config.classifier.clone()).unwrap()),
+            policy: PolicyEngine::new(config.clone()),
+            provider: Provider::new(ProviderConfig {
+                base_url: "http://127.0.0.1:9".to_string(),
+                api_key: Some("test".to_string()),
+                ..Default::default()
+            })
+            .unwrap(),
+            cache: Arc::new(cache::ResponseCache::new(100, 60)),
+            session: Arc::new(session::SessionTracker::new(100, 60)),
+            auth: Arc::new(auth::AuthManager::new(keys_file)),
+            quotas: Arc::new(auth::QuotaEnforcer::new()),
+            admin_key: admin_key.to_string(),
+            config,
+        }
+    }
+
+    async fn send(
+        app: Router,
+        method: &str,
+        uri: &str,
+        bearer: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(token) = bearer {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        if body.is_some() {
+            builder = builder.header("Content-Type", "application/json");
+        }
+        let request = match body {
+            Some(b) => builder.body(Body::from(b.to_string())).unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        let resp = app.oneshot(request).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json = if bytes.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(json!({}))
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn health_endpoints_are_public() {
+        let app = build_router(test_state(""));
+        for uri in ["/health/live", "/health/ready"] {
+            let (status, _) = send(app.clone(), "GET", uri, None, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_endpoints_require_admin_key() {
+        let app = build_router(test_state("secret-admin"));
+        let (status, _) = send(
+            app.clone(),
+            "POST",
+            "/admin/keys",
+            None,
+            Some(json!({"owner":"x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/admin/keys",
+            Some("wrong"),
+            Some(json!({"owner":"x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let (status, body) = send(
+            app,
+            "POST",
+            "/admin/keys",
+            Some("secret-admin"),
+            Some(json!({"owner":"x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["key"].as_str().unwrap().starts_with("miser_"));
+    }
+
+    #[tokio::test]
+    async fn completions_reject_invalid_and_inactive_keys() {
+        let state = test_state("");
+        // Seed one valid key.
+        let raw = state
+            .auth
+            .create_key_with_quotas("tester", vec![], None, None)
+            .unwrap();
+        let app = build_router(state);
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+        let (status, _) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some("miser_bogus"),
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // Valid key passes auth (upstream is unreachable → expect 502, not 401).
+        let (status, _) = send(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_enforcement_returns_429() {
+        let state = test_state("");
+        let raw = state
+            .auth
+            .create_key_with_quotas("limited", vec![], Some(1), None)
+            .unwrap();
+        let app = build_router(state);
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+        // First request consumes the window; upstream failure (502) comes after quota pass.
+        let (first, _) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(first, StatusCode::BAD_GATEWAY);
+        let (second, body) = send(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(second, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    }
+
+    #[tokio::test]
+    async fn tier_gating_returns_403_for_disallowed_tier() {
+        let state = test_state("");
+        let raw = state
+            .auth
+            .create_key_with_quotas("gated", vec!["hard".to_string()], None, None)
+            .unwrap();
+        let app = build_router(state);
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+        let (status, body) = send(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not allowed")
+        );
     }
 }

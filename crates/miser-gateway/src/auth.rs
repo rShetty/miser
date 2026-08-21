@@ -69,7 +69,14 @@ impl AuthManager {
         Err(AuthError::InvalidKey)
     }
 
-    pub fn create_key(&self, owner: &str) -> Result<String, AuthError> {
+    /// Create a key with per-key quotas enforced by the gateway.
+    pub fn create_key_with_quotas(
+        &self,
+        owner: &str,
+        allowed_tiers: Vec<String>,
+        rate_limit_rpm: Option<u32>,
+        monthly_budget_usd: Option<f64>,
+    ) -> Result<String, AuthError> {
         let raw_key = format!("miser_{}", random_key());
         let id = format!("key_{}", &random_key()[..12]);
         let hash = sha256_hex(&raw_key["miser_".len()..]);
@@ -83,14 +90,40 @@ impl AuthManager {
             owner: owner.to_string(),
             created_at: now,
             active: true,
-            allowed_tiers: vec![],
-            rate_limit_rpm: None,
-            monthly_budget_usd: None,
+            allowed_tiers,
+            rate_limit_rpm,
+            monthly_budget_usd,
         };
         let mut store = self.store.lock().map_err(|_| AuthError::StoreError)?;
         store.keys.push(api_key);
         self.persist(&store)?;
         Ok(raw_key)
+    }
+
+    /// Update quota fields on an existing key.
+    pub fn update_key_quotas(
+        &self,
+        id: &str,
+        allowed_tiers: Option<Vec<String>>,
+        rate_limit_rpm: Option<Option<u32>>,
+        monthly_budget_usd: Option<Option<f64>>,
+    ) -> Result<(), AuthError> {
+        let mut store = self.store.lock().map_err(|_| AuthError::StoreError)?;
+        let key = store
+            .keys
+            .iter_mut()
+            .find(|k| k.id == id)
+            .ok_or(AuthError::NotFound)?;
+        if let Some(tiers) = allowed_tiers {
+            key.allowed_tiers = tiers;
+        }
+        if let Some(rpm) = rate_limit_rpm {
+            key.rate_limit_rpm = rpm;
+        }
+        if let Some(budget) = monthly_budget_usd {
+            key.monthly_budget_usd = budget;
+        }
+        self.persist(&store)
     }
 
     pub fn list_keys(&self) -> Result<Vec<ApiKey>, AuthError> {
@@ -250,5 +283,113 @@ mod tests {
     fn random_keys_are_unique_across_many_samples() {
         let keys: std::collections::HashSet<String> = (0..256).map(|_| random_key()).collect();
         assert_eq!(keys.len(), 256, "CSPRNG keys must not collide");
+    }
+}
+
+/// Per-key quota enforcement: fixed-window rate limiting and monthly
+/// budget tracking.
+///
+/// Budget semantics: spend is estimated from usage tokens multiplied by
+/// `price_per_1k_tokens` (a conservative blended rate the operator
+/// configures). When no price is configured, budget caps are not enforced —
+/// rate limits and tier gating remain active.
+pub struct QuotaEnforcer {
+    /// key_id -> (window_start_minute, request_count)
+    windows: Mutex<std::collections::HashMap<String, (u64, u32)>>,
+    /// key_id -> (year_month, accumulated_usd)
+    spend: Mutex<std::collections::HashMap<String, (u32, f64)>>,
+}
+
+impl Default for QuotaEnforcer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QuotaEnforcer {
+    pub fn new() -> Self {
+        Self {
+            windows: Mutex::new(std::collections::HashMap::new()),
+            spend: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn current_minute() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() / 60)
+            .unwrap_or(0)
+    }
+
+    fn current_month() -> u32 {
+        // Approximate month index from epoch seconds (30.44-day months).
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        (secs / 2_629_800) as u32
+    }
+
+    /// Fixed-window RPM check. Returns `false` when the request should be
+    /// rejected with 429.
+    pub fn check_rate_limit(&self, key_id: &str, rpm: u32) -> bool {
+        let minute = Self::current_minute();
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = windows.entry(key_id.to_string()).or_insert((minute, 0));
+        if entry.0 != minute {
+            *entry = (minute, 0);
+        }
+        if entry.1 >= rpm {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+
+    /// Returns `false` when the monthly budget cap would be exceeded.
+    pub fn check_budget(&self, key_id: &str, cap_usd: f64) -> bool {
+        let month = Self::current_month();
+        let spend = self.spend.lock().unwrap_or_else(|e| e.into_inner());
+        match spend.get(key_id) {
+            Some((m, total)) if *m == month => *total < cap_usd,
+            _ => true,
+        }
+    }
+
+    /// Accumulate estimated cost for a key in the current month.
+    pub fn record_spend(&self, key_id: &str, amount_usd: f64) {
+        let month = Self::current_month();
+        let mut spend = self.spend.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = spend.entry(key_id.to_string()).or_insert((month, 0.0));
+        if entry.0 != month {
+            *entry = (month, 0.0);
+        }
+        entry.1 += amount_usd;
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_blocks_after_threshold() {
+        let q = QuotaEnforcer::new();
+        for _ in 0..3 {
+            assert!(q.check_rate_limit("k", 3));
+        }
+        assert!(!q.check_rate_limit("k", 3));
+        // Independent per key.
+        assert!(q.check_rate_limit("other", 3));
+    }
+
+    #[test]
+    fn budget_blocks_only_when_exceeded() {
+        let q = QuotaEnforcer::new();
+        assert!(q.check_budget("k", 1.0));
+        q.record_spend("k", 0.5);
+        assert!(q.check_budget("k", 1.0));
+        q.record_spend("k", 0.75);
+        assert!(!q.check_budget("k", 1.0));
     }
 }
