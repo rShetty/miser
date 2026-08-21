@@ -158,21 +158,12 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 fn random_key() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let chars: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut state = now as u64 ^ 0x9E3779B97F4A7C15;
-    let mut result = String::with_capacity(43);
-    for _ in 0..43 {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        result.push(chars[(state % chars.len() as u64) as usize] as char);
-    }
-    result
+    use rand::distr::{Alphanumeric, SampleString};
+    use rand::rand_core::UnwrapErr;
+    use rand::rngs::SysRng;
+    // Alphanumeric is uniformly distributed over [A-Za-z0-9] and SysRng is the
+    // operating system CSPRNG, so keys are unpredictable and unbiased.
+    Alphanumeric.sample_string(&mut UnwrapErr(SysRng), 43)
 }
 
 pub fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -234,5 +225,30 @@ mod tests {
     #[test]
     fn sha256_differs_for_similar_inputs() {
         assert_ne!(sha256_hex("miser_key1"), sha256_hex("miser_key2"));
+    }
+
+    #[test]
+    fn random_keys_have_expected_length_and_alphabet() {
+        for _ in 0..32 {
+            let key = random_key();
+            assert_eq!(key.len(), 43);
+            assert!(
+                key.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "key must be alphanumeric, got {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_random_keys_differ() {
+        for _ in 0..16 {
+            assert_ne!(random_key(), random_key());
+        }
+    }
+
+    #[test]
+    fn random_keys_are_unique_across_many_samples() {
+        let keys: std::collections::HashSet<String> = (0..256).map(|_| random_key()).collect();
+        assert_eq!(keys.len(), 256, "CSPRNG keys must not collide");
     }
 }
