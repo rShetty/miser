@@ -10,6 +10,15 @@ curl -fsS http://127.0.0.1:8787/health/live
 curl -fsS http://127.0.0.1:8787/health/ready
 ```
 
+## API key store
+
+Keys live in `/var/lib/miser/keys.json` as SHA-256 hashes. The hashing scheme changed from a legacy FNV-based digest to real SHA-256; **pre-existing `keys.json` entries are invalidated by this change** and must be regenerated:
+
+1. Stop the gateway or pick a low-traffic window.
+2. Back up `/var/lib/miser/keys.json` (mode 600, never to source control).
+3. Remove the stale entries (`echo '{"keys":[]}' > /var/lib/miser/keys.json`).
+4. Re-issue keys via `POST /admin/keys` and redistribute them to clients.
+
 ## Deployment
 
 Push to `main` after CI passes. The GitHub Actions deployment builds on the VPS architecture, stages binaries/configuration, restarts systemd, and checks liveness.

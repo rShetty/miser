@@ -137,19 +137,11 @@ impl AuthManager {
 }
 
 fn sha256_hex(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut hash: u64 = 14695981039346656037;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(1099511628211);
-    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
     let mut result = String::with_capacity(64);
-    let mut state = hash;
-    for _ in 0..8 {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        result.push_str(&format!("{:08x}", state));
+    for byte in digest {
+        result.push_str(&format!("{:02x}", byte));
     }
     result
 }
@@ -205,4 +197,42 @@ pub fn json_error(
     status: axum::http::StatusCode,
 ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
     (status, axum::Json(json!({"error": {"message": msg}})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_matches_known_vectors() {
+        // FIPS 180-4 test vectors.
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn sha256_is_64_lowercase_hex_chars() {
+        let digest = sha256_hex("miser_test_key");
+        assert_eq!(digest.len(), 64);
+        assert!(
+            digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+    }
+
+    #[test]
+    fn sha256_differs_for_similar_inputs() {
+        assert_ne!(sha256_hex("miser_key1"), sha256_hex("miser_key2"));
+    }
 }
