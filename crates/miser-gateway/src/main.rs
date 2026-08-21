@@ -1,6 +1,7 @@
 mod auth;
 mod cache;
 mod session;
+mod validate;
 
 use axum::{
     Json, Router,
@@ -19,6 +20,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use uuid::Uuid;
+use validate::validate_config;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -47,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let config: GatewayConfig = toml::from_str(&tokio::fs::read_to_string(&args.config).await?)?;
+    validate_config(&config).map_err(|error| anyhow::anyhow!("{error}"))?;
     let api_key = std::env::var(
         config
             .provider
