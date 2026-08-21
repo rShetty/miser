@@ -10,6 +10,34 @@ curl -fsS http://127.0.0.1:8787/health/live
 curl -fsS http://127.0.0.1:8787/health/ready
 ```
 
+## Metrics
+
+The gateway exposes Prometheus metrics at `/metrics` (text exposition format, no authentication — keep the port private or scrape through an authenticated reverse proxy):
+
+```bash
+curl -fsS http://127.0.0.1:8787/metrics
+```
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `miser_requests_total` | `route`, `status` | Requests by route and HTTP status code |
+| `miser_request_duration_seconds` | `route` | Request latency histogram |
+| `miser_tier_requests_total` | `tier` | Requests served per effective classification tier |
+| `miser_cache_hits_total` / `miser_cache_misses_total` | — | Exact-match response cache outcomes |
+| `miser_quality_escalations_total` | — | Requests escalated above the classifier's original tier |
+| `miser_upstream_errors_total` | — | Failed or errored upstream provider responses |
+
+Scrape example for Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: miser
+    static_configs:
+      - targets: ["127.0.0.1:8787"]
+```
+
+Alert suggestions: sustained `rate(miser_upstream_errors_total[5m]) > 0`, 5xx share of `miser_requests_total` above 1%, and p99 `miser_request_duration_seconds` above the request timeout.
+
 ## API key store
 
 Keys live in `/var/lib/miser/keys.json` as SHA-256 hashes. The hashing scheme changed from a legacy FNV-based digest to real SHA-256; **pre-existing `keys.json` entries are invalidated by this change** and must be regenerated:

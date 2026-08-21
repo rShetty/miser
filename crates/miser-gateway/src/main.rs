@@ -1,5 +1,6 @@
 mod auth;
 mod cache;
+mod metrics;
 mod session;
 mod validate;
 
@@ -8,7 +9,7 @@ use axum::{
     error_handling::HandleErrorLayer,
     extract::{Path, State},
     http::{HeaderValue, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
 use clap::Parser;
@@ -18,7 +19,7 @@ use miser_provider::{Provider, ProviderConfig, safe_response_headers};
 use miser_types::{ChatCompletionRequest, ComplexityTier, GatewayConfig};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
@@ -48,6 +49,7 @@ struct AppState {
     session: Arc<session::SessionTracker>,
     auth: Arc<auth::AuthManager>,
     quotas: Arc<auth::QuotaEnforcer>,
+    metrics: Arc<metrics::Metrics>,
     admin_key: String,
 }
 
@@ -104,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         )),
         auth: Arc::new(auth::AuthManager::new(std::path::PathBuf::from(auth_path))),
         quotas: Arc::new(auth::QuotaEnforcer::new()),
+        metrics: Arc::new(metrics::Metrics::new()?),
         admin_key,
         config,
     };
@@ -173,6 +176,7 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
+        .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(completions))
         .route("/admin/keys", post(create_key))
@@ -222,7 +226,52 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(models)
 }
 
+/// Serves all gateway metrics in the Prometheus text exposition format.
+async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Response {
+    match state.metrics.render() {
+        Ok(body) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4"),
+            )],
+            body,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to encode metrics");
+            (StatusCode::INTERNAL_SERVER_ERROR, "metrics encoding failed").into_response()
+        }
+    }
+}
+
+/// Wraps the completions handler so every outcome — success or typed
+/// error — is counted by route/status and observed in the latency
+/// histogram.
 async fn completions(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    request: Json<ChatCompletionRequest>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let start = Instant::now();
+    let result = completions_inner(State(state.clone()), headers, request).await;
+    let status = match &result {
+        Ok(response) => response.status(),
+        Err((status, _)) => *status,
+    };
+    state
+        .metrics
+        .requests_total
+        .with_label_values(&[metrics::COMPLETIONS_ROUTE, &status.as_u16().to_string()])
+        .inc();
+    state
+        .metrics
+        .request_duration_seconds
+        .with_label_values(&[metrics::COMPLETIONS_ROUTE])
+        .observe(start.elapsed().as_secs_f64());
+    result
+}
+
+async fn completions_inner(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Json(mut request): Json<ChatCompletionRequest>,
@@ -269,6 +318,7 @@ async fn completions(
     let body = serde_json::to_value(&request).map_err(internal)?;
     let cache_key = cache::request_hash(&body);
     if let Some((cached_body, cached_status, cached_headers)) = state.cache.get(cache_key) {
+        state.metrics.cache_hits_total.inc();
         let mut response = Response::builder().status(cached_status);
         for (name, value) in &cached_headers {
             response = response.header(name, value);
@@ -282,6 +332,7 @@ async fn completions(
             .body(axum::body::Body::from(cached_body))
             .map_err(internal);
     }
+    state.metrics.cache_misses_total.inc();
     let mut classification = state
         .classifier
         .classify(&request)
@@ -302,6 +353,14 @@ async fn completions(
         .select(&request, &classification)
         .map_err(internal)?;
     let effective_tier = state.policy.effective_tier(&request, &classification);
+    state
+        .metrics
+        .tier_requests_total
+        .with_label_values(&[&format_tier(effective_tier)])
+        .inc();
+    if effective_tier > classification.tier {
+        state.metrics.quality_escalations_total.inc();
+    }
     // Per-key tier gating: an empty allowlist means all tiers are allowed.
     if let Some(key) = &authenticated_key {
         if !key.allowed_tiers.is_empty() {
@@ -336,11 +395,16 @@ async fn completions(
         }
     }
     let body = serde_json::to_value(&request).map_err(internal)?;
-    let upstream = state
-        .provider
-        .forward(body.clone(), None)
-        .await
-        .map_err(internal)?;
+    let upstream = match state.provider.forward(body.clone(), None).await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            state.metrics.upstream_errors_total.inc();
+            return Err(internal(error));
+        }
+    };
+    if !upstream.status().is_success() {
+        state.metrics.upstream_errors_total.inc();
+    }
     let selected_route = route.clone();
     if !stream_requested && upstream.status().is_success() {
         // Record estimated spend for per-key budget enforcement when the
@@ -647,6 +711,7 @@ mod integration_tests {
             session: Arc::new(session::SessionTracker::new(100, 60)),
             auth: Arc::new(auth::AuthManager::new(keys_file)),
             quotas: Arc::new(auth::QuotaEnforcer::new()),
+            metrics: Arc::new(metrics::Metrics::new().unwrap()),
             admin_key: admin_key.to_string(),
             config,
         }
@@ -688,6 +753,76 @@ mod integration_tests {
             let (status, _) = send(app.clone(), "GET", uri, None, None).await;
             assert_eq!(status, StatusCode::OK, "{uri}");
         }
+    }
+
+    /// Like [`send`] but returns the raw response for non-JSON
+    /// endpoints such as `/metrics`.
+    async fn send_text(app: Router, method: &str, uri: &str) -> (StatusCode, String, String) {
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap_or_default().to_string())
+            .unwrap_or_default();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            content_type,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_renders_and_counters_increment() {
+        let state = test_state("");
+        // Seed one key so the gateway enforces authentication instead of
+        // falling back to open access.
+        state
+            .auth
+            .create_key_with_quotas("metrics", vec![], None, None)
+            .unwrap();
+        let app = build_router(state);
+        let (status, content_type, body) = send_text(app.clone(), "GET", "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "text/plain; version=0.0.4");
+        // Scalar families always render; vector families appear once used.
+        assert!(body.contains("# HELP miser_cache_hits_total"), "{body}");
+        assert!(
+            !body.contains("miser_requests_total{route=\"/v1/chat/completions\""),
+            "counter should be absent before traffic:\n{body}"
+        );
+
+        // A rejected completions request must bump the route/status counter.
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+        let (status, _) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some("miser_bogus"),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _, body) = send_text(app, "GET", "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(concat!(
+                "miser_requests_total{route=\"/v1/chat/completions\",",
+                "status=\"401\"} 1"
+            )),
+            "counter did not increment:\n{body}"
+        );
+        assert!(
+            body.contains("# HELP miser_request_duration_seconds"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

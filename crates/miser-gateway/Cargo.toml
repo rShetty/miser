@@ -18,6 +18,7 @@ miser-classifier = { path = "../miser-classifier" }
 miser-policy = { path = "../miser-policy" }
 miser-provider = { path = "../miser-provider" }
 miser-types = { path = "../miser-types" }
+prometheus.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
