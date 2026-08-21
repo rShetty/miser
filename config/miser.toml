@@ -1,6 +1,11 @@
 host = "0.0.0.0"
 port = 8787
 api_key = ""
+# Global cap on in-flight requests (default: 64).
+# concurrency_limit = 64
+# Per-request timeout in milliseconds, including time spent waiting for a
+# concurrency permit (default: 30000).
+# request_timeout_ms = 30000
 
 [classifier]
 mode = "hybrid"

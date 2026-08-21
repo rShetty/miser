@@ -5,6 +5,7 @@ mod validate;
 
 use axum::{
     Json, Router,
+    error_handling::HandleErrorLayer,
     extract::{Path, State},
     http::{HeaderValue, StatusCode},
     response::Response,
@@ -17,10 +18,19 @@ use miser_provider::{Provider, ProviderConfig, safe_response_headers};
 use miser_types::{ChatCompletionRequest, ComplexityTier, GatewayConfig};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use uuid::Uuid;
 use validate::validate_config;
+
+/// Default cap on in-flight requests when `concurrency_limit` is absent
+/// from the config.
+const DEFAULT_CONCURRENCY_LIMIT: usize = 64;
+/// Default per-request timeout when `request_timeout_ms` is absent from
+/// the config.
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -101,11 +111,65 @@ async fn main() -> anyhow::Result<()> {
     let app = build_router(state);
     let listener = TcpListener::bind(&address).await?;
     tracing::info!(address = %address, "miser gateway listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    tracing::info!("miser gateway shutdown complete");
     Ok(())
 }
 
+/// Resolves when SIGTERM or SIGINT is received so `with_graceful_shutdown`
+/// can stop accepting connections and drain in-flight requests.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("failed to install SIGINT handler");
+    wait_for_shutdown_signal(&mut terminate, &mut interrupt).await;
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal(
+    terminate: &mut tokio::signal::unix::Signal,
+    interrupt: &mut tokio::signal::unix::Signal,
+) {
+    tokio::select! {
+        _ = terminate.recv() => {
+            tracing::info!(signal = "SIGTERM", "shutdown signal received, draining in-flight requests");
+        }
+        _ = interrupt.recv() => {
+            tracing::info!(signal = "SIGINT", "shutdown signal received, draining in-flight requests");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!(
+        signal = "SIGINT",
+        "shutdown signal received, draining in-flight requests"
+    );
+}
+
 fn build_router(state: AppState) -> Router {
+    let concurrency_limit = state
+        .config
+        .extra
+        .get("concurrency_limit")
+        .and_then(Value::as_u64)
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_CONCURRENCY_LIMIT as u64) as usize;
+    let request_timeout = Duration::from_millis(
+        state
+            .config
+            .extra
+            .get("request_timeout_ms")
+            .and_then(Value::as_u64)
+            .filter(|timeout| *timeout > 0)
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS),
+    );
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
@@ -119,6 +183,26 @@ fn build_router(state: AppState) -> Router {
         .with_state(Arc::new(state))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
+        .layer(ConcurrencyLimitLayer::new(concurrency_limit))
+        // The timeout sits outside the concurrency limit, so the deadline
+        // covers both waiting for a permit and handling the request.
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(|error: axum::BoxError| async {
+                    handle_layer_error(error)
+                }))
+                .layer(TimeoutLayer::new(request_timeout)),
+        )
+}
+
+/// Turns tower layer errors (per-request timeouts) into JSON responses.
+fn handle_layer_error(error: axum::BoxError) -> (StatusCode, Json<Value>) {
+    if error.is::<tower::timeout::error::Elapsed>() {
+        auth::json_error("request timed out", StatusCode::REQUEST_TIMEOUT)
+    } else {
+        tracing::error!(error = %error, "request failed in middleware stack");
+        auth::json_error("internal server error", StatusCode::INTERNAL_SERVER_ERROR)
+    }
 }
 
 async fn live() -> Json<Value> {
@@ -724,5 +808,31 @@ mod integration_tests {
                 .unwrap()
                 .contains("not allowed")
         );
+    }
+
+    /// Delivering SIGTERM to our own process must complete the shutdown
+    /// future handed to `with_graceful_shutdown`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_completes_shutdown_signal_future() {
+        use std::time::Duration;
+
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .expect("install SIGINT handler");
+        let shutdown = std::pin::pin!(wait_for_shutdown_signal(&mut terminate, &mut interrupt));
+        // Give the signal handler a moment to register before delivery.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("failed to run kill");
+        assert!(status.success(), "failed to deliver SIGTERM");
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("SIGTERM should complete the shutdown future");
     }
 }
