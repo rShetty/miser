@@ -47,6 +47,8 @@ Keys live in `/var/lib/miser/keys.json` as SHA-256 hashes. The hashing scheme ch
 3. Remove the stale entries (`echo '{"keys":[]}' > /var/lib/miser/keys.json`).
 4. Re-issue keys via `POST /admin/keys` and redistribute them to clients.
 
+Keys support an optional `expires_at` (Unix seconds) set at creation time via `POST /admin/keys`; validation rejects expired keys with `403 API key expired`. To rotate a key, call `POST /admin/keys/{id}/rotate` with the admin key: the response contains the new secret exactly once and the previous secret stops working immediately (owner, quotas, tier allowlist and expiry are preserved).
+
 ## Deployment
 
 Push to `main` after CI passes. The GitHub Actions deployment builds on the VPS architecture, stages binaries/configuration, restarts systemd, and checks liveness.

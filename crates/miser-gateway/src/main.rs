@@ -184,6 +184,7 @@ fn build_router(state: AppState) -> Router {
         .route("/admin/keys/{id}", get(get_key))
         .route("/admin/keys/{id}", patch(update_key))
         .route("/admin/keys/{id}", delete(delete_key))
+        .route("/admin/keys/{id}/rotate", post(rotate_key))
         .with_state(Arc::new(state))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -285,6 +286,9 @@ async fn completions_inner(
             Ok(api_key) => authenticated_key = Some(api_key),
             Err(auth::AuthError::Inactive) => {
                 return Err(auth::json_error("API key inactive", StatusCode::FORBIDDEN));
+            }
+            Err(auth::AuthError::Expired) => {
+                return Err(auth::json_error("API key expired", StatusCode::FORBIDDEN));
             }
             Err(_) => {
                 if !auth::admin_auth(&headers, &state.admin_key) {
@@ -540,11 +544,13 @@ async fn create_key(
         .and_then(Value::as_u64)
         .map(|v| v as u32);
     let monthly_budget_usd = body.get("monthly_budget_usd").and_then(Value::as_f64);
+    let expires_at = body.get("expires_at").and_then(Value::as_u64);
     match state.auth.create_key_with_quotas(
         owner,
         allowed_tiers,
         rate_limit_rpm,
         monthly_budget_usd,
+        expires_at,
     ) {
         Ok(raw_key) => Ok(Json(json!({
             "key": raw_key,
@@ -661,6 +667,34 @@ async fn delete_key(
         }
         Err(_) => Err(auth::json_error(
             "failed to delete key",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
+/// Rotates a key: issues a fresh secret, returned exactly once in this
+/// response, and invalidates the previous secret immediately.
+async fn rotate_key(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    match state.auth.rotate_key(&id) {
+        Ok(raw_key) => Ok(Json(json!({
+            "key": raw_key,
+            "message": "Store this key securely. The previous key is now invalid."
+        }))),
+        Err(auth::AuthError::NotFound) => {
+            Err(auth::json_error("key not found", StatusCode::NOT_FOUND))
+        }
+        Err(_) => Err(auth::json_error(
+            "failed to rotate key",
             StatusCode::INTERNAL_SERVER_ERROR,
         )),
     }
@@ -785,7 +819,7 @@ mod integration_tests {
         // falling back to open access.
         state
             .auth
-            .create_key_with_quotas("metrics", vec![], None, None)
+            .create_key_with_quotas("metrics", vec![], None, None, None)
             .unwrap();
         let app = build_router(state);
         let (status, content_type, body) = send_text(app.clone(), "GET", "/metrics").await;
@@ -864,7 +898,7 @@ mod integration_tests {
         // Seed one valid key.
         let raw = state
             .auth
-            .create_key_with_quotas("tester", vec![], None, None)
+            .create_key_with_quotas("tester", vec![], None, None, None)
             .unwrap();
         let app = build_router(state);
         let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
@@ -894,7 +928,7 @@ mod integration_tests {
         let state = test_state("");
         let raw = state
             .auth
-            .create_key_with_quotas("limited", vec![], Some(1), None)
+            .create_key_with_quotas("limited", vec![], Some(1), None, None)
             .unwrap();
         let app = build_router(state);
         let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
@@ -924,7 +958,7 @@ mod integration_tests {
         let state = test_state("");
         let raw = state
             .auth
-            .create_key_with_quotas("gated", vec!["hard".to_string()], None, None)
+            .create_key_with_quotas("gated", vec!["hard".to_string()], None, None, None)
             .unwrap();
         let app = build_router(state);
         let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
@@ -943,6 +977,124 @@ mod integration_tests {
                 .unwrap()
                 .contains("not allowed")
         );
+    }
+
+    /// Expired keys are rejected with 403, and admin rotation issues a new
+    /// secret once while the old secret stops authenticating immediately.
+    #[tokio::test]
+    async fn expired_keys_rejected_and_rotation_invalidates_old_secret() {
+        let state = test_state("secret-admin");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expired_raw = state
+            .auth
+            .create_key_with_quotas("stale", vec![], None, None, Some(now - 10))
+            .unwrap();
+        let active_raw = state
+            .auth
+            .create_key_with_quotas("current", vec![], None, None, None)
+            .unwrap();
+        let active_id = state
+            .auth
+            .list_keys()
+            .unwrap()
+            .into_iter()
+            .find(|k| k.owner == "current")
+            .unwrap()
+            .id;
+        let app = build_router(state);
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+
+        // Expired key → 403 with an explicit message.
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&expired_raw),
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("expired"),
+            "{body}"
+        );
+
+        // Rotation requires the admin key.
+        let (status, _) = send(
+            app.clone(),
+            "POST",
+            &format!("/admin/keys/{active_id}/rotate"),
+            Some(&active_raw),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Admin rotation returns a fresh one-time secret.
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            &format!("/admin/keys/{active_id}/rotate"),
+            Some("secret-admin"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rotated_raw = body["key"]
+            .as_str()
+            .expect("rotated key in response")
+            .to_string();
+        assert!(rotated_raw.starts_with("miser_"));
+        assert_ne!(rotated_raw, active_raw);
+
+        // The old secret is dead; the new one passes auth (502 = upstream).
+        let (status, _) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&active_raw),
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = send(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&rotated_raw),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// Creating a key with a future `expires_at` via the admin API works
+    /// and the raw secret is returned once.
+    #[tokio::test]
+    async fn create_key_accepts_optional_expiry() {
+        let state = test_state("secret-admin");
+        let app = build_router(state);
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let (status, body) = send(
+            app,
+            "POST",
+            "/admin/keys",
+            Some("secret-admin"),
+            Some(json!({"owner":"temporary","expires_at": expires_at})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["key"].as_str().unwrap().starts_with("miser_"));
     }
 
     /// Delivering SIGTERM to our own process must complete the shutdown
