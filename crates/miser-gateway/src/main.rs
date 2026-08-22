@@ -56,10 +56,14 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .json()
-        .init();
+    let json_logs = std::env::var("RUST_LOG_FORMAT").as_deref() == Ok("json");
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env());
+    if json_logs {
+        subscriber.json().init();
+    } else {
+        subscriber.init();
+    }
     let args = Args::parse();
     let config: GatewayConfig = toml::from_str(&tokio::fs::read_to_string(&args.config).await?)?;
     validate_config(&config).map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -159,6 +163,23 @@ async fn shutdown_signal() {
         signal = "SIGINT",
         "shutdown signal received, draining in-flight requests"
     );
+}
+
+impl AppState {
+    /// Resolve the acting admin identity for audit records: the admin key
+    /// id when the caller presented a valid key, else the shared admin key
+    /// fingerprint.
+    fn admin_actor(&self, headers: &axum::http::HeaderMap) -> String {
+        if let Some(bearer) = auth::extract_bearer(headers) {
+            if let Ok(key) = self.auth.validate(&bearer) {
+                return format!("key:{}", key.id);
+            }
+            if auth::admin_auth(headers, &self.admin_key) && !self.admin_key.is_empty() {
+                return "admin-key".to_string();
+            }
+        }
+        "unknown".to_string()
+    }
 }
 
 fn build_router(state: AppState) -> Router {
@@ -559,7 +580,10 @@ async fn create_key(
         expires_at,
     ) {
         Ok(raw_key) => {
-            let _ = state.audit.append("admin", "create_key", owner);
+            let actor = state.admin_actor(&headers);
+            let _ = state
+                .audit
+                .append_outcome(&actor, "create_key", owner, "success");
             Ok(Json(json!({
                 "key": raw_key,
                 "message": "Store this key securely. It will not be shown again."
@@ -688,7 +712,10 @@ async fn delete_key(
     }
     match state.auth.delete_key(&id) {
         Ok(_) => {
-            let _ = state.audit.append("admin", "delete_key", &id);
+            let actor = state.admin_actor(&headers);
+            let _ = state
+                .audit
+                .append_outcome(&actor, "delete_key", &id, "success");
             Ok(Json(json!({"message": "key deleted"})))
         }
         Err(auth::AuthError::NotFound) => {
@@ -716,7 +743,10 @@ async fn rotate_key(
     }
     match state.auth.rotate_key(&id) {
         Ok(raw_key) => {
-            let _ = state.audit.append("admin", "rotate_key", &id);
+            let actor = state.admin_actor(&headers);
+            let _ = state
+                .audit
+                .append_outcome(&actor, "rotate_key", &id, "success");
             Ok(Json(json!({
                 "key": raw_key,
                 "message": "Store this key securely. The previous key is now invalid."

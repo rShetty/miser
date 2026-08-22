@@ -540,6 +540,7 @@ pub struct AuditEntry {
     pub actor: String,
     pub action: String,
     pub target: String,
+    pub outcome: String,
     pub prev_hash: String,
     pub row_hash: String,
 }
@@ -558,6 +559,7 @@ impl AuditLog {
             "actor": entry.actor,
             "action": entry.action,
             "target": entry.target,
+            "outcome": entry.outcome,
             "prev_hash": entry.prev_hash,
         })
         .to_string();
@@ -578,7 +580,13 @@ impl AuditLog {
         }
     }
 
-    pub fn append(&self, actor: &str, action: &str, target: &str) -> Result<(), AuthError> {
+    pub fn append_outcome(
+        &self,
+        actor: &str,
+        action: &str,
+        target: &str,
+        outcome: &str,
+    ) -> Result<(), AuthError> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -588,6 +596,7 @@ impl AuditLog {
             actor: actor.to_string(),
             action: action.to_string(),
             target: target.to_string(),
+            outcome: outcome.to_string(),
             prev_hash: self.last_hash(),
             row_hash: String::new(),
         };
@@ -644,8 +653,10 @@ mod audit_tests {
                 .as_nanos()
         ));
         let log = AuditLog::new(path.clone());
-        log.append("admin", "create_key", "key_a").unwrap();
-        log.append("admin", "delete_key", "key_b").unwrap();
+        log.append_outcome("admin", "create_key", "key_a", "success")
+            .unwrap();
+        log.append_outcome("admin", "delete_key", "key_b", "success")
+            .unwrap();
         assert_eq!(log.verify_chain().unwrap(), 2);
     }
 
@@ -660,8 +671,10 @@ mod audit_tests {
                 .as_nanos()
         ));
         let log = AuditLog::new(path.clone());
-        log.append("admin", "create_key", "key_a").unwrap();
-        log.append("admin", "delete_key", "key_b").unwrap();
+        log.append_outcome("admin", "create_key", "key_a", "success")
+            .unwrap();
+        log.append_outcome("admin", "delete_key", "key_b", "success")
+            .unwrap();
         // Tamper: rewrite line 1.
         let text = fs::read_to_string(&path).unwrap();
         let tampered = text.replacen("create_key", "HACKED", 1);

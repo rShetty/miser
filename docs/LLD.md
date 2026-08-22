@@ -49,7 +49,7 @@ ClassificationResult {
 ```text
 ApiKey {
   id: String,                  // key_<12 random chars>
-  key_hash: String,            // SHA-256 hash (FNV-based, 64 hex chars)
+  key_hash: String,            // SHA-256 hash (SHA-256, 64 hex chars)
   owner: String,
   created_at: u64,             // Unix timestamp
   active: bool,
