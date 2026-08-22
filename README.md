@@ -207,6 +207,8 @@ Run configured model-assisted modes when available:
 
 Miser supports API key authentication for all `/v1/` endpoints. Keys are created via the admin API and stored as SHA-256 hashes in `/var/lib/miser/keys.json`.
 
+> **Migration note:** earlier releases computed key hashes with a non-standard FNV-based digest while the docs claimed SHA-256. As of this release keys are hashed with real SHA-256, which **invalidates every hash already stored in `keys.json`**. Existing stored entries can no longer match incoming keys, so the store must be regenerated: delete `/var/lib/miser/keys.json` (or remove its entries), issue new keys via `POST /admin/keys`, and redistribute them to clients.
+
 ### Admin API
 
 Set `MISER_ADMIN_KEY` in `/etc/miser/miser.env`:

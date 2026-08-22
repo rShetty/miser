@@ -19,6 +19,10 @@ pub struct ApiKey {
     pub rate_limit_rpm: Option<u32>,
     #[serde(default)]
     pub monthly_budget_usd: Option<f64>,
+    /// Unix timestamp (seconds) after which the key is rejected. `None`
+    /// means the key never expires.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,9 +40,18 @@ pub struct AuthManager {
 pub enum AuthError {
     InvalidKey,
     Inactive,
+    Expired,
     StoreError,
     NotFound,
     AlreadyExists,
+}
+
+/// Current Unix time in seconds; `0` if the clock is before the epoch.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl AuthManager {
@@ -63,34 +76,90 @@ impl AuthManager {
         let store = self.store.lock().map_err(|_| AuthError::StoreError)?;
         for api_key in &store.keys {
             if api_key.active && constant_time_eq(&api_key.key_hash, &hash) {
+                if let Some(expires_at) = api_key.expires_at {
+                    if unix_now() >= expires_at {
+                        return Err(AuthError::Expired);
+                    }
+                }
                 return Ok(api_key.clone());
             }
         }
         Err(AuthError::InvalidKey)
     }
 
-    pub fn create_key(&self, owner: &str) -> Result<String, AuthError> {
+    /// Create a key with per-key quotas enforced by the gateway.
+    pub fn create_key_with_quotas(
+        &self,
+        owner: &str,
+        allowed_tiers: Vec<String>,
+        rate_limit_rpm: Option<u32>,
+        monthly_budget_usd: Option<f64>,
+        expires_at: Option<u64>,
+    ) -> Result<String, AuthError> {
         let raw_key = format!("miser_{}", random_key());
         let id = format!("key_{}", &random_key()[..12]);
         let hash = sha256_hex(&raw_key["miser_".len()..]);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = unix_now();
         let api_key = ApiKey {
             id,
             key_hash: hash,
             owner: owner.to_string(),
             created_at: now,
             active: true,
-            allowed_tiers: vec![],
-            rate_limit_rpm: None,
-            monthly_budget_usd: None,
+            allowed_tiers,
+            rate_limit_rpm,
+            monthly_budget_usd,
+            expires_at,
         };
         let mut store = self.store.lock().map_err(|_| AuthError::StoreError)?;
         store.keys.push(api_key);
         self.persist(&store)?;
         Ok(raw_key)
+    }
+
+    /// Rotate a key: replaces its secret with a freshly generated one and
+    /// returns the new raw key. The old secret stops working immediately
+    /// (no grace period); owner, quotas, tier allowlist and expiry are
+    /// preserved. The raw key is visible only in this return value.
+    pub fn rotate_key(&self, id: &str) -> Result<String, AuthError> {
+        let raw_key = format!("miser_{}", random_key());
+        let hash = sha256_hex(&raw_key["miser_".len()..]);
+        let mut store = self.store.lock().map_err(|_| AuthError::StoreError)?;
+        let key = store
+            .keys
+            .iter_mut()
+            .find(|k| k.id == id)
+            .ok_or(AuthError::NotFound)?;
+        key.key_hash = hash;
+        key.active = true;
+        self.persist(&store)?;
+        Ok(raw_key)
+    }
+
+    /// Update quota fields on an existing key.
+    pub fn update_key_quotas(
+        &self,
+        id: &str,
+        allowed_tiers: Option<Vec<String>>,
+        rate_limit_rpm: Option<Option<u32>>,
+        monthly_budget_usd: Option<Option<f64>>,
+    ) -> Result<(), AuthError> {
+        let mut store = self.store.lock().map_err(|_| AuthError::StoreError)?;
+        let key = store
+            .keys
+            .iter_mut()
+            .find(|k| k.id == id)
+            .ok_or(AuthError::NotFound)?;
+        if let Some(tiers) = allowed_tiers {
+            key.allowed_tiers = tiers;
+        }
+        if let Some(rpm) = rate_limit_rpm {
+            key.rate_limit_rpm = rpm;
+        }
+        if let Some(budget) = monthly_budget_usd {
+            key.monthly_budget_usd = budget;
+        }
+        self.persist(&store)
     }
 
     pub fn list_keys(&self) -> Result<Vec<ApiKey>, AuthError> {
@@ -137,19 +206,11 @@ impl AuthManager {
 }
 
 fn sha256_hex(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut hash: u64 = 14695981039346656037;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(1099511628211);
-    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
     let mut result = String::with_capacity(64);
-    let mut state = hash;
-    for _ in 0..8 {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        result.push_str(&format!("{:08x}", state));
+    for byte in digest {
+        result.push_str(&format!("{:02x}", byte));
     }
     result
 }
@@ -166,21 +227,12 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 fn random_key() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let chars: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut state = now as u64 ^ 0x9E3779B97F4A7C15;
-    let mut result = String::with_capacity(43);
-    for _ in 0..43 {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        result.push(chars[(state % chars.len() as u64) as usize] as char);
-    }
-    result
+    use rand::distr::{Alphanumeric, SampleString};
+    use rand::rand_core::UnwrapErr;
+    use rand::rngs::SysRng;
+    // Alphanumeric is uniformly distributed over [A-Za-z0-9] and SysRng is the
+    // operating system CSPRNG, so keys are unpredictable and unbiased.
+    Alphanumeric.sample_string(&mut UnwrapErr(SysRng), 43)
 }
 
 pub fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -205,4 +257,415 @@ pub fn json_error(
     status: axum::http::StatusCode,
 ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
     (status, axum::Json(json!({"error": {"message": msg}})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_matches_known_vectors() {
+        // FIPS 180-4 test vectors.
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn sha256_is_64_lowercase_hex_chars() {
+        let digest = sha256_hex("miser_test_key");
+        assert_eq!(digest.len(), 64);
+        assert!(
+            digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+    }
+
+    #[test]
+    fn sha256_differs_for_similar_inputs() {
+        assert_ne!(sha256_hex("miser_key1"), sha256_hex("miser_key2"));
+    }
+
+    #[test]
+    fn random_keys_have_expected_length_and_alphabet() {
+        for _ in 0..32 {
+            let key = random_key();
+            assert_eq!(key.len(), 43);
+            assert!(
+                key.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "key must be alphanumeric, got {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_random_keys_differ() {
+        for _ in 0..16 {
+            assert_ne!(random_key(), random_key());
+        }
+    }
+
+    #[test]
+    fn random_keys_are_unique_across_many_samples() {
+        let keys: std::collections::HashSet<String> = (0..256).map(|_| random_key()).collect();
+        assert_eq!(keys.len(), 256, "CSPRNG keys must not collide");
+    }
+
+    fn temp_store(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "miser_auth_test_{tag}_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn expired_key_is_rejected_by_validate() {
+        let manager = AuthManager::new(temp_store("expired"));
+        let now = unix_now();
+        let raw = manager
+            .create_key_with_quotas("legacy", vec![], None, None, Some(now.saturating_sub(10)))
+            .unwrap();
+        assert!(matches!(manager.validate(&raw), Err(AuthError::Expired)));
+    }
+
+    #[test]
+    fn key_expiring_in_the_future_is_accepted() {
+        let manager = AuthManager::new(temp_store("future"));
+        let raw = manager
+            .create_key_with_quotas("fresh", vec![], None, None, Some(unix_now() + 3_600))
+            .unwrap();
+        let validated = manager.validate(&raw).unwrap();
+        assert_eq!(validated.owner, "fresh");
+        assert_eq!(validated.expires_at, Some(unix_now() + 3_600));
+    }
+
+    #[test]
+    fn key_without_expiry_never_expires() {
+        let manager = AuthManager::new(temp_store("noexpiry"));
+        let raw = manager
+            .create_key_with_quotas("steady", vec![], None, None, None)
+            .unwrap();
+        assert!(manager.validate(&raw).is_ok());
+        let listed = manager.list_keys().unwrap();
+        assert!(listed[0].expires_at.is_none());
+    }
+
+    #[test]
+    fn rotation_replaces_secret_and_invalidates_old_key() {
+        let manager = AuthManager::new(temp_store("rotate"));
+        let old_raw = manager
+            .create_key_with_quotas("rotating", vec!["hard".into()], Some(60), None, None)
+            .unwrap();
+        let id = manager.list_keys().unwrap()[0].id.clone();
+
+        let new_raw = manager.rotate_key(&id).unwrap();
+        assert_ne!(old_raw, new_raw);
+        assert!(new_raw.starts_with("miser_"));
+        // The old secret stops working immediately.
+        assert!(matches!(
+            manager.validate(&old_raw),
+            Err(AuthError::InvalidKey)
+        ));
+        // The new secret authenticates and keeps the key's attributes.
+        let validated = manager.validate(&new_raw).unwrap();
+        assert_eq!(validated.id, id);
+        assert_eq!(validated.owner, "rotating");
+        assert_eq!(validated.allowed_tiers, vec!["hard".to_string()]);
+        assert_eq!(validated.rate_limit_rpm, Some(60));
+        assert!(validated.active);
+    }
+
+    #[test]
+    fn rotation_survives_restart_from_disk() {
+        let path = temp_store("rotate_persist");
+        let manager = AuthManager::new(path.clone());
+        let old_raw = manager
+            .create_key_with_quotas("persisted", vec![], None, None, None)
+            .unwrap();
+        let id = manager.list_keys().unwrap()[0].id.clone();
+        let new_raw = manager.rotate_key(&id).unwrap();
+
+        let restarted = AuthManager::new(path);
+        assert!(matches!(
+            restarted.validate(&old_raw),
+            Err(AuthError::InvalidKey)
+        ));
+        assert_eq!(restarted.validate(&new_raw).unwrap().id, id);
+    }
+
+    #[test]
+    fn rotation_of_unknown_key_fails() {
+        let manager = AuthManager::new(temp_store("rotate_missing"));
+        assert!(matches!(
+            manager.rotate_key("key_does_not_exist"),
+            Err(AuthError::NotFound)
+        ));
+    }
+}
+
+/// Per-key quota enforcement: fixed-window rate limiting and monthly
+/// budget tracking.
+///
+/// Budget semantics: spend is estimated from usage tokens multiplied by
+/// `price_per_1k_tokens` (a conservative blended rate the operator
+/// configures). When no price is configured, budget caps are not enforced —
+/// rate limits and tier gating remain active.
+pub struct QuotaEnforcer {
+    /// key_id -> (window_start_minute, request_count)
+    windows: Mutex<std::collections::HashMap<String, (u64, u32)>>,
+    /// key_id -> (year_month, accumulated_usd)
+    spend: Mutex<std::collections::HashMap<String, (u32, f64)>>,
+}
+
+impl Default for QuotaEnforcer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QuotaEnforcer {
+    pub fn new() -> Self {
+        Self {
+            windows: Mutex::new(std::collections::HashMap::new()),
+            spend: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn current_minute() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() / 60)
+            .unwrap_or(0)
+    }
+
+    fn current_month() -> u32 {
+        // Approximate month index from epoch seconds (30.44-day months).
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        (secs / 2_629_800) as u32
+    }
+
+    /// Fixed-window RPM check. Returns `false` when the request should be
+    /// rejected with 429.
+    pub fn check_rate_limit(&self, key_id: &str, rpm: u32) -> bool {
+        let minute = Self::current_minute();
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = windows.entry(key_id.to_string()).or_insert((minute, 0));
+        if entry.0 != minute {
+            *entry = (minute, 0);
+        }
+        if entry.1 >= rpm {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+
+    /// Returns `false` when the monthly budget cap would be exceeded.
+    pub fn check_budget(&self, key_id: &str, cap_usd: f64) -> bool {
+        let month = Self::current_month();
+        let spend = self.spend.lock().unwrap_or_else(|e| e.into_inner());
+        match spend.get(key_id) {
+            Some((m, total)) if *m == month => *total < cap_usd,
+            _ => true,
+        }
+    }
+
+    /// Accumulate estimated cost for a key in the current month.
+    pub fn record_spend(&self, key_id: &str, amount_usd: f64) {
+        let month = Self::current_month();
+        let mut spend = self.spend.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = spend.entry(key_id.to_string()).or_insert((month, 0.0));
+        if entry.0 != month {
+            *entry = (month, 0.0);
+        }
+        entry.1 += amount_usd;
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_blocks_after_threshold() {
+        let q = QuotaEnforcer::new();
+        for _ in 0..3 {
+            assert!(q.check_rate_limit("k", 3));
+        }
+        assert!(!q.check_rate_limit("k", 3));
+        // Independent per key.
+        assert!(q.check_rate_limit("other", 3));
+    }
+
+    #[test]
+    fn budget_blocks_only_when_exceeded() {
+        let q = QuotaEnforcer::new();
+        assert!(q.check_budget("k", 1.0));
+        q.record_spend("k", 0.5);
+        assert!(q.check_budget("k", 1.0));
+        q.record_spend("k", 0.75);
+        assert!(!q.check_budget("k", 1.0));
+    }
+}
+
+/// Append-only, hash-chained audit trail for admin key operations.
+///
+/// Each line records prev-hash/row-hash (SHA-256 over the canonical JSON),
+/// mirroring the patroclus design, so tampering is detectable via
+/// [`AuditLog::verify_chain`].
+pub struct AuditLog {
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub ts: u64,
+    pub actor: String,
+    pub action: String,
+    pub target: String,
+    pub prev_hash: String,
+    pub row_hash: String,
+}
+
+impl AuditLog {
+    pub fn new(path: PathBuf) -> Self {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        Self { path }
+    }
+
+    fn compute_row_hash(entry: &AuditEntry) -> String {
+        let canonical = json!({
+            "ts": entry.ts,
+            "actor": entry.actor,
+            "action": entry.action,
+            "target": entry.target,
+            "prev_hash": entry.prev_hash,
+        })
+        .to_string();
+        sha256_hex(&canonical)
+    }
+
+    /// Last row hash on chain, or empty string for a fresh log.
+    fn last_hash(&self) -> String {
+        match fs::read_to_string(&self.path) {
+            Ok(text) => text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .rfind(|_| true)
+                .and_then(|l| serde_json::from_str::<AuditEntry>(l).ok())
+                .map(|e| e.row_hash)
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    }
+
+    pub fn append(&self, actor: &str, action: &str, target: &str) -> Result<(), AuthError> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut entry = AuditEntry {
+            ts,
+            actor: actor.to_string(),
+            action: action.to_string(),
+            target: target.to_string(),
+            prev_hash: self.last_hash(),
+            row_hash: String::new(),
+        };
+        entry.row_hash = Self::compute_row_hash(&entry);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|_| AuthError::StoreError)?;
+        use std::io::Write as _;
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&entry).map_err(|_| AuthError::StoreError)?
+        )
+        .map_err(|_| AuthError::StoreError)?;
+        Ok(())
+    }
+
+    /// Recompute the full chain; returns Err with the first broken line number.
+    pub fn verify_chain(&self) -> Result<usize, String> {
+        let text =
+            fs::read_to_string(&self.path).map_err(|_| "audit log unreadable".to_string())?;
+        let mut prev = String::new();
+        let mut count = 0usize;
+        for (idx, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+            count += 1;
+            let entry: AuditEntry = serde_json::from_str(line)
+                .map_err(|_| format!("line {}: malformed entry", idx + 1))?;
+            if entry.prev_hash != prev {
+                return Err(format!("line {}: prev_hash mismatch", idx + 1));
+            }
+            if entry.row_hash != Self::compute_row_hash(&entry) {
+                return Err(format!("line {}: row_hash mismatch", idx + 1));
+            }
+            prev = entry.row_hash;
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn append_and_verify_chain() {
+        let path = std::env::temp_dir().join(format!(
+            "miser_audit_{}_{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = AuditLog::new(path.clone());
+        log.append("admin", "create_key", "key_a").unwrap();
+        log.append("admin", "delete_key", "key_b").unwrap();
+        assert_eq!(log.verify_chain().unwrap(), 2);
+    }
+
+    #[test]
+    fn tampering_is_detected() {
+        let path = std::env::temp_dir().join(format!(
+            "miser_audit_tamper_{}_{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = AuditLog::new(path.clone());
+        log.append("admin", "create_key", "key_a").unwrap();
+        log.append("admin", "delete_key", "key_b").unwrap();
+        // Tamper: rewrite line 1.
+        let text = fs::read_to_string(&path).unwrap();
+        let tampered = text.replacen("create_key", "HACKED", 1);
+        fs::write(&path, tampered).unwrap();
+        assert!(log.verify_chain().is_err());
+    }
 }

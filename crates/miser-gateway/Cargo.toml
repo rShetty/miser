@@ -18,11 +18,19 @@ miser-classifier = { path = "../miser-classifier" }
 miser-policy = { path = "../miser-policy" }
 miser-provider = { path = "../miser-provider" }
 miser-types = { path = "../miser-types" }
+prometheus.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
