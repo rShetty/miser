@@ -280,7 +280,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Ecosystem
 
-Miser is part of a six-project AI governance ecosystem for enterprises:
+Miser is part of the AI governance ecosystem governed through Governance Hub:
 
 | Project | Role | Repo |
 |---|---|---|
@@ -290,6 +290,9 @@ Miser is part of a six-project AI governance ecosystem for enterprises:
 | **Miser** | LLM cost optimization | [rShetty/miser](https://github.com/rShetty/miser) |
 | **Sentiel** | Observability, DLP & compliance | [rShetty/sentiel](https://github.com/rShetty/sentiel) |
 | **Aegis** | Network egress & attestation | [rShetty/Aegis](https://github.com/rShetty/Aegis) |
+| **Argus** | Human/agent OIDC identity provider | [rShetty/argus](https://github.com/rShetty/argus) |
+| **Forge** | Supply chain trust & package signing | [rShetty/forge](https://github.com/rShetty/forge) |
+| **Governance Hub** | Unified admin console and sole product UI | [rShetty/governance-hub](https://github.com/rShetty/governance-hub) |
 
 Hive agents route LLM calls through Miser by setting `OPENROUTER_BASE_URL` to
 Miser's endpoint. Miser classifies each request's complexity and routes to the
