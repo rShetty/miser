@@ -11,6 +11,10 @@ pub struct ApiKey {
     pub id: String,
     pub key_hash: String,
     pub owner: String,
+    /// Client/application label for attribution ("-" when unset). Every
+    /// usage record carries this so spend can be rolled up per client.
+    #[serde(default)]
+    pub client: String,
     pub created_at: u64,
     pub active: bool,
     #[serde(default)]
@@ -88,14 +92,40 @@ impl AuthManager {
     }
 
     /// Create a key with per-key quotas enforced by the gateway.
+    /// Returns the raw secret; use [`Self::create_key_full`] to also get
+    /// the assigned id. Convenience wrapper kept for callers that only
+    /// need the secret (the HTTP handler uses [`Self::create_key_full`]).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn create_key_with_quotas(
         &self,
         owner: &str,
+        client: &str,
         allowed_tiers: Vec<String>,
         rate_limit_rpm: Option<u32>,
         monthly_budget_usd: Option<f64>,
         expires_at: Option<u64>,
     ) -> Result<String, AuthError> {
+        self.create_key_full(
+            owner,
+            client,
+            allowed_tiers,
+            rate_limit_rpm,
+            monthly_budget_usd,
+            expires_at,
+        )
+        .map(|(_, raw)| raw)
+    }
+
+    /// Like [`Self::create_key_with_quotas`] but returns `(id, raw_key)`.
+    pub fn create_key_full(
+        &self,
+        owner: &str,
+        client: &str,
+        allowed_tiers: Vec<String>,
+        rate_limit_rpm: Option<u32>,
+        monthly_budget_usd: Option<f64>,
+        expires_at: Option<u64>,
+    ) -> Result<(String, String), AuthError> {
         let raw_key = format!("miser_{}", random_key());
         let id = format!("key_{}", &random_key()[..12]);
         let hash = sha256_hex(&raw_key["miser_".len()..]);
@@ -104,6 +134,7 @@ impl AuthManager {
             id,
             key_hash: hash,
             owner: owner.to_string(),
+            client: normalize_client(client),
             created_at: now,
             active: true,
             allowed_tiers,
@@ -112,9 +143,10 @@ impl AuthManager {
             expires_at,
         };
         let mut store = self.store.lock().map_err(|_| AuthError::StoreError)?;
+        let key_id = api_key.id.clone();
         store.keys.push(api_key);
         self.persist(&store)?;
-        Ok(raw_key)
+        Ok((key_id, raw_key))
     }
 
     /// Rotate a key: replaces its secret with a freshly generated one and
@@ -140,6 +172,7 @@ impl AuthManager {
     pub fn update_key_quotas(
         &self,
         id: &str,
+        client: Option<String>,
         allowed_tiers: Option<Vec<String>>,
         rate_limit_rpm: Option<Option<u32>>,
         monthly_budget_usd: Option<Option<f64>>,
@@ -150,6 +183,9 @@ impl AuthManager {
             .iter_mut()
             .find(|k| k.id == id)
             .ok_or(AuthError::NotFound)?;
+        if let Some(client) = client {
+            key.client = normalize_client(&client);
+        }
         if let Some(tiers) = allowed_tiers {
             key.allowed_tiers = tiers;
         }
@@ -233,6 +269,17 @@ fn random_key() -> String {
     // Alphanumeric is uniformly distributed over [A-Za-z0-9] and SysRng is the
     // operating system CSPRNG, so keys are unpredictable and unbiased.
     Alphanumeric.sample_string(&mut UnwrapErr(SysRng), 43)
+}
+
+/// Normalize a client label: trimmed, non-empty becomes the label; anything
+/// else collapses to "-" so aggregation always has a bucket.
+pub fn normalize_client(client: &str) -> String {
+    let trimmed = client.trim();
+    if trimmed.is_empty() {
+        "-".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 pub fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -337,7 +384,14 @@ mod tests {
         let manager = AuthManager::new(temp_store("expired"));
         let now = unix_now();
         let raw = manager
-            .create_key_with_quotas("legacy", vec![], None, None, Some(now.saturating_sub(10)))
+            .create_key_with_quotas(
+                "legacy",
+                "-",
+                vec![],
+                None,
+                None,
+                Some(now.saturating_sub(10)),
+            )
             .unwrap();
         assert!(matches!(manager.validate(&raw), Err(AuthError::Expired)));
     }
@@ -346,7 +400,7 @@ mod tests {
     fn key_expiring_in_the_future_is_accepted() {
         let manager = AuthManager::new(temp_store("future"));
         let raw = manager
-            .create_key_with_quotas("fresh", vec![], None, None, Some(unix_now() + 3_600))
+            .create_key_with_quotas("fresh", "-", vec![], None, None, Some(unix_now() + 3_600))
             .unwrap();
         let validated = manager.validate(&raw).unwrap();
         assert_eq!(validated.owner, "fresh");
@@ -357,7 +411,7 @@ mod tests {
     fn key_without_expiry_never_expires() {
         let manager = AuthManager::new(temp_store("noexpiry"));
         let raw = manager
-            .create_key_with_quotas("steady", vec![], None, None, None)
+            .create_key_with_quotas("steady", "-", vec![], None, None, None)
             .unwrap();
         assert!(manager.validate(&raw).is_ok());
         let listed = manager.list_keys().unwrap();
@@ -368,7 +422,7 @@ mod tests {
     fn rotation_replaces_secret_and_invalidates_old_key() {
         let manager = AuthManager::new(temp_store("rotate"));
         let old_raw = manager
-            .create_key_with_quotas("rotating", vec!["hard".into()], Some(60), None, None)
+            .create_key_with_quotas("rotating", "-", vec!["hard".into()], Some(60), None, None)
             .unwrap();
         let id = manager.list_keys().unwrap()[0].id.clone();
 
@@ -394,7 +448,7 @@ mod tests {
         let path = temp_store("rotate_persist");
         let manager = AuthManager::new(path.clone());
         let old_raw = manager
-            .create_key_with_quotas("persisted", vec![], None, None, None)
+            .create_key_with_quotas("persisted", "-", vec![], None, None, None)
             .unwrap();
         let id = manager.list_keys().unwrap()[0].id.clone();
         let new_raw = manager.rotate_key(&id).unwrap();

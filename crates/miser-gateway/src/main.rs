@@ -2,6 +2,7 @@ mod auth;
 mod cache;
 mod metrics;
 mod session;
+mod usage;
 mod validate;
 
 use axum::{
@@ -49,6 +50,7 @@ struct AppState {
     session: Arc<session::SessionTracker>,
     auth: Arc<auth::AuthManager>,
     quotas: Arc<auth::QuotaEnforcer>,
+    usage: Arc<usage::UsageLedger>,
     metrics: Arc<metrics::Metrics>,
     audit: Arc<auth::AuditLog>,
     admin_key: String,
@@ -111,6 +113,10 @@ async fn main() -> anyhow::Result<()> {
         )),
         auth: Arc::new(auth::AuthManager::new(std::path::PathBuf::from(auth_path))),
         quotas: Arc::new(auth::QuotaEnforcer::new()),
+        usage: Arc::new(usage::UsageLedger::new(std::path::PathBuf::from(
+            std::env::var("MISER_USAGE_FILE")
+                .unwrap_or_else(|_| "/var/lib/miser/usage.jsonl".to_string()),
+        ))),
         metrics: Arc::new(metrics::Metrics::new()?),
         audit: Arc::new(auth::AuditLog::new(std::path::PathBuf::from(
             std::env::var("MISER_AUDIT_FILE")
@@ -212,6 +218,9 @@ fn build_router(state: AppState) -> Router {
         .route("/admin/audit/verify", get(verify_audit))
         .route("/admin/keys/{id}", delete(delete_key))
         .route("/admin/keys/{id}/rotate", post(rotate_key))
+        .route("/admin/usage/summary", get(usage_summary))
+        .route("/admin/usage/keys/{id}", get(usage_key_detail))
+        .route("/admin/usage/clients", get(usage_clients))
         .with_state(Arc::new(state))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -304,6 +313,7 @@ async fn completions_inner(
     headers: axum::http::HeaderMap,
     Json(mut request): Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
+    let started = Instant::now();
     let bearer = auth::extract_bearer(&headers).unwrap_or_default();
     let mut authenticated_key: Option<auth::ApiKey> = None;
     if state.admin_key.is_empty() && state.auth.list_keys().map(|k| k.is_empty()).unwrap_or(true) {
@@ -350,6 +360,18 @@ async fn completions_inner(
     let cache_key = cache::request_hash(&body);
     if let Some((cached_body, cached_status, cached_headers)) = state.cache.get(cache_key) {
         state.metrics.cache_hits_total.inc();
+        record_usage(
+            &state,
+            authenticated_key.as_ref(),
+            &request.model,
+            "-",
+            0,
+            0,
+            started.elapsed(),
+            true,
+            cached_status.as_u16(),
+            &request_id,
+        );
         let mut response = Response::builder().status(cached_status);
         for (name, value) in &cached_headers {
             response = response.header(name, value);
@@ -459,6 +481,29 @@ async fn completions_inner(
         let original_status = upstream.status();
         let original_headers = safe_response_headers(upstream.headers());
         let payload = upstream.bytes().await.map_err(internal)?;
+        // Real usage from the provider response, attributed to the key.
+        let usage = serde_json::from_slice::<Value>(&payload)
+            .ok()
+            .and_then(|body| body.get("usage").cloned())
+            .unwrap_or(Value::Null);
+        record_usage(
+            &state,
+            authenticated_key.as_ref(),
+            &selected_route.model,
+            &format_tier(effective_tier),
+            usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            started.elapsed(),
+            false,
+            original_status.as_u16(),
+            &request_id,
+        );
         state.cache.store(
             cache_key,
             payload.clone(),
@@ -497,6 +542,22 @@ async fn completions_inner(
     let status = upstream.status();
     let safe_headers = safe_response_headers(upstream.headers());
     let stream = upstream.bytes_stream();
+    // Streaming: token counts arrive inside the stream, so record the same
+    // monotonic estimate the budget enforcer uses.
+    if authenticated_key.is_some() {
+        record_usage(
+            &state,
+            authenticated_key.as_ref(),
+            &selected_route.model,
+            &format_tier(effective_tier),
+            0,
+            request.max_tokens.unwrap_or(512) as u64,
+            started.elapsed(),
+            false,
+            status.as_u16(),
+            &request_id,
+        );
+    }
     let mut response = Response::builder().status(status);
     for (name, value) in &safe_headers {
         response = response.header(name, value);
@@ -534,6 +595,66 @@ fn format_tier(tier: ComplexityTier) -> String {
         .trim_matches('"')
         .to_owned()
 }
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Attribute one settled request to its key in the usage ledger. Cost uses
+/// the same blended `price_per_1k_usd` the budget enforcer applies. Calls
+/// without an authenticated key (admin/anonymous setup) are not recorded.
+#[allow(clippy::too_many_arguments)]
+fn record_usage(
+    state: &AppState,
+    key: Option<&auth::ApiKey>,
+    model: &str,
+    tier: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    latency: Duration,
+    cached: bool,
+    status: u16,
+    request_id: &str,
+) {
+    let Some(key) = key else { return };
+    let total_tokens = (prompt_tokens + completion_tokens) as f64;
+    let cost_usd = state
+        .config
+        .extra
+        .get("price_per_1k_usd")
+        .and_then(Value::as_f64)
+        .map(|price| total_tokens / 1000.0 * price)
+        .unwrap_or(0.0);
+    state.usage.record(&usage::UsageRecord {
+        ts: unix_now(),
+        key_id: key.id.clone(),
+        client: key.client.clone(),
+        model: model.to_string(),
+        tier: tier.to_string(),
+        prompt_tokens,
+        completion_tokens,
+        cost_usd,
+        latency_ms: latency.as_millis() as u64,
+        cached,
+        status,
+        request_id: request_id.to_string(),
+    });
+}
+
+/// Parse a reporting window query value ("24h" | "7d" | "30d" | "all")
+/// into a lower-bound unix timestamp; `None` means no lower bound.
+fn window_since(window: Option<&str>) -> Option<u64> {
+    let now = unix_now();
+    match window.unwrap_or("30d") {
+        "24h" => Some(now.saturating_sub(86_400)),
+        "7d" => Some(now.saturating_sub(7 * 86_400)),
+        "30d" => Some(now.saturating_sub(30 * 86_400)),
+        _ => None,
+    }
+}
 fn internal<E: std::fmt::Display>(error: E) -> (StatusCode, Json<Value>) {
     (
         StatusCode::BAD_GATEWAY,
@@ -556,6 +677,7 @@ async fn create_key(
         .get("owner")
         .and_then(Value::as_str)
         .unwrap_or("default");
+    let client = body.get("client").and_then(Value::as_str).unwrap_or("");
     let allowed_tiers: Vec<String> = body
         .get("allowed_tiers")
         .and_then(Value::as_array)
@@ -572,19 +694,21 @@ async fn create_key(
         .map(|v| v as u32);
     let monthly_budget_usd = body.get("monthly_budget_usd").and_then(Value::as_f64);
     let expires_at = body.get("expires_at").and_then(Value::as_u64);
-    match state.auth.create_key_with_quotas(
+    match state.auth.create_key_full(
         owner,
+        client,
         allowed_tiers,
         rate_limit_rpm,
         monthly_budget_usd,
         expires_at,
     ) {
-        Ok(raw_key) => {
+        Ok((key_id, raw_key)) => {
             let actor = state.admin_actor(&headers);
             let _ = state
                 .audit
                 .append_outcome(&actor, "create_key", owner, "success");
             Ok(Json(json!({
+                "id": key_id,
                 "key": raw_key,
                 "message": "Store this key securely. It will not be shown again."
             })))
@@ -607,7 +731,26 @@ async fn list_keys(
         ));
     }
     match state.auth.list_keys() {
-        Ok(keys) => Ok(Json(json!({"keys": keys}))),
+        Ok(keys) => {
+            // Attach a 30-day usage rollup per key (OpenRouter-style).
+            let since = unix_now().saturating_sub(30 * 86_400);
+            let rollups = state.usage.summarize(Some(since), None, None);
+            let enriched: Vec<Value> = keys
+                .iter()
+                .map(|k| {
+                    let mut v = serde_json::to_value(k).unwrap_or(Value::Null);
+                    let rollup = rollups.by_key.get(&k.id);
+                    v["usage_30d"] = json!({
+                        "requests": rollup.map(|u| u.requests).unwrap_or(0),
+                        "prompt_tokens": rollup.map(|u| u.prompt_tokens).unwrap_or(0),
+                        "completion_tokens": rollup.map(|u| u.completion_tokens).unwrap_or(0),
+                        "cost_usd": rollup.map(|u| u.cost_usd).unwrap_or(0.0),
+                    });
+                    v
+                })
+                .collect();
+            Ok(Json(json!({"keys": enriched})))
+        }
         Err(_) => Err(auth::json_error(
             "failed to list keys",
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -667,10 +810,17 @@ async fn update_key(
         .get("rate_limit_rpm")
         .map(|v| v.as_u64().map(|n| n as u32));
     let monthly_budget_usd = body.get("monthly_budget_usd").map(|v| v.as_f64());
-    match state
-        .auth
-        .update_key_quotas(&id, allowed_tiers, rate_limit_rpm, monthly_budget_usd)
-    {
+    let client = body
+        .get("client")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match state.auth.update_key_quotas(
+        &id,
+        client,
+        allowed_tiers,
+        rate_limit_rpm,
+        monthly_budget_usd,
+    ) {
         Ok(()) => Ok(Json(json!({"id": id, "updated": true}))),
         Err(auth::AuthError::NotFound) => {
             Err(auth::json_error("key not found", StatusCode::NOT_FOUND))
@@ -762,6 +912,84 @@ async fn rotate_key(
     }
 }
 
+/// Aggregate usage across all keys (OpenRouter-style activity dashboard).
+/// Query: `window=24h|7d|30d|all` (default 30d), optional `client=`.
+async fn usage_summary(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    let since = window_since(params.get("window").map(String::as_str));
+    let summary = state
+        .usage
+        .summarize(since, None, params.get("client").map(String::as_str));
+    Ok(Json(serde_json::to_value(summary).unwrap_or(Value::Null)))
+}
+
+/// Per-key usage detail: summary filtered to one key over a window.
+async fn usage_key_detail(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    let known = state
+        .auth
+        .list_keys()
+        .map(|keys| keys.iter().any(|k| k.id == id))
+        .unwrap_or(false);
+    if !known {
+        return Err(auth::json_error("key not found", StatusCode::NOT_FOUND));
+    }
+    let since = window_since(params.get("window").map(String::as_str));
+    let summary = state.usage.summarize(since, Some(&id), None);
+    Ok(Json(serde_json::to_value(summary).unwrap_or(Value::Null)))
+}
+
+/// Per-client attribution rollup — which client/app consumed what.
+async fn usage_clients(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    let since = window_since(params.get("window").map(String::as_str));
+    let summary = state.usage.summarize(since, None, None);
+    let clients: Vec<Value> = summary
+        .by_client
+        .iter()
+        .map(|(client, agg)| {
+            json!({
+                "client": client,
+                "requests": agg.requests,
+                "prompt_tokens": agg.prompt_tokens,
+                "completion_tokens": agg.completion_tokens,
+                "cost_usd": agg.cost_usd,
+            })
+        })
+        .collect();
+    Ok(Json(
+        json!({"window": params.get("window").cloned().unwrap_or_else(|| "30d".into()), "clients": clients}),
+    ))
+}
+
 #[cfg(test)]
 mod integration_tests {
     use super::*;
@@ -807,6 +1035,14 @@ mod integration_tests {
             session: Arc::new(session::SessionTracker::new(100, 60)),
             auth: Arc::new(auth::AuthManager::new(keys_file)),
             quotas: Arc::new(auth::QuotaEnforcer::new()),
+            usage: Arc::new(usage::UsageLedger::new(std::env::temp_dir().join(format!(
+                "miser_test_usage_{}_{}.jsonl",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )))),
             metrics: Arc::new(metrics::Metrics::new().unwrap()),
             audit: Arc::new(auth::AuditLog::new(std::env::temp_dir().join(format!(
                 "miser_test_audit_{}_{}.jsonl",
@@ -889,7 +1125,7 @@ mod integration_tests {
         // falling back to open access.
         state
             .auth
-            .create_key_with_quotas("metrics", vec![], None, None, None)
+            .create_key_with_quotas("metrics", "-", vec![], None, None, None)
             .unwrap();
         let app = build_router(state);
         let (status, content_type, body) = send_text(app.clone(), "GET", "/metrics").await;
@@ -968,7 +1204,7 @@ mod integration_tests {
         // Seed one valid key.
         let raw = state
             .auth
-            .create_key_with_quotas("tester", vec![], None, None, None)
+            .create_key_with_quotas("tester", "-", vec![], None, None, None)
             .unwrap();
         let app = build_router(state);
         let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
@@ -998,7 +1234,7 @@ mod integration_tests {
         let state = test_state("");
         let raw = state
             .auth
-            .create_key_with_quotas("limited", vec![], Some(1), None, None)
+            .create_key_with_quotas("limited", "-", vec![], Some(1), None, None)
             .unwrap();
         let app = build_router(state);
         let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
@@ -1028,7 +1264,7 @@ mod integration_tests {
         let state = test_state("");
         let raw = state
             .auth
-            .create_key_with_quotas("gated", vec!["hard".to_string()], None, None, None)
+            .create_key_with_quotas("gated", "-", vec!["hard".to_string()], None, None, None)
             .unwrap();
         let app = build_router(state);
         let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
@@ -1052,6 +1288,99 @@ mod integration_tests {
     /// Expired keys are rejected with 403, and admin rotation issues a new
     /// secret once while the old secret stops authenticating immediately.
     #[tokio::test]
+    async fn usage_endpoints_gate_on_admin_and_report_attribution() {
+        let state = Arc::new(test_state("secret-admin"));
+        state.usage.record(&usage::UsageRecord {
+            ts: unix_now(),
+            key_id: "key_test".into(),
+            client: "cli-app".into(),
+            model: "test/hard".into(),
+            tier: "hard".into(),
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            cost_usd: 0.03,
+            latency_ms: 5,
+            cached: false,
+            status: 200,
+            request_id: "r1".into(),
+        });
+        let app = build_router((*state).clone());
+
+        // Admin gate: unauthenticated access is rejected on every route.
+        for uri in ["/admin/usage/summary", "/admin/usage/clients"] {
+            let (status, _) = send(app.clone(), "GET", uri, None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        // Summary reflects the attributed record.
+        let (status, body) = send(
+            app.clone(),
+            "GET",
+            "/admin/usage/summary?window=all",
+            Some("secret-admin"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["requests"], 1, "{body}");
+        assert_eq!(body["prompt_tokens"], 10);
+        assert_eq!(body["completion_tokens"], 20);
+        assert_eq!(body["by_model"]["test/hard"]["requests"], 1);
+        assert_eq!(body["by_key"]["key_test"]["client"], "cli-app");
+        assert_eq!(body["by_client"]["cli-app"]["requests"], 1);
+        assert_eq!(body["by_day"].as_object().map(|d| d.len()), Some(1));
+
+        // Client rollup lists the client bucket.
+        let (status, body) = send(
+            app.clone(),
+            "GET",
+            "/admin/usage/clients?window=all",
+            Some("secret-admin"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["clients"][0]["client"], "cli-app");
+        assert_eq!(body["clients"][0]["cost_usd"], 0.03);
+
+        // Per-key detail 404s for unknown ids…
+        let (status, _) = send(
+            app.clone(),
+            "GET",
+            "/admin/usage/keys/key_missing",
+            Some("secret-admin"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // …and works for a real key, including create → list → detail flow.
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/admin/keys",
+            Some("secret-admin"),
+            Some(json!({"owner": "o", "client": "cli2"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["id"].as_str().is_some(), "create must return id");
+        let key_id = body["id"].as_str().unwrap().to_string();
+        let (status, body) = send(
+            app,
+            "GET",
+            &format!("/admin/usage/keys/{key_id}"),
+            Some("secret-admin"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["requests"], 0);
+    }
+
+    /// Expired keys are rejected with 403, and admin rotation issues a new
+    /// secret once while the old secret stops authenticating immediately.
+    #[tokio::test]
     async fn expired_keys_rejected_and_rotation_invalidates_old_secret() {
         let state = test_state("secret-admin");
         let now = std::time::SystemTime::now()
@@ -1060,11 +1389,11 @@ mod integration_tests {
             .as_secs();
         let expired_raw = state
             .auth
-            .create_key_with_quotas("stale", vec![], None, None, Some(now - 10))
+            .create_key_with_quotas("stale", "-", vec![], None, None, Some(now - 10))
             .unwrap();
         let active_raw = state
             .auth
-            .create_key_with_quotas("current", vec![], None, None, None)
+            .create_key_with_quotas("current", "-", vec![], None, None, None)
             .unwrap();
         let active_id = state
             .auth
