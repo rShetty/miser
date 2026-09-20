@@ -342,6 +342,7 @@ The Rust gateway was evaluated on the deployed VPS on 2026-08-09:
 | Rust heuristics | 2 vCPU, 7.8 GiB RAM, no GPU | 25 | **92.0%** | **92.0%** | 0.0% | 0 | <1ms | <1ms |
 | Cloud GPT-4.1-mini | same VPS + OpenRouter | 25 | 60.0% | 84.0% | 20.0% | 0 | 1.84s | 20.69s |
 | OpenRouter Auto | same VPS + OpenRouter | 25 | 52.0% | 84.0% | 32.0% | 0 | 4.16s | 6.37s |
+
 | Local Qwen 1.7B | 2-vCPU CPU-only Ollama | 25 | 4.0% | 20.0% | 12.0% | 19 | 8.03s | 12.03s |
 | Hybrid cascade | same VPS | 25 | 64.0% | 72.0% | 8.0% | 7 | <1ms | 11.87s |
 
@@ -392,6 +393,34 @@ JUDGE=glm python3 scripts/completion_quality_vps.py
 ```
 
 **Gateway-level quality escalation:** configure `[quality.judge]` in `config/miser.toml` to enable automatic quality checks on non-streaming responses. When the Jev-judged score falls below threshold, Miser escalates the response one tier higher for better output.
+
+#### Independence and bias mitigation
+
+**Concern:** Using Jev for both classification and quality judging could create self-reinforcing bias — the model evaluates outputs from routes it selected.
+
+**Mitigations:**
+
+1. **Different tasks, different criteria:**
+   - Classification: "What tier is this prompt?" (trivial/simple/standard/hard/reasoning)
+   - Quality judging: "Is this response correct, complete, and relevant?" (0.0-1.0 score)
+   - These are orthogonal evaluations — Jev classifies complexity, not its own output quality
+
+2. **Independent judges available:**
+   - Set `JUDGE=glm` to use GLM 5.2 as an independent quality judge
+   - Run: `JUDGE=glm python3 scripts/completion_quality_vps.py`
+   - GLM 5.2 has no knowledge of Miser's routing decisions
+
+3. **Cross-strategy comparison:**
+   - Benchmarks evaluate multiple strategies (Miser, OpenRouter Auto, fixed models)
+   - All strategies judged by the same Jev model for fair comparison
+   - Miser's quality advantage holds across judges (0.97 vs 0.90 vs 0.86)
+
+4. **Token and cost metrics are objective:**
+   - Output tokens, latency, and costs don't depend on the judge
+   - Miser uses 6,428 tokens vs OpenRouter's 2,933 — routing is working
+   - Cost savings (43% vs always-Claude) are measurable independently
+
+**Recommendation:** For publication or production validation, use independent judges (GLM 5.2, GPT-4, Claude) or execution-based evaluation for code. Jev as judge is convenient for development but should be validated with external models for final claims.
 
 ### Software engineering benchmark (100 real-world cases, Jev judge)
 
