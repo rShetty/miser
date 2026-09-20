@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "miser.model",
+  "name": "Miser Model",
+  "version": "1.0.0",
+  "author": "rshetty",
+  "description": "Shows the AI model chosen by Miser gateway for the last request",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "MiserModel.qml"
+  },
+  "barWidget": {
+    "displayName": "Miser Model",
+    "description": "Live model/tier display for Miser AI gateway",
+    "category": "Development",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

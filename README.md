@@ -22,6 +22,17 @@ Routing quality is classification quality. Miser classifies every prompt into a 
 
 Full methodology, tuning history, and reproduction commands: [docs/EVALUATION.md](docs/EVALUATION.md).
 
+## Catalog routing (cost-optimized, never thrashing)
+
+With `routing.mode = "catalog"` the gateway downloads the OpenRouter catalog once (446 models), splits **every** model into the five tiers by input price, and pins one model per tier. Selection is deliberately stable:
+
+- **Sticky pins** — every request for a tier hits the same model, keeping provider-side prompt caches warm. No per-request switching.
+- **Hysteresis-gated migration** — pins move only on an explicit `POST /admin/catalog/refresh`, and only when a candidate is ≥25% cheaper than the current pin.
+- **Failover, not flapping** — repeated upstream failures (default 3 consecutive 5xx/429/transport errors) promote the tier's next candidate until restart; successes never demote it back.
+- **Durable snapshot** — pins plus the full model→tier split persist to `catalog/models.json`; restarts reload it without re-fetching. The first snapshot seeds from the fixed `[tiers.*].model` config, so enabling catalog mode changes nothing until a refresh deliberately migrates.
+
+See [docs/SETUP.md §3c](docs/SETUP.md) for the operator commands.
+
 ## Documentation
 
 - [Documentation index](docs/README.md)
@@ -343,6 +354,14 @@ Run the full ecosystem:
 
 See the [ecosystem documentation](https://github.com/rShetty/patroclus/blob/main/docs/ECOSYSTEM.md)
 for the complete integration guide.
+
+## Addons
+
+Optional integrations for displaying miser routing info in other tools:
+
+| Addon | Platform | Description |
+|---|---|---|
+| [miser-model](addons/omarchy/miser-model/) | [Omarchy](https://omarchy.org/) | Status bar widget showing the model chosen for the last request, with tier color indicator and hover tooltip with full routing details |
 
 ## License
 
