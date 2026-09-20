@@ -53,6 +53,39 @@ Miser uses Jev for both routing **and** quality evaluation. The same System One 
 
 Full methodology, tuning history, and reproduction commands: [docs/EVALUATION.md](docs/EVALUATION.md).
 
+### How better classification drives better quality
+
+The data proves it: **accurate classification is the foundation of quality outputs**.
+
+**The chain:**
+1. **Jev classifies correctly 90.5% of the time** (vs 52% for OpenRouter Auto)
+2. **Correct classification routes to the right model** for each task's complexity
+3. **Right model produces better outputs** — 0.97 quality vs 0.90 (7.8% improvement)
+
+**Why this matters:**
+- Trivial prompts ("hello", "thanks") → trivial tier → cheap fast model (saves cost, no quality loss)
+- Hard prompts (architecture, security) → hard tier → frontier model (ensures quality)
+- **Under-routing is the killer**: OpenRouter Auto sends 32% of hard work to weak models (vs Miser's 6%). That's why their quality drops to 0.90 with 70% pass rate.
+- **Over-routing wastes money**: Regex heuristics send 16.4% of trivial work to expensive models (vs Miser's 3.4% with Jev).
+
+**Even a strong fixed model underperforms routing:**
+
+| Strategy | Quality | Pass Rate | Cost |
+|---|---:|---:|---:|
+| **Miser Auto (Jev routing)** | **0.97** | **90%** | Optimized |
+| GPT-4.1-mini (fixed, no routing) | 0.86 | 70% | High (always frontier) |
+| OpenRouter Auto | 0.90 | 70% | Variable |
+
+GPT-4.1-mini is a strong model, but without intelligent routing it scores 0.86 quality — 11% lower than Miser's adaptive approach. **Routing beats brute force.**
+
+**The Jev advantage:**
+- 90.5% exact accuracy means the right model 9 out of 10 times
+- 100% adjacent accuracy means even "wrong" routing is at most 1 tier off
+- 6% under-routing vs 32% for competitors — hard work gets the models it deserves
+- Calibrated confidence scores enable automatic escalation when uncertain
+
+**Result:** Miser produces the best outputs not by always using the most expensive model, but by using the *right* model for each task.
+
 ## Catalog routing (cost-optimized, never thrashing)
 
 With `routing.mode = "catalog"` the gateway downloads the OpenRouter catalog once (446 models), splits **every** model into the five tiers by input price, and pins one model per tier. Selection is deliberately stable:
