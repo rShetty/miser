@@ -440,6 +440,9 @@ async fn completions_inner(
         }
     }
     let request_id = Uuid::new_v4().to_string();
+    // Capture the client's requested model before routing overwrites
+    // request.model; the usage ledger records both.
+    let requested_model = request.model.clone();
     let body = serde_json::to_value(&request).map_err(internal)?;
     let cache_key = cache::request_hash(&body);
     if let Some((cached_body, cached_status, cached_headers)) = state.cache.get(cache_key) {
@@ -448,6 +451,7 @@ async fn completions_inner(
             &state,
             authenticated_key.as_ref(),
             &request.model,
+            &requested_model,
             "-",
             0,
             0,
@@ -585,6 +589,7 @@ async fn completions_inner(
             &state,
             authenticated_key.as_ref(),
             &selected_route.model,
+            &requested_model,
             &format_tier(effective_tier),
             usage
                 .get("prompt_tokens")
@@ -644,6 +649,7 @@ async fn completions_inner(
             &state,
             authenticated_key.as_ref(),
             &selected_route.model,
+            &requested_model,
             &format_tier(effective_tier),
             0,
             request.max_tokens.unwrap_or(512) as u64,
@@ -706,6 +712,7 @@ fn record_usage(
     state: &AppState,
     key: Option<&auth::ApiKey>,
     model: &str,
+    requested_model: &str,
     tier: &str,
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -728,6 +735,7 @@ fn record_usage(
         key_id: key.id.clone(),
         client: key.client.clone(),
         model: model.to_string(),
+        requested_model: requested_model.to_string(),
         tier: tier.to_string(),
         prompt_tokens,
         completion_tokens,
@@ -1439,6 +1447,7 @@ mod integration_tests {
             key_id: "key_test".into(),
             client: "cli-app".into(),
             model: "test/hard".into(),
+            requested_model: "auto".into(),
             tier: "hard".into(),
             prompt_tokens: 10,
             completion_tokens: 20,

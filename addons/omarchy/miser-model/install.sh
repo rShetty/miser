@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install miser-model omarchy bar widget
+# Install the miser.model omarchy bar widget
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -22,16 +22,29 @@ cp "$SCRIPT_DIR/manifest.json" "$PLUGIN_DIR/"
 cp "$SCRIPT_DIR/MiserModel.qml" "$PLUGIN_DIR/"
 cp "$SCRIPT_DIR/README.md" "$PLUGIN_DIR/"
 
+# Validate against the omarchy plugin manifest schema (best effort)
+if command -v omarchy >/dev/null 2>&1; then
+  if ! omarchy plugin validate "$PLUGIN_DIR" >/dev/null 2>&1; then
+    echo "    Note: omarchy plugin validate reported issues:"
+    omarchy plugin validate "$PLUGIN_DIR" || true
+  fi
+fi
+
 echo ""
-echo "==> Installed. To add to your bar:"
+echo "==> Installed. Enable it in your bar:"
 echo ""
-echo "    omarchy bar move miser.model --section right"
+echo "    omarchy plugin enable miser.model right"
 echo ""
-echo "    Or edit ~/.config/omarchy/shell.json and add 'miser.model'"
-echo "    to bar.sections.right"
+echo "    Remove it again with: omarchy plugin disable miser.model"
 echo ""
-echo "==> Configure usage file path if not at default:"
-echo "    Default: /var/lib/miser/usage.jsonl"
-echo "    Override in shell.json: { \"miser.model\": { \"usageFile\": \"...\" } }"
+echo "==> Point the gateway and the widget at the same usage file."
+echo "    Gateway default: MISER_USAGE_FILE=/var/lib/miser/usage.jsonl (needs root"
+echo "    or read access). For a user-run dev gateway:"
 echo ""
-echo "==> Done. Widget will appear after shell reload (automatic on save)."
+echo "      MISER_USAGE_FILE=~/.local/state/miser/usage.jsonl ./start_server.sh"
+echo ""
+echo "      # and in ~/.config/omarchy/shell.json:"
+echo '      { "miser.model": { "usageFile": "~/.local/state/miser/usage.jsonl" } }'
+echo ""
+echo "==> If the shell does not pick the plugin up, run:"
+echo "    omarchy-shell shell rescanPlugins"

@@ -21,6 +21,11 @@ pub struct UsageRecord {
     /// Client/application label from the key ("-" when unset).
     pub client: String,
     pub model: String,
+    /// Model as requested by the client; "auto" routes through
+    /// classification. Kept separate from `model`, which is the model that
+    /// actually served the request.
+    #[serde(default)]
+    pub requested_model: String,
     pub tier: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,

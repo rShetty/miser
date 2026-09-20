@@ -3,122 +3,88 @@
 An [Omarchy](https://omarchy.org/) status bar widget that displays the AI model
 chosen by the [Miser](https://github.com/rshetty/miser) AI gateway for each request.
 
-![Miser Model Widget](screenshot.png)
-
 ## Features
 
-- **Live model display**: Shows the currently-routed model name (e.g., `claude-sonnet-4`)
+- **Live model display**: Shows the model routed for the latest request (e.g., `claude-sonnet-4`)
 - **Tier indicator**: Color-coded dot showing complexity tier (trivial → reasoning)
-- **Hover tooltip**: Full details including classifier, confidence, tokens, latency
-- **Cache awareness**: Indicates when a response was served from cache
+- **Event-driven**: Updates instantly on every settled request (inotify file watch, no polling)
+- **Auto-hide**: Hides when the usage ledger is missing or empty — no stale toolbar after a gateway restart
+- **Hover tooltip**: Full details including tokens, latency, cost, cache status
 
 ## Installation
 
-### 1. Copy to Omarchy plugins directory
+### 1. Install the plugin
+
+From the miser repo:
 
 ```bash
-cp -r "$(dirname "$0")" ~/.config/omarchy/plugins/miser.model
+addons/omarchy/miser-model/install.sh
 ```
 
-Or clone from the miser repo:
+The script copies the plugin to `~/.config/omarchy/plugins/miser.model/` and
+validates it against the omarchy manifest schema.
+
+### 2. Enable it in your bar
 
 ```bash
-git clone https://github.com/rshetty/miser.git /tmp/miser
-cp -r /tmp/miser/addons/omarchy/miser-model ~/.config/omarchy/plugins/miser.model
+omarchy plugin enable miser.model right
 ```
 
-### 2. Add to your bar layout
-
-Edit `~/.config/omarchy/shell.json` and add the widget to your bar:
-
-```json
-{
-  "bar": {
-    "sections": {
-      "right": [
-        "miser.model",
-        "omarchy.clock"
-      ]
-    }
-  }
-}
-```
-
-Or use the omarchy CLI:
+Or remove it again:
 
 ```bash
-omarchy bar move miser.model --section right
+omarchy plugin disable miser.model
 ```
 
-### 3. Configure (optional)
+(If the shell does not pick up the change, force a reload with
+`omarchy-shell shell rescanPlugins` or `omarchy refresh shell`.)
 
-If your miser usage file is not at the default location (`/var/lib/miser/usage.jsonl`),
-configure the path in `~/.config/omarchy/shell.json`:
+### 3. Point the gateway and the widget at the same usage file
+
+The gateway writes one JSONL line per settled request to `MISER_USAGE_FILE`.
+
+**System service (default):** the gateway runs as root or a service user and
+writes `/var/lib/miser/usage.jsonl`; grant your user read access, or override
+both sides:
+
+**User-run gateway (dev):** `/var/lib` is root-owned, so `create_dir_all` fails
+silently for your user. Override the gateway env var and configure the widget
+to match in `~/.config/omarchy/shell.json`:
 
 ```json
 {
   "miser.model": {
-    "usageFile": "/home/you/.local/share/miser/usage.jsonl"
+    "usageFile": "~/.local/state/miser/usage.jsonl"
   }
 }
 ```
 
-### 4. Ensure miser writes usage records
-
-The gateway writes every request to a JSONL file. Configure via environment variable:
-
 ```bash
-# In your miser service or .env file
-MISER_USAGE_FILE=/var/lib/miser/usage.jsonl
+MISER_USAGE_FILE=~/.local/state/miser/usage.jsonl ./start_server.sh
 ```
-
-### 5. Permissions
-
-The widget needs read access to the usage file. Options:
-
-**Option A**: Add your user to the miser group (if running as systemd service):
-```bash
-sudo usermod -aG miser $USER
-sudo chmod 640 /var/lib/miser/usage.jsonl
-```
-
-**Option B**: Use a world-readable path:
-```bash
-MISER_USAGE_FILE=/tmp/miser-usage.jsonl
-```
-
-**Option C**: Run miser as your user (for local development):
-```bash
-./start_server.sh  # Uses local ./usage.jsonl
-```
-
-## Tier Colors
-
-| Tier | Color | Description |
-|------|-------|-------------|
-| trivial | gray | Greetings, simple facts, one-liners |
-| simple | green | Explanations, snippets, single-file changes |
-| standard | blue | Features, multi-file changes, APIs |
-| hard | orange | Architecture, distributed systems, security |
-| reasoning | red | Proofs, derivations, formal methods |
 
 ## How It Works
 
-1. The widget polls the miser usage JSONL file every 2 seconds
-2. It reads the last line (most recent request)
-3. Parses the JSON record and updates the display
-4. Hover shows full details including classifier, confidence, and token counts
+The widget watches the gateway's usage ledger, which appends one JSON record
+per request:
 
-## Development
+### Visibility
 
-The widget reads from the miser usage ledger, which appends one JSON record per request:
+The widget is **only visible while the client is on `miser/auto`**:
+
+- A record counts only when `requested_model` is `auto` (e.g. `miser/auto` or
+  `auto`). Requests pinned to a specific model hide the widget.
+- The record must be fresh: after `hideAfterMs` (default 10 minutes) without a
+  settled auto request, the widget hides instead of showing a stale routed
+  model. Override via the layout entry: `"hideAfterMs": 30000`.
 
 ```json
 {
-  "ts": 1726819200,
+  "ts": 1761000000,
   "key_id": "key_abc123",
   "client": "opencode",
   "model": "anthropic/claude-sonnet-4",
+  "requested_model": "auto",
   "tier": "hard",
   "prompt_tokens": 2450,
   "completion_tokens": 1200,
@@ -129,6 +95,22 @@ The widget reads from the miser usage ledger, which appends one JSON record per 
   "request_id": "req_xyz789"
 }
 ```
+
+1. A `FileView` watches the ledger; every append triggers an instant reload
+2. The last line is parsed and the model name + tier dot update
+3. A directory watcher catches ledger creation/removal, and a 5s fallback
+   poll covers a ledger directory created after shell startup
+4. When the ledger is missing or empty the widget hides — no stale display
+
+## Tier Colors
+
+| Tier | Color | Description |
+|------|-------|-------------|
+| trivial | gray | Greetings, simple facts, one-liners |
+| simple | green | Explanations, snippets, single-file changes |
+| standard | blue | Features, multi-file changes, APIs |
+| hard | orange | Architecture, distributed systems, security |
+| reasoning | red | Proofs, derivations, formal methods |
 
 ## License
 
