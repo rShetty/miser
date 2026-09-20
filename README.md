@@ -63,6 +63,90 @@ OpenCode / Codex / Aider / SDK
 
 The gateway is stateless, preserves unknown OpenAI request fields, forwards streaming responses, and exposes routing metadata through `x-miser-*` headers (including the selected tier and which classifier decided it).
 
+## Request routing
+
+Every request is classified, escalated, and routed to a model. Within a
+session the tier is **monotonic** — once a conversation hits `hard` or
+`reasoning`, follow-up messages stay at that tier for the session TTL
+(default 30 min). This prevents context loss when the model would
+otherwise downgrade mid-thread.
+
+### Routing algorithm
+
+```text
+1. Cache lookup      FNV hash(messages, model/user/seed excluded)
+                     → hit-exact → return cached response
+
+2. Classification    Jev / heuristic / hybrid → tier + confidence
+
+3. Session lock      session_key = user field OR hash(first message)
+                     if previous_tier > classified_tier:
+                         tier = previous_tier   (never downgrade)
+
+4. Policy floors     low confidence → ≥ standard
+                     tools present → ≥ standard
+                     response_format → ≥ standard
+                     reasoning task → reasoning
+                     agentic task → ≥ hard
+                     tool-use history → ≥ hard
+
+5. Catalog swap      if catalog mode: model = tier's pinned model
+                     (sticky pin; only moves on refresh or 3 failures)
+
+6. Forward           request sent to upstream with selected model
+
+7. Session update    session.tier = max(current, effective_tier)
+
+8. Cache store       response stored for 5 min TTL (non-streaming only)
+```
+
+### Cache behaviour
+
+Cache keys are **model-independent** — the hash excludes `model`,
+`user`, and `seed`, so the same prompt gets the same cache entry
+regardless of which tier answered it. A 5-minute TTL keeps stale
+routing decisions from persisting. Streaming responses are not cached
+(tokens arrive incrementally).
+
+| Scenario | Result |
+|---|---|
+| Same prompt, same tier | Cache hit |
+| Same prompt after session escalation | Cache hit (model-independent hash) |
+| Same prompt after 5 min TTL | Cache miss |
+| Different prompt, same tier | Cache miss (different hash) |
+| Streaming request | Never cached |
+
+### Session continuity
+
+The session tracker stores the **maximum tier seen** for each session
+key. Subsequent requests in the same session are floor-locked to that
+tier — `thanks!` after an architecture discussion still goes to the
+reasoning model. Tradeoffs:
+
+- **Pro**: stable tool-use context; agentic flows stay on capable
+  models; reduces cache thrashing from tier oscillation.
+- **Con**: over-routes trivial follow-ups to expensive models until
+  the 30-min TTL expires.
+
+Session key derivation: the `user` field in the request if set;
+otherwise an FNV hash of the first user message. Clients that set
+`user` to a stable session id get the best continuity. Disable with
+`[session] enabled = false` in `config/miser.toml`.
+
+### Catalog pin stability
+
+In `routing.mode = "catalog"` each tier pins one model from the
+OpenRouter catalog. Pins are **sticky** — every request for a tier
+hits the same model, keeping provider-side prompt caches warm. Pins
+move only on:
+
+- An explicit `POST /admin/catalog/refresh` when a candidate is ≥25%
+  cheaper (hysteresis gate).
+- Three consecutive upstream failures (5xx/429/transport), which
+  promote the next candidate until restart (failover, not flapping).
+
+Successes never demote a promoted model back.
+
 ## Classifier modes
 
 Configure `classifier.mode` in `config/miser.toml` (`jev` is the default):
