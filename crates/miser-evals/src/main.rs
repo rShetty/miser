@@ -88,13 +88,7 @@ async fn main() -> anyhow::Result<()> {
         config.mode = mode;
     }
     // Endpoint API keys come from the environment when not set in config.
-    if config
-        .jev
-        .api_key
-        .as_deref()
-        .unwrap_or_default()
-        .is_empty()
-    {
+    if config.jev.api_key.as_deref().unwrap_or_default().is_empty() {
         if let Ok(key) = std::env::var("JEV_API_KEY") {
             if !key.is_empty() {
                 config.jev.api_key = Some(key);
@@ -193,7 +187,9 @@ async fn main() -> anyhow::Result<()> {
     );
     if !latency_ms.is_empty() {
         let (avg, p50, p95, p99) = latency_stats(&latency_ms);
-        println!("latency_ms_avg={avg:.1} latency_ms_p50={p50} latency_ms_p95={p95} latency_ms_p99={p99}");
+        println!(
+            "latency_ms_avg={avg:.1} latency_ms_p50={p50} latency_ms_p95={p95} latency_ms_p99={p99}"
+        );
     }
     if input_tokens > 0 || output_tokens > 0 {
         let cost =
@@ -282,12 +278,22 @@ mod metrics_tests {
     #[test]
     fn perfect_classification() {
         let m = Metrics::from_outcomes(&[(Trivial, Trivial), (Hard, Hard)]);
-        assert_eq!((m.exact, m.adjacent, m.under_routing, m.over_routing, m.mean_distance), (1.0, 1.0, 0.0, 0.0, 0.0));
+        assert_eq!(
+            (
+                m.exact,
+                m.adjacent,
+                m.under_routing,
+                m.over_routing,
+                m.mean_distance
+            ),
+            (1.0, 1.0, 0.0, 0.0, 0.0)
+        );
     }
 
     #[test]
     fn under_and_over_routing_split() {
-        let m = Metrics::from_outcomes(&[(Standard, Trivial), (Standard, Reasoning), (Simple, Simple)]);
+        let m =
+            Metrics::from_outcomes(&[(Standard, Trivial), (Standard, Reasoning), (Simple, Simple)]);
         assert_eq!(m.exact, 1.0 / 3.0);
         assert_eq!(m.adjacent, 1.0 / 3.0);
         assert_eq!(m.under_routing, 1.0 / 3.0);

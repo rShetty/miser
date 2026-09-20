@@ -119,7 +119,9 @@ impl CatalogRouter {
             })
             .collect();
         let model_tiers: BTreeMap<String, ComplexityTier> = if config.routing.seed_from_config {
-            pins.iter().map(|(tier, pin)| (pin.model.clone(), *tier)).collect()
+            pins.iter()
+                .map(|(tier, pin)| (pin.model.clone(), *tier))
+                .collect()
         } else {
             BTreeMap::new()
         };
@@ -193,10 +195,11 @@ impl CatalogRouter {
         {
             let state = self.state.lock().map_err(|_| "catalog lock poisoned")?;
             for tier in ALL_TIERS {
-                if !snapshot.pins.contains_key(&tier) {
-                    if let Some(previous) = state.snapshot.pins.get(&tier) {
-                        snapshot.pins.insert(tier, previous.clone());
-                    }
+                if let Some(previous) = state.snapshot.pins.get(&tier) {
+                    snapshot
+                        .pins
+                        .entry(tier)
+                        .or_insert_with(|| previous.clone());
                 }
             }
         }
@@ -227,9 +230,7 @@ impl CatalogRouter {
 
         let migrated: Vec<Value> = changed
             .iter()
-            .map(|(tier, from, to)| {
-                json!({"tier": format_tier(*tier), "from": from, "to": to})
-            })
+            .map(|(tier, from, to)| json!({"tier": format_tier(*tier), "from": from, "to": to}))
             .collect();
         tracing::info!(
             migrated = ?changed,
@@ -553,7 +554,7 @@ fn shellexpand_home(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use miser_types::{RoutingBands, RoutingFilters, RoutingMode};
+    use miser_types::{RoutingBands, RoutingMode};
 
     fn routing() -> RoutingConfig {
         RoutingConfig {
@@ -625,7 +626,10 @@ mod tests {
             "ok/model"
         );
         // Filtered-out models still appear in the split.
-        assert_eq!(snapshot.model_tiers.get("weak/model"), Some(&ComplexityTier::Trivial));
+        assert_eq!(
+            snapshot.model_tiers.get("weak/model"),
+            Some(&ComplexityTier::Trivial)
+        );
     }
 
     #[test]

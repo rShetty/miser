@@ -119,7 +119,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     if classifier_config.mode == miser_types::ClassifierMode::Jev
-        && classifier_config.jev.api_key.as_deref().unwrap_or_default().is_empty()
+        && classifier_config
+            .jev
+            .api_key
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
     {
         tracing::warn!(
             "classifier.mode is 'jev' but no JEV_API_KEY is configured; \
@@ -218,7 +223,11 @@ impl AppState {
     /// client errors (4xx) are the caller's fault and never trigger
     /// failover; 2xx resets the failure counter. A promoted failover model
     /// is sticky until restart or the next catalog refresh.
-    fn report_upstream_outcome(&self, tier: ComplexityTier, status: Option<axum::http::StatusCode>) {
+    fn report_upstream_outcome(
+        &self,
+        tier: ComplexityTier,
+        status: Option<axum::http::StatusCode>,
+    ) {
         if !self.catalog.enabled() {
             return;
         }

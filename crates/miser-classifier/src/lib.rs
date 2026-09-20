@@ -461,8 +461,7 @@ impl Classifier {
             .unwrap_or(default_confidence());
         let task_type = answers["task"]["choice"]
             .as_str()
-            .map(|s| serde_json::from_value::<TaskType>(json!(s)).ok())
-            .flatten();
+            .and_then(|s| serde_json::from_value::<TaskType>(json!(s)).ok());
         let mut classification = result(
             tier,
             confidence,
@@ -939,7 +938,13 @@ mod tests {
     /// Spawn a one-connection-per-response mock HTTP server. Returns the
     /// base URL and a handle that resolves to the requests the server saw,
     /// in order.
-    async fn spawn_mock(responses: Vec<MockHttpResponse>) -> (String, Arc<Mutex<Vec<MockRequest>>>, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock(
+        responses: Vec<MockHttpResponse>,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<MockRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<MockRequest>>> = Arc::default();
@@ -950,10 +955,7 @@ mod tests {
                 let mut buf = [0u8; 8192];
                 let mut data = Vec::new();
                 let head_end = loop {
-                    let n = match sock.read(&mut buf).await {
-                        Ok(n) => n,
-                        Err(_) => 0,
-                    };
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
                     data.extend_from_slice(&buf[..n]);
                     if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
                         let head = String::from_utf8_lossy(&data[..pos]);
@@ -961,8 +963,14 @@ mod tests {
                             .lines()
                             .find_map(|line| {
                                 let lower = line.to_lowercase();
-                                lower.starts_with("content-length:")
-                                    .then(|| lower["content-length:".len()..].trim().parse::<usize>().ok())
+                                lower
+                                    .starts_with("content-length:")
+                                    .then(|| {
+                                        lower["content-length:".len()..]
+                                            .trim()
+                                            .parse::<usize>()
+                                            .ok()
+                                    })
                                     .flatten()
                             })
                             .unwrap_or(0);
@@ -971,23 +979,35 @@ mod tests {
                         }
                     }
                     if n == 0 {
-                        break data.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(data.len());
+                        break data
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .unwrap_or(data.len());
                     }
                 };
                 let head = String::from_utf8_lossy(&data[..head_end]).to_string();
                 let mut lines = head.lines();
                 let request_line = lines.next().unwrap_or_default().to_string();
-                let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_string();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
                 let auth = lines
                     .filter_map(|line| {
                         let lower = line.to_lowercase();
-                        lower.starts_with("authorization:").then(|| line[15..].trim().to_string())
+                        lower
+                            .starts_with("authorization:")
+                            .then(|| line[15..].trim().to_string())
                     })
                     .next();
                 let body_start = (head_end + 4).min(data.len());
                 let body = serde_json::from_slice(&data[body_start..])
                     .unwrap_or(serde_json::json!({"mock_parse_error": true}));
-                seen_for_task.lock().await.push(MockRequest { path, auth, body });
+                seen_for_task
+                    .lock()
+                    .await
+                    .push(MockRequest { path, auth, body });
                 if response.delay_ms > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(response.delay_ms)).await;
                 }
@@ -1000,7 +1020,9 @@ mod tests {
                 };
                 let head = format!(
                     "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    response.status, reason, payload.len()
+                    response.status,
+                    reason,
+                    payload.len()
                 );
                 // The client may have already timed out and dropped the
                 // connection; delivering the response is best-effort.
@@ -1053,9 +1075,16 @@ mod tests {
         }])
         .await;
         let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
-        let result = classifier.classify(&request("Implement a rate-limited middleware")).await.unwrap();
+        let result = classifier
+            .classify(&request("Implement a rate-limited middleware"))
+            .await
+            .unwrap();
         assert_eq!(result.tier, ComplexityTier::Standard);
-        assert!((result.confidence - 0.84).abs() < 1e-6, "confidence {:?}", result.confidence);
+        assert!(
+            (result.confidence - 0.84).abs() < 1e-6,
+            "confidence {:?}",
+            result.confidence
+        );
         assert_eq!(result.classifier, "jev");
         assert_eq!(result.task, Some(TaskType::Coding));
         let requests = seen.lock().await;
@@ -1063,10 +1092,16 @@ mod tests {
         assert_eq!(requests[0].path, "/evaluate");
         assert_eq!(requests[0].auth.as_deref(), Some("Bearer test-key"));
         assert_eq!(requests[0].body["model"], "jev-latest");
-        assert_eq!(requests[0].body["state"]["request"], "Implement a rate-limited middleware");
+        assert_eq!(
+            requests[0].body["state"]["request"],
+            "Implement a rate-limited middleware"
+        );
         assert_eq!(requests[0].body["questions"]["tier"]["type"], "choice");
         assert_eq!(
-            requests[0].body["questions"]["tier"]["criteria"].as_object().unwrap().len(),
+            requests[0].body["questions"]["tier"]["criteria"]
+                .as_object()
+                .unwrap()
+                .len(),
             5,
             "tier question must offer all five tiers"
         );
@@ -1118,7 +1153,10 @@ mod tests {
         .unwrap();
         classifier.classify(&req).await.unwrap();
         let requests = seen.lock().await;
-        assert_eq!(requests[0].body["state"]["tools"], serde_json::json!(["shell"]));
+        assert_eq!(
+            requests[0].body["state"]["tools"],
+            serde_json::json!(["shell"])
+        );
         assert_eq!(requests[0].body["state"]["tool_history"], false);
         server.await.unwrap();
     }
@@ -1132,9 +1170,16 @@ mod tests {
         }])
         .await;
         let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
-        let result = classifier.classify(&request("Design a distributed cache")).await.unwrap();
+        let result = classifier
+            .classify(&request("Design a distributed cache"))
+            .await
+            .unwrap();
         assert_eq!(result.tier, ComplexityTier::Hard);
-        assert!((result.confidence - 0.91).abs() < 1e-6, "confidence {:?}", result.confidence);
+        assert!(
+            (result.confidence - 0.91).abs() < 1e-6,
+            "confidence {:?}",
+            result.confidence
+        );
         assert_eq!(result.task, Some(TaskType::Reasoning));
         server.await.unwrap();
     }
@@ -1150,7 +1195,11 @@ mod tests {
         let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
         let result = classifier.classify(&request("hello")).await.unwrap();
         assert_eq!(result.tier, ComplexityTier::Trivial);
-        assert!(result.confidence <= 0.99, "confidence {:?}", result.confidence);
+        assert!(
+            result.confidence <= 0.99,
+            "confidence {:?}",
+            result.confidence
+        );
         server.await.unwrap();
     }
 
@@ -1164,7 +1213,10 @@ mod tests {
         .await;
         let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
         let result = classifier.classify(&request("Explain DNS")).await.unwrap();
-        assert_eq!(result.classifier, "heuristic", "invalid choice must fall back to heuristic");
+        assert_eq!(
+            result.classifier, "heuristic",
+            "invalid choice must fall back to heuristic"
+        );
         assert_eq!(result.tier, ComplexityTier::Simple);
         server.await.unwrap();
     }
@@ -1194,8 +1246,14 @@ mod tests {
         let mut config = jev_config(&base_url, ClassifierMode::Jev);
         config.jev.timeout_ms = 200;
         let classifier = Classifier::new(config).unwrap();
-        let result = classifier.classify(&request("Architect a distributed cache")).await.unwrap();
-        assert_eq!(result.classifier, "heuristic", "deadline must bound the jev call");
+        let result = classifier
+            .classify(&request("Architect a distributed cache"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.classifier, "heuristic",
+            "deadline must bound the jev call"
+        );
         server.await.unwrap();
     }
 
@@ -1219,8 +1277,12 @@ mod tests {
 
     #[tokio::test]
     async fn override_precedes_jev() {
-        let classifier = Classifier::new(jev_config("http://127.0.0.1:9", ClassifierMode::Jev)).unwrap();
-        let result = classifier.classify(&request("@route:reasoning\nhello")).await.unwrap();
+        let classifier =
+            Classifier::new(jev_config("http://127.0.0.1:9", ClassifierMode::Jev)).unwrap();
+        let result = classifier
+            .classify(&request("@route:reasoning\nhello"))
+            .await
+            .unwrap();
         assert_eq!(result.classifier, "override");
         assert_eq!(result.tier, ComplexityTier::Reasoning);
     }
@@ -1234,8 +1296,14 @@ mod tests {
         }])
         .await;
         let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
-        let result = classifier.classify(&request("Implement an API endpoint")).await.unwrap();
-        assert_eq!(result.classifier, "jev", "jev mode must not silently re-classify via heuristic");
+        let result = classifier
+            .classify(&request("Implement an API endpoint"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.classifier, "jev",
+            "jev mode must not silently re-classify via heuristic"
+        );
         assert_eq!(result.tier, ComplexityTier::Standard);
         server.await.unwrap();
     }
