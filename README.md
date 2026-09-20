@@ -25,6 +25,7 @@ Full methodology, tuning history, and reproduction commands: [docs/EVALUATION.md
 ## Documentation
 
 - [Documentation index](docs/README.md)
+- [Install Guide (copy-paste)](docs/SETUP.md)
 - [High-Level Design](docs/HLD.md)
 - [Low-Level Design](docs/LLD.md)
 - [Security Model](docs/SECURITY.md)
@@ -60,6 +61,10 @@ Configure `classifier.mode` in `config/miser.toml` (`jev` is the default):
 - `local_llm`: OpenAI-compatible Ollama or local endpoint
 - `cloud_llm`: OpenAI-compatible cloud classifier
 - `hybrid`: heuristics first, then bounded local/cloud fallback
+
+## Install (copy-paste)
+
+A complete, ordered, copy-paste-able install guide — clone, keys in `~/.env`, start, prove `x-miser-classifier: jev`, benchmark, wire your agent in auto mode — lives in **[docs/SETUP.md](docs/SETUP.md)**.
 
 ## Run locally
 

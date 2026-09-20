@@ -36,7 +36,7 @@ for mode in "${MODES[@]}"; do
   fi
   summary="$(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p miser-evals -- \
     --corpus "$CORPUS" --mode "$mode" --config "$CONFIG" 2>/dev/null \
-    | grep -E 'exact_accuracy=|latency_ms_avg=' || true)"
+    | grep -E 'exact_accuracy=|latency_ms_avg=|classification_cost_usd=' || true)"
   pick() { echo "$summary" | grep -o "$1" | cut -d= -f2 || true; }
   exact="$(pick 'exact_accuracy=[0-9.]*')"
   adjacent="$(pick 'adjacent_accuracy=[0-9.]*')"
