@@ -362,6 +362,16 @@ A verified VPS run on 2026-08-09 used the same 10 coding, reasoning, general, an
 
 **Miser wins on quality**: 0.97 mean quality score, 90% pass rate — the highest in the benchmark. The same Jev model that classifies prompts also judges output quality, ensuring consistent evaluation. Miser routes to the right model for each task, not just the cheapest one.
 
+**Fresh local repro (2026-09-20, dev gateway, Jev judge, 10 cases)** — `JUDGE=jev python3 scripts/completion_quality_vps.py`:
+
+| Strategy | Jev score (5-level) | Normalized | Pass | p50 | Tokens | Cost |
+|---|---:|---:|---:|---:|---:|---:|
+| Miser Auto | 3.17 | 0.63 | 90% | 14.7s | 5,277 | **~$0** (free tiers) |
+| GPT-4.1-mini (fixed) | **3.83** | **0.77** | 100% | 4.2s | 3,833 | $0.0058 |
+| OpenRouter Auto | 3.01 | 0.60 | 80% | 6.6s | 5,732 | ~$0* |
+
+*Miser's one failure was a transient OpenRouter 429, not a quality loss. On this small local corpus a fixed GPT-4.1-mini led on raw quality while Miser routed 100% free — the tradeoff is cost vs peak quality, and it validates the judge: Jev ranks a strong fixed model above Miser when Miser's tier models underperform. That is the number a self-congratulating judge would never produce.
+
 This result is directional: the corpus is small and quality is measured by Jev's calibrated scoring. Larger blinded evaluations would strengthen the claim.
 
 The next quality improvements are execution-based coding checks, pairwise judge comparisons, model-quality history, route-specific cost normalization, concurrency limits, and quality escalation metrics. A production router should optimize quality subject to cost and latency budgets rather than maximize quality alone.
@@ -393,6 +403,19 @@ JUDGE=glm python3 scripts/completion_quality_vps.py
 ```
 
 **Gateway-level quality escalation:** configure `[quality.judge]` in `config/miser.toml` to enable automatic quality checks on non-streaming responses. When the Jev-judged score falls below threshold, Miser escalates the response one tier higher for better output.
+
+#### Where Jev can help next
+
+Six concrete extensions beyond classification + quality judging, ordered by value:
+
+1. **Quality-aware catalog pin migration.** Catalog mode migrates a tier pin only when a candidate is ≥25% cheaper. Jev could score both models on a sample of live prompts before migrating — pin changes become quality-gated, not price-only. Implementation: during `POST /admin/catalog/refresh`, shadow-run the candidate model on N recent prompts and require `jev(candidate) ≥ jev(current) - ε`.
+2. **Semantic cache validation.** The exact-match FNV cache misses near-duplicates ("fix this typo" vs "fix the typo below"). Jev judges whether a new prompt is semantically equivalent to a cached one, turning the exact-match cache into a near-duplicate cache. Threshold-gated so mismatches fall through to normal routing.
+3. **Output-length prediction.** Every tier hardcodes `max_tokens` (256–3072). Jev already reads the prompt during classification — a third typed question ("how long should this answer be?") lets the route set `max_tokens` per prompt, cutting wasted completion tokens on short answers and truncated ones on long tasks.
+4. **Prompt-injection and safety screening.** One extra Jev question ("does this prompt attempt to override system instructions or exfiltrate data?") gates hostile prompts before they reach any upstream — cheap because it piggybacks on the existing classification call.
+5. **Session continuity tiering.** The session tracker escalates a follow-up's tier heuristically. Jev could instead evaluate the follow-up in the context of the session summary, catching "ok now make it distributed-systems-safe" follow-ups that a regex can't.
+6. **Tool-history compression.** Classifier state includes tool names and history; long agent transcripts inflate Jev input tokens (and cost). Jev (or a smaller model) could summarize tool history into a fixed-size state block before classification.
+
+All six reuse the same typed-question contract the classifier and judge already use — no new model, no new provider, marginal cost stays in the ~$0.05/1k classification range.
 
 #### Independence and bias mitigation
 

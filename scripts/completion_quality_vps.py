@@ -108,8 +108,12 @@ def judge_quality_glm(case, response_text):
 def call(case, endpoint, model):
     body = {'model': model, 'messages': [{'role':'user','content':case['prompt']}], 'temperature':0, 'max_tokens':800}
     headers = {'Content-Type':'application/json'}
-    if endpoint == OR: headers['Authorization'] = 'Bearer '+KEY
-    else: headers['Authorization'] = 'Bearer local'
+    if endpoint == OR:
+        headers['Authorization'] = 'Bearer '+KEY
+    else:
+        # Gateway auth: 'local' works on open-access deployments; set
+        # MISER_GATEWAY_KEY for gateways with API keys configured.
+        headers['Authorization'] = 'Bearer '+os.environ.get('MISER_GATEWAY_KEY', 'local')
     req = urllib.request.Request(endpoint, data=json.dumps(body).encode(), headers=headers, method='POST')
     start=time.perf_counter()
     try:
@@ -163,6 +167,6 @@ def main():
                  'errors':[x.get('error') for x in out if not x['ok']]}
         print(json.dumps(summary,indent=2)); allout.append({'summary':summary,'cases':out})
     report={'timestamp':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'judge':JEV_MODEL if JUDGE=='jev' else 'z-ai/glm-5.2','cases':CASES,'results':allout}
-    path=ROOT/'results'/'completion-quality-judged.json'; path.write_text(json.dumps(report,indent=2))
+    path=ROOT/'results'/'completion-quality-judged.json'; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(report,indent=2))
     print('REPORT='+str(path))
 main()
