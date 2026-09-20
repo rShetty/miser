@@ -173,6 +173,7 @@ pub enum ClassifierMode {
     Heuristic,
     LocalLlm,
     CloudLlm,
+    Jev,
     Hybrid,
 }
 
@@ -186,6 +187,10 @@ pub struct ClassifierEndpointConfig {
     pub base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// URL path appended to base_url. Defaults to `/evaluate` (Vercel AI
+    /// Gateway); TypeSafe direct uses `/systemone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
     #[serde(flatten)]
@@ -210,12 +215,16 @@ pub struct ClassifierConfig {
     pub local_llm: ClassifierEndpointConfig,
     #[serde(default)]
     pub cloud_llm: ClassifierEndpointConfig,
+    /// Jev (TypeSafe System One) evaluation endpoint. Talks the evaluation
+    /// contract (`POST {base_url}/evaluate`), not chat completions.
+    #[serde(default)]
+    pub jev: ClassifierEndpointConfig,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
 
 fn default_classifier_mode() -> ClassifierMode {
-    ClassifierMode::Hybrid
+    ClassifierMode::Jev
 }
 fn default_confidence_threshold() -> f32 {
     0.55
@@ -428,5 +437,15 @@ mod tests {
         assert_eq!(config.base_url, "https://openrouter.ai/api/v1");
         let endpoint: ClassifierEndpointConfig = toml::from_str("").unwrap();
         assert_eq!(endpoint.timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn classifier_defaults_to_jev_mode() {
+        let config: ClassifierConfig = toml::from_str("").unwrap();
+        assert_eq!(config.mode, ClassifierMode::Jev);
+        // Unknown fields still land in extra instead of failing the parse.
+        let config: ClassifierConfig = toml::from_str("future_field = true").unwrap();
+        assert_eq!(config.mode, ClassifierMode::Jev);
+        assert_eq!(config.extra["future_field"], true);
     }
 }

@@ -1,0 +1,116 @@
+{"id": "t000", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "hello"}]}}
+{"id": "t001", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "hey there!"}]}}
+{"id": "t002", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "thanks, that worked"}]}}
+{"id": "t003", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "ok"}]}}
+{"id": "t004", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "yes"}]}}
+{"id": "t005", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "git status"}]}}
+{"id": "t006", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "git diff HEAD~1"}]}}
+{"id": "t007", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "show me the git log"}]}}
+{"id": "t008", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "what's 2+2?"}]}}
+{"id": "t009", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "what is your name?"}]}}
+{"id": "t010", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "rename the variable x to y in line 3"}]}}
+{"id": "t011", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "uppercase the string 'hello world'"}]}}
+{"id": "t012", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "trim trailing whitespace from this line: 'foo   '"}]}}
+{"id": "t013", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "just answer yes or no: is Python interpreted?"}]}}
+{"id": "s014", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Explain how Docker networking works in a few sentences"}]}}
+{"id": "s015", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a regex that matches email addresses"}]}}
+{"id": "s016", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Add a null check to this function"}]}}
+{"id": "s017", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a SQL query to select users created after 2024"}]}}
+{"id": "s018", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a unit test for a function that adds two numbers"}]}}
+{"id": "s019", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "What's the difference between npm and yarn?"}]}}
+{"id": "s020", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "How do I fix a CORS error?"}]}}
+{"id": "s021", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Translate 'good morning' to French"}]}}
+{"id": "s022", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Summarize this paragraph in one sentence: The gateway routes each request to the cheapest model that can handle it, preserving unknown OpenAI fields and forwarding streaming responses."}]}}
+{"id": "s023", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a small Python function to reverse a string"}]}}
+{"id": "s024", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Which git command shows the last commit?"}]}}
+{"id": "s025", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Define a TypeScript interface for a user with id, name, and email"}]}}
+{"id": "s026", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "How do I add a dependency with pip?"}]}}
+{"id": "s027", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Explain what semicolons do in JavaScript"}]}}
+{"id": "s028", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a curl command to POST JSON to an API"}]}}
+{"id": "s029", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "What is a CI/CD pipeline?"}]}}
+{"id": "s030", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a README section describing installation"}]}}
+{"id": "s031", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a simple Dockerfile for a Node app"}]}}
+{"id": "s032", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Convert this JSON object to YAML: {name: miser, port: 8787}"}]}}
+{"id": "s033", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Describe what this shell one-liner does: grep -r TODO ."}]}}
+{"id": "s034", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "What is a JWT and how does it work?"}]}}
+{"id": "s035", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a regex for ISO dates (YYYY-MM-DD)"}]}}
+{"id": "s036", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "How do I fix trailing whitespace in vim?"}]}}
+{"id": "s037", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a bash one-liner to count lines in all .py files"}]}}
+{"id": "s038", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Implement a rate-limited middleware for our Express API"}]}}
+{"id": "s039", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Add JWT authentication to the Express server"}]}}
+{"id": "s040", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Debug why our integration test fails on CI but passes locally"}]}}
+{"id": "s041", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Refactor this service to use a connection pool"}]}}
+{"id": "s042", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Add Redis caching to the product catalog endpoint"}]}}
+{"id": "s043", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Implement cursor-based pagination for the orders API"}]}}
+{"id": "s044", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a GitHub Actions workflow that runs tests and deploys on main"}]}}
+{"id": "s045", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a Kubernetes manifest for our API deployment with liveness probes"}]}}
+{"id": "s046", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Optimize the React list rendering, it re-renders on every keystroke"}]}}
+{"id": "s047", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Implement retry logic with exponential backoff for the webhook sender"}]}}
+{"id": "s048", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Design the database schema for a multi-tenant orders system"}]}}
+{"id": "s049", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a load test script for the checkout endpoint"}]}}
+{"id": "s050", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Add property-based tests for the pricing calculator"}]}}
+{"id": "s051", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Implement AES-256 encryption for PII fields at rest"}]}}
+{"id": "s052", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Set up a GraphQL resolver for the orders type"}]}}
+{"id": "s053", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a Terraform module for a VPC with public and private subnets"}]}}
+{"id": "s054", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Add dataloader batching to prevent N+1 queries"}]}}
+{"id": "s055", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Build a React form with validation and error states"}]}}
+{"id": "s056", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Implement the OAuth2 authorization code flow for our web app"}]}}
+{"id": "s057", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Configure nginx as a reverse proxy with TLS termination"}]}}
+{"id": "s058", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Implement a queue consumer with a dead-letter queue"}]}}
+{"id": "s059", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Add internationalization to the React app"}]}}
+{"id": "s060", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Implement WebSocket reconnection with jittered backoff"}]}}
+{"id": "s061", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Add snapshot tests for the design system components"}]}}
+{"id": "s062", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Debug a race condition in the cache eviction logic"}]}}
+{"id": "s063", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Implement a payment webhook with idempotency handling"}]}}
+{"id": "h064", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Design a URL shortener that handles one million redirects per second across five regions"}]}}
+{"id": "h065", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Analyze the production incident: API latency spiked to 30s and then the cluster failed over; write the postmortem"}]}}
+{"id": "h066", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Plan the migration from per-service IAM to a service mesh with mTLS across 40 services"}]}}
+{"id": "h067", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Design end-to-end encryption for our chat app using the Signal protocol"}]}}
+{"id": "h068", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Architect an event-sourcing system with CRDT-based consistency for offline collaboration"}]}}
+{"id": "h069", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Design a zero-downtime multi-region deployment with failover for the payment gateway"}]}}
+{"id": "h070", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a threat model for the new payment processing service"}]}}
+{"id": "h071", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Design a saga-based distributed transaction across inventory, payments, and shipping services"}]}}
+{"id": "h072", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Design a consistent hashing ring for the distributed cache and analyze rebalancing"}]}}
+{"id": "h073", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Plan SSO with SAML and SCIM provisioning across the whole organization"}]}}
+{"id": "h074", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Investigate the deadlock in the connection pool under concurrent migrations"}]}}
+{"id": "h075", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Design a secrets management rollout with Vault and PCI-DSS field-level encryption"}]}}
+{"id": "h076", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Design a notification system that fans out to 100M users with per-channel quotas"}]}}
+{"id": "h077", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Define the SLO/RTO/RPO and failover runbook for the billing platform"}]}}
+{"id": "h078", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Plan a chaos engineering rollout for the checkout path with mutation testing"}]}}
+{"id": "h079", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Refactor the 80-file auth module across five services without downtime"}]}}
+{"id": "h080", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Design the scheduler for a distributed job system with strict ordering guarantees"}]}}
+{"id": "h081", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Analyze the outage: queue backpressure caused cascading retries; design the fix"}]}}
+{"id": "r082", "expected_tier": "reasoning", "request": {"model": "auto", "messages": [{"role": "user", "content": "Prove that the amortized cost of dynamic array insertion is O(1)"}]}}
+{"id": "r083", "expected_tier": "reasoning", "request": {"model": "auto", "messages": [{"role": "user", "content": "Derive the posterior distribution for a conjugate Bayesian update with a Beta prior"}]}}
+{"id": "r084", "expected_tier": "reasoning", "request": {"model": "auto", "messages": [{"role": "user", "content": "Prove the halting problem is undecidable"}]}}
+{"id": "r085", "expected_tier": "reasoning", "request": {"model": "auto", "messages": [{"role": "user", "content": "Show a reduction from 3-SAT to vertex cover and bound the complexity"}]}}
+{"id": "r086", "expected_tier": "reasoning", "request": {"model": "auto", "messages": [{"role": "user", "content": "Analyze the recurrence T(n) = 2T(n/2) + n with the master theorem"}]}}
+{"id": "r087", "expected_tier": "reasoning", "request": {"model": "auto", "messages": [{"role": "user", "content": "Prove the correctness of Dijkstra's algorithm with non-negative weights"}]}}
+{"id": "r088", "expected_tier": "reasoning", "request": {"model": "auto", "messages": [{"role": "user", "content": "Prove that a distributed counter with CRDT merge converges"}]}}
+{"id": "r089", "expected_tier": "reasoning", "request": {"model": "auto", "messages": [{"role": "user", "content": "Analyze the serialization graph for this schedule and check for anomalies"}]}}
+{"id": "r090", "expected_tier": "reasoning", "request": {"model": "auto", "messages": [{"role": "user", "content": "Prove a lower bound of Omega(n log n) for comparison sorting"}]}}
+{"id": "r091", "expected_tier": "reasoning", "request": {"model": "auto", "messages": [{"role": "user", "content": "Formally prove the greedy algorithm for interval scheduling is optimal"}]}}
+{"id": "t092", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "hello! no need to do anything with kubernetes today, just saying hi"}]}}
+{"id": "t093", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "thanks! that's all I needed about migrations"}]}}
+{"id": "t094", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "What does your name say about the algorithm you use?"}]}}
+{"id": "s095", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Explain how Dijkstra's algorithm works in one short paragraph"}]}}
+{"id": "s096", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Give me a one-line curl command to check the kubernetes pods status"}]}}
+{"id": "s097", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "What does 'CRDT' stand for? One sentence."}]}}
+{"id": "s098", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Write a regex that matches the literal string 'jwt'"}]}}
+{"id": "t099", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "Thanks for the explanation of the incident, nothing to fix"}]}}
+{"id": "s100", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "what is a bloom filter? two sentences max"}]}}
+{"id": "s101", "expected_tier": "trivial", "request": {"model": "auto", "messages": [{"role": "user", "content": "Just say 'distributed consensus' in a sentence so I can quote you"}]}}
+{"id": "s102", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "read the config file and show it to me"}], "tools": [{"type": "function", "function": {"name": "read_file", "description": "Read a file"}}]}}
+{"id": "s103", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "find where rate limiting is configured"}], "tools": [{"type": "function", "function": {"name": "search", "description": "Search the codebase"}}]}}
+{"id": "s104", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "check git status and show recent logs"}], "tools": [{"type": "function", "function": {"name": "shell", "description": "Run a shell command"}}]}}
+{"id": "h105", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "run the test suite"}], "tools": [{"type": "function", "function": {"name": "shell", "description": "Run a shell command"}}]}}
+{"id": "h106", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "fix the failing test in auth.py and commit"}], "tools": [{"type": "function", "function": {"name": "shell", "description": "Run a shell command"}}, {"type": "function", "function": {"name": "edit_file", "description": "Edit a file"}}]}}
+{"id": "h107", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "deploy the service to staging"}], "tools": [{"type": "function", "function": {"name": "shell", "description": "Run a shell command"}}]}}
+{"id": "h108", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "run the tests and if they fail fix them and push"}]}}
+{"id": "h109", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "run the tests"}, {"role": "assistant", "content": "Running tests.", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "shell", "arguments": "{}"}}]}, {"role": "tool", "tool_call_id": "c1", "content": "2 tests failed"}, {"role": "user", "content": "now fix the failing one"}]}}
+{"id": "s110", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "what is a trie?"}, {"role": "assistant", "content": "A tree for prefix lookups."}, {"role": "user", "content": "got it, thanks"}]}}
+{"id": "s111", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "We need caching for the catalog."}, {"role": "assistant", "content": "Redis or in-process?"}, {"role": "user", "content": "Redis, shared across pods."}, {"role": "assistant", "content": "TTL requirements?"}, {"role": "user", "content": "5 minutes, and stale-while-revalidate."}, {"role": "assistant", "content": "Anything else?"}, {"role": "user", "content": "ok so implement it with a small client wrapper"}]}}
+{"id": "s112", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "The deploy failed on stage 3."}, {"role": "assistant", "content": "Which error?"}, {"role": "user", "content": "502 from the proxy."}, {"role": "assistant", "content": "Logs?"}, {"role": "user", "content": "upstream timeout after 30s."}, {"role": "assistant", "content": "Since when?"}, {"role": "user", "content": "after the config change."}, {"role": "assistant", "content": "Which change?"}, {"role": "user", "content": "increased workers."}, {"role": "assistant", "content": "Reverted?"}, {"role": "user", "content": "not yet, what should I do?"}]}}
+{"id": "h113", "expected_tier": "hard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Production is down in eu-west."}, {"role": "assistant", "content": "Symptoms?"}, {"role": "user", "content": "All replicas 500ing."}, {"role": "assistant", "content": "Recent deploys?"}, {"role": "user", "content": "Config migration at 14:02."}, {"role": "assistant", "content": "Rollback possible?"}, {"role": "user", "content": "We tried, it failed halfway. Investigate and write the postmortem with the rollout fix."}]}}
+{"id": "s114", "expected_tier": "simple", "request": {"model": "auto", "messages": [{"role": "user", "content": "Return a JSON schema for a user object with validation rules"}]}}
+{"id": "s115", "expected_tier": "standard", "request": {"model": "auto", "messages": [{"role": "user", "content": "Generate an OpenAPI spec for the three order endpoints"}]}}

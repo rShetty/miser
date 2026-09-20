@@ -14,3 +14,4 @@ miser-types = { path = "../miser-types" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+toml.workspace = true

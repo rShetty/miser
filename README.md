@@ -41,9 +41,10 @@ Configure `classifier.mode` in `config/miser.toml`:
 - `heuristic`: zero-cost, local structural and regex classification
 - `local_llm`: OpenAI-compatible Ollama or local endpoint
 - `cloud_llm`: OpenAI-compatible cloud classifier
+- `jev`: **default**. TypeSafe System One evaluation model (`jev-latest` via TypeSafe direct, or `typesafe-ai/jev` via Vercel AI Gateway); classifies through a typed choice question, not chat completions. Key from `JEV_API_KEY`. Falls back to the heuristic when the endpoint is unreachable or the key is missing.
 - `hybrid`: heuristics first, then bounded local/cloud fallback
 
-The default hybrid mode is conservative: the low-latency heuristic result is accepted when confident; optional model calls are attempted only for ambiguous requests and have independent deadlines.
+The default jev mode classifies every request with a single evaluation call (~340 ms p50) and falls back to the zero-cost heuristic on failure, so a missing key degrades gracefully instead of breaking the gateway.
 
 ## Run locally
 
@@ -201,6 +202,8 @@ Run configured model-assisted modes when available:
 ```bash
 /usr/local/bin/miser-evals --corpus /opt/miser/evals/cases.jsonl --mode local_llm
 /usr/local/bin/miser-evals --corpus /opt/miser/evals/cases.jsonl --mode cloud_llm
+/usr/local/bin/miser-evals --corpus /opt/miser/evals/cases.jsonl --mode jev --config /opt/miser/config/miser.toml
+scripts/classifier_benchmark.sh evals/cases.jsonl heuristic local_llm cloud_llm hybrid jev
 ```
 
 ## Authentication

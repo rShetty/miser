@@ -9,7 +9,7 @@ The gateway is stateless. It does not persist prompts or completions. API keys a
 ## 2. Goals
 
 - OpenAI-compatible chat-completions ingress with transparent streaming.
-- Per-request complexity classification: heuristic, local-LLM, cloud-LLM, and hybrid modes.
+- Per-request complexity classification: Jev (TypeSafe System One, default), heuristic, local-LLM, cloud-LLM, and hybrid modes.
 - Concurrent first-wins classification using `tokio::select!` to minimize classification latency.
 - Cost-aware tier-to-model routing with open-weight models for trivial/simple/standard tasks and frontier models for hard/reasoning tasks.
 - Exact-match response caching with FNV hash and 5-minute TTL to eliminate repeated inference.
@@ -99,11 +99,12 @@ OpenAI request envelopes with `#[serde(flatten)]` for unknown fields, content pa
 
 ### Classifier (`miser-classifier`)
 
-Five-stage pipeline with four modes:
+Five-stage pipeline with five modes:
 - **Override**: `@route:<tier>` at byte zero, confidence 1.0
 - **Structural**: tools present, JSON schema, message count, system prompt length, response format
 - **Heuristic**: compiled `RegexSet` with weighted tier scoring (trivial/simple/standard/hard/reasoning), coding-task detection with +10 boost, zero external calls
 - **LLM**: OpenAI-compatible `/chat/completions` with `temperature:0`, `response_format:json_object`, bounded timeout
+- **Jev** (default): one TypeSafe System One evaluation call answers two typed choice questions (tier + task); tier probability becomes confidence; falls back to the heuristic on failure, timeout, or missing key
 - **Hybrid**: accept high-confidence heuristics; if below threshold, race local + cloud LLMs concurrently via `tokio::select!`; first result above threshold wins; fallback to heuristic on failure
 
 ### Policy (`miser-policy`)
@@ -132,7 +133,7 @@ Five-stage pipeline with four modes:
 
 - Offline classification eval: JSONL corpus, exact/adjacent accuracy, confusion matrix.
 - Quality eval: required-content coverage, structured-output validity, optional LLM judge.
-- CLI: `--mode heuristic|local_llm|cloud_llm|hybrid`, `--quality <path>`.
+- CLI: `--mode heuristic|local_llm|cloud_llm|jev|hybrid`, `--config <path>`, `--quality <path>`.
 
 ## 6. Request lifecycle
 

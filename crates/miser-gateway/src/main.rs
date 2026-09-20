@@ -102,8 +102,22 @@ async fn main() -> anyhow::Result<()> {
     });
     let auth_path =
         std::env::var("MISER_KEYS_FILE").unwrap_or_else(|_| "/etc/miser/keys.json".to_string());
+    let mut classifier_config = config.classifier.clone();
+    if classifier_config
+        .jev
+        .api_key
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        if let Ok(jev_key) = std::env::var("JEV_API_KEY") {
+            if !jev_key.is_empty() {
+                classifier_config.jev.api_key = Some(jev_key);
+            }
+        }
+    }
     let state = AppState {
-        classifier: Arc::new(Classifier::new(config.classifier.clone())?),
+        classifier: Arc::new(Classifier::new(classifier_config)?),
         policy: PolicyEngine::new(config.clone()),
         provider: Provider::new(provider_config)?,
         cache: Arc::new(cache::ResponseCache::new(10000, 300)),

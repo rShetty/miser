@@ -8,6 +8,7 @@ pub const KNOWN_CLASSIFIER_STAGES: &[&str] = &[
     "heuristic",
     "local_llm",
     "cloud_llm",
+    "jev",
 ];
 
 /// Fail-fast validation performed before the gateway binds a socket.
@@ -51,6 +52,7 @@ pub fn validate_config(config: &GatewayConfig) -> Result<(), String> {
         &config.classifier.cloud_llm,
         &mut errors,
     );
+    validate_endpoint("classifier.jev", &config.classifier.jev, &mut errors);
     if let Some(judge) = &config.quality.judge {
         validate_endpoint("quality.judge", judge, &mut errors);
     }

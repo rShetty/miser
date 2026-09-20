@@ -36,7 +36,7 @@ ClassificationResult {
   tier: ComplexityTier,       // Trivial < Simple < Standard < Hard < Reasoning
   confidence: f32,
   reasons: Vec<String>,
-  classifier: String,          // "override" | "heuristic" | "local_llm" | "cloud_llm"
+  classifier: String,          // "override" | "heuristic" | "local_llm" | "cloud_llm" | "jev"
   latency_ms: u64,
   task: Option<TaskType>,      // Chat | Coding | Reasoning | ...
   risk: Option<RiskLevel>,
@@ -248,7 +248,7 @@ Implemented but disabled (`max_entries: 0`). TF-IDF bag-of-words embedding with 
 
 `config/miser.toml`:
 - Server: host, port, api_key (empty for key-based auth), admin_key
-- Classifier: mode, stages, confidence_threshold, local_llm, cloud_llm
+- Classifier: mode, stages, confidence_threshold, local_llm, cloud_llm, jev
 - Quality: enabled, minimum_score, escalate_on_failure
 - Provider: base_url, api_key, api_key_env, provider_preferences
 - Tiers: 5 tiers with model and max_tokens

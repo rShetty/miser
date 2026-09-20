@@ -4,7 +4,7 @@ use miser_types::{
 };
 use regex::RegexSet;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::time::Instant;
 use thiserror::Error;
 
@@ -14,6 +14,10 @@ pub enum ClassifierError {
     Request(#[from] reqwest::Error),
     #[error("classifier returned invalid response: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("classifier endpoint is disabled or misconfigured")]
+    Config,
+    #[error("classifier response had an unexpected format")]
+    Format,
 }
 
 #[derive(Clone)]
@@ -104,6 +108,18 @@ impl Classifier {
         })
     }
 
+    /// Stable string form of the configured mode, used by eval tooling to
+    /// attribute per-case results.
+    pub fn mode_name(&self) -> &'static str {
+        match self.config.mode {
+            ClassifierMode::Heuristic => "heuristic",
+            ClassifierMode::LocalLlm => "local_llm",
+            ClassifierMode::CloudLlm => "cloud_llm",
+            ClassifierMode::Jev => "jev",
+            ClassifierMode::Hybrid => "hybrid",
+        }
+    }
+
     pub async fn classify(
         &self,
         request: &ChatCompletionRequest,
@@ -132,6 +148,7 @@ impl Classifier {
                 .llm(request, &self.config.cloud_llm, "cloud_llm", started)
                 .await
                 .or(Ok(heuristic)),
+            ClassifierMode::Jev => self.jev(request, started).await.or(Ok(heuristic)),
             ClassifierMode::Hybrid => {
                 if heuristic.confidence >= self.config.confidence_threshold {
                     return Ok(heuristic);
@@ -290,9 +307,7 @@ impl Classifier {
         started: Instant,
     ) -> Result<ClassificationResult, ClassifierError> {
         if !endpoint.enabled || endpoint.base_url.is_empty() || endpoint.model.is_empty() {
-            return Err(ClassifierError::Parse(
-                serde_json::from_str::<serde_json::Value>("null").unwrap_err(),
-            ));
+            return Err(ClassifierError::Config);
         }
         let body = json!({ "model": endpoint.model, "messages": [{"role":"system","content":"Classify minimum required capability. Return only JSON {tier: trivial|simple|standard|hard|reasoning, confidence: number, reason: string}. Judge work required, not keywords."},{"role":"user","content":request_text(request)}], "temperature":0, "max_tokens":180, "think":false, "response_format":{"type":"json_object"} });
         let mut req = self
@@ -322,6 +337,128 @@ impl Classifier {
             started,
             task(&request_text(request)),
         ))
+    }
+
+    /// Classify through the Jev evaluation API (`POST {base_url}/evaluate`).
+    ///
+    /// Jev is a System One evaluation model, not a chat model: it receives a
+    /// shared state plus typed questions and returns choices with
+    /// probabilities. Tier and task are answered in one call; the tier
+    /// probability is used directly as classification confidence.
+    async fn jev(
+        &self,
+        request: &ChatCompletionRequest,
+        started: Instant,
+    ) -> Result<ClassificationResult, ClassifierError> {
+        let endpoint = &self.config.jev;
+        if !endpoint.enabled || endpoint.base_url.is_empty() || endpoint.model.is_empty() {
+            return Err(ClassifierError::Config);
+        }
+        if endpoint.api_key.as_deref().unwrap_or_default().is_empty() {
+            return Err(ClassifierError::Config);
+        }
+        // Tool context is part of the request envelope, not the prompt text:
+        // without it Jev cannot apply the agentic capability floors.
+        let tool_names: Vec<String> = request
+            .tools
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| {
+                        tool["function"]["name"]
+                            .as_str()
+                            .or_else(|| tool["name"].as_str())
+                            .or_else(|| tool["type"].as_str())
+                            .unwrap_or("unknown")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let body = json!({
+            "model": endpoint.model,
+            "state": {
+                "request": request_text(request),
+                "tools": tool_names,
+                "tool_history": has_tool_history(request)
+            },
+            "questions": {
+                "tier": {
+                    "type": "choice",
+                    "instructions": "Classify the minimum capability tier required to answer this request. Judge the work and model capability required, never keywords: technical jargon in a trivial request stays trivial, and closing or small-talk messages stay trivial regardless of which technologies they mention. Decide from the inside out: is the answer one bare fact (date, arithmetic, protocol constant, yes/no) with no concept explanation? Then trivial. Asked to explain a concept, produce an artifact (snippet, regex, query, command, translation), or make a small edit? Simple, even when brief. Multi-file feature work, debugging, or infrastructure configuration? Standard. Designing or analyzing a system at scale, production incidents, security threat models, or cross-service migrations? Hard. Formal proof or derivation? Reasoning. Tool context overrides the text alone: when tools are attached or tool history exists, executing one read-only lookup is standard, and mutating or multi-step operations (install, deploy, migrate, commit) are hard. When two tiers are plausible, choose the higher one: under-routing demanding work to a weak model costs more than over-routing.",
+                    "criteria": {
+                        "trivial": "Greetings, thanks, and conversation-closing small talk, pure yes/no answers, bare facts like dates or port numbers, one-command lookups without tools, and tiny mechanical text edits such as rename or uppercase - even if they name complex technology",
+                        "simple": "Explaining a concept even briefly, writing a snippet, regex, query, command, or single test, translating or summarizing text, single-file changes",
+                        "standard": "Implementing features, debugging failures, multi-file or multi-component changes, API/database/schema work, CI or infrastructure configuration with substance, or single read-only tool operations",
+                        "hard": "Architecture or system design at scale (high traffic, many services, many regions), production incident analysis, threat modeling, distributed transactions or migrations, large cross-service refactors, or mutating or multi-step tool operations",
+                        "reasoning": "Formal proofs, complexity or algorithm analysis, derivations, correctness or optimality arguments"
+                    }
+                },
+                "task": {
+                    "type": "choice",
+                    "instructions": "Which category best describes this request?",
+                    "criteria": {
+                        "chat": "Conversational or informational exchange",
+                        "coding": "Writing, changing, or debugging software",
+                        "reasoning": "Formal analysis, proofs, or derivations",
+                        "agentic": "Executing actions, tools, or multi-step operations"
+                    }
+                }
+            }
+        });
+        let path = endpoint.path.as_deref().unwrap_or("/evaluate");
+        let url = if path.starts_with("http://") || path.starts_with("https://") {
+            path.to_string()
+        } else {
+            format!("{}{}", endpoint.base_url.trim_end_matches('/'), path)
+        };
+        let req = self
+            .client
+            .post(url)
+            .timeout(std::time::Duration::from_millis(endpoint.timeout_ms))
+            .json(&body)
+            .bearer_auth(endpoint.api_key.as_deref().unwrap_or_default());
+        let payload: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+        let answers = &payload["answers"];
+        let tier_str = answers["tier"]["choice"].as_str().unwrap_or_default();
+        let tier = match tier_str {
+            "trivial" => ComplexityTier::Trivial,
+            "simple" => ComplexityTier::Simple,
+            "standard" => ComplexityTier::Standard,
+            "hard" => ComplexityTier::Hard,
+            "reasoning" => ComplexityTier::Reasoning,
+            _ => return Err(ClassifierError::Format),
+        };
+        // TypeSafe direct returns a per-answer `confidence`; the Gateway
+        // contract only carries `probabilities`. Prefer the explicit field.
+        let confidence = answers["tier"]["confidence"]
+            .as_f64()
+            .or_else(|| {
+                answers["tier"]["probabilities"]
+                    .get(tier_str)
+                    .and_then(Value::as_f64)
+            })
+            .map(|p| (p as f32).clamp(0.0, 0.99))
+            .unwrap_or(default_confidence());
+        let task_type = answers["task"]["choice"]
+            .as_str()
+            .map(|s| serde_json::from_value::<TaskType>(json!(s)).ok())
+            .flatten();
+        let mut classification = result(
+            tier,
+            confidence,
+            "jev",
+            vec![format!("jev:{}", tier_str)],
+            started,
+            task_type,
+        );
+        if !payload["usage"].is_null() {
+            classification
+                .extra
+                .insert("usage".into(), payload["usage"].clone());
+        }
+        Ok(classification)
     }
 }
 
@@ -759,5 +896,329 @@ mod tests {
             "multi-step agentic should be Hard, got {:?}",
             r.tier
         );
+    }
+
+    // --- Jev evaluation-stage tests -----------------------------------------
+
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    struct MockRequest {
+        path: String,
+        auth: Option<String>,
+        body: serde_json::Value,
+    }
+
+    struct MockHttpResponse {
+        status: u16,
+        body: serde_json::Value,
+        /// Delay before responding, to exercise the request deadline.
+        delay_ms: u64,
+    }
+
+    /// Spawn a one-connection-per-response mock HTTP server. Returns the
+    /// base URL and a handle that resolves to the requests the server saw,
+    /// in order.
+    async fn spawn_mock(responses: Vec<MockHttpResponse>) -> (String, Arc<Mutex<Vec<MockRequest>>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<MockRequest>>> = Arc::default();
+        let seen_for_task = seen.clone();
+        let handle = tokio::spawn(async move {
+            for response in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let mut data = Vec::new();
+                let head_end = loop {
+                    let n = match sock.read(&mut buf).await {
+                        Ok(n) => n,
+                        Err(_) => 0,
+                    };
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&data[..pos]);
+                        let content_length = head
+                            .lines()
+                            .find_map(|line| {
+                                let lower = line.to_lowercase();
+                                lower.starts_with("content-length:")
+                                    .then(|| lower["content-length:".len()..].trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if data.len() >= pos + 4 + content_length {
+                            break pos;
+                        }
+                    }
+                    if n == 0 {
+                        break data.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(data.len());
+                    }
+                };
+                let head = String::from_utf8_lossy(&data[..head_end]).to_string();
+                let mut lines = head.lines();
+                let request_line = lines.next().unwrap_or_default().to_string();
+                let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_string();
+                let auth = lines
+                    .filter_map(|line| {
+                        let lower = line.to_lowercase();
+                        lower.starts_with("authorization:").then(|| line[15..].trim().to_string())
+                    })
+                    .next();
+                let body_start = (head_end + 4).min(data.len());
+                let body = serde_json::from_slice(&data[body_start..])
+                    .unwrap_or(serde_json::json!({"mock_parse_error": true}));
+                seen_for_task.lock().await.push(MockRequest { path, auth, body });
+                if response.delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(response.delay_ms)).await;
+                }
+                let payload = serde_json::to_vec(&response.body).unwrap();
+                let reason = match response.status {
+                    200 => "OK",
+                    500 => "Internal Server Error",
+                    401 => "Unauthorized",
+                    _ => "OK",
+                };
+                let head = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.status, reason, payload.len()
+                );
+                // The client may have already timed out and dropped the
+                // connection; delivering the response is best-effort.
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&payload).await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen, handle)
+    }
+
+    fn jev_answer(tier: &str, confidence: f64) -> serde_json::Value {
+        serde_json::json!({
+            "model": "jev-test",
+            "answers": {
+                "tier": {"type": "choice", "choice": tier, "confidence": confidence},
+                "task": {"type": "choice", "choice": "coding"}
+            }
+        })
+    }
+
+    fn probabilities_answer(tier: &str, p: f64) -> serde_json::Value {
+        serde_json::json!({
+            "answers": {
+                "tier": {"type": "choice", "choice": tier, "probabilities": {tier: p}},
+                "task": {"type": "choice", "choice": "reasoning"}
+            }
+        })
+    }
+
+    fn jev_config(base_url: &str, mode: ClassifierMode) -> ClassifierConfig {
+        let mut config: ClassifierConfig = serde_json::from_str("{}").unwrap();
+        config.mode = mode;
+        config.confidence_threshold = 0.65;
+        config.jev.enabled = true;
+        config.jev.model = "jev-latest".into();
+        config.jev.base_url = base_url.into();
+        config.jev.api_key = Some("test-key".into());
+        config.jev.timeout_ms = 2000;
+        config
+    }
+
+    #[tokio::test]
+    async fn jev_parses_choice_confidence_and_task() {
+        let (base_url, seen, server) = spawn_mock(vec![MockHttpResponse {
+            status: 200,
+            body: jev_answer("standard", 0.84),
+            delay_ms: 0,
+        }])
+        .await;
+        let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
+        let result = classifier.classify(&request("Implement a rate-limited middleware")).await.unwrap();
+        assert_eq!(result.tier, ComplexityTier::Standard);
+        assert!((result.confidence - 0.84).abs() < 1e-6, "confidence {:?}", result.confidence);
+        assert_eq!(result.classifier, "jev");
+        assert_eq!(result.task, Some(TaskType::Coding));
+        let requests = seen.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/evaluate");
+        assert_eq!(requests[0].auth.as_deref(), Some("Bearer test-key"));
+        assert_eq!(requests[0].body["model"], "jev-latest");
+        assert_eq!(requests[0].body["state"]["request"], "Implement a rate-limited middleware");
+        assert_eq!(requests[0].body["questions"]["tier"]["type"], "choice");
+        assert_eq!(
+            requests[0].body["questions"]["tier"]["criteria"].as_object().unwrap().len(),
+            5,
+            "tier question must offer all five tiers"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jev_uses_configured_path_and_multimessage_state() {
+        let (base_url, seen, server) = spawn_mock(vec![MockHttpResponse {
+            status: 200,
+            body: jev_answer("simple", 0.7),
+            delay_ms: 0,
+        }])
+        .await;
+        let mut config = jev_config(&base_url, ClassifierMode::Jev);
+        config.jev.path = Some("/systemone".into());
+        let classifier = Classifier::new(config).unwrap();
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "auto",
+            "messages": [
+                {"role": "user", "content": "first message"},
+                {"role": "user", "content": "second message"}
+            ]
+        }))
+        .unwrap();
+        let result = classifier.classify(&req).await.unwrap();
+        assert_eq!(result.tier, ComplexityTier::Simple);
+        let requests = seen.lock().await;
+        assert_eq!(requests[0].path, "/systemone");
+        let state = requests[0].body["state"]["request"].as_str().unwrap();
+        assert!(state.contains("first message") && state.contains("second message"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jev_state_includes_tool_context() {
+        let (base_url, seen, server) = spawn_mock(vec![MockHttpResponse {
+            status: 200,
+            body: jev_answer("standard", 0.8),
+            delay_ms: 0,
+        }])
+        .await;
+        let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "run the test suite"}],
+            "tools": [{"type": "function", "function": {"name": "shell", "description": "Run a shell command"}}]
+        }))
+        .unwrap();
+        classifier.classify(&req).await.unwrap();
+        let requests = seen.lock().await;
+        assert_eq!(requests[0].body["state"]["tools"], serde_json::json!(["shell"]));
+        assert_eq!(requests[0].body["state"]["tool_history"], false);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jev_falls_back_to_probabilities_without_confidence() {
+        let (base_url, _seen, server) = spawn_mock(vec![MockHttpResponse {
+            status: 200,
+            body: probabilities_answer("hard", 0.91),
+            delay_ms: 0,
+        }])
+        .await;
+        let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
+        let result = classifier.classify(&request("Design a distributed cache")).await.unwrap();
+        assert_eq!(result.tier, ComplexityTier::Hard);
+        assert!((result.confidence - 0.91).abs() < 1e-6, "confidence {:?}", result.confidence);
+        assert_eq!(result.task, Some(TaskType::Reasoning));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jev_confidence_is_clamped() {
+        let (base_url, _seen, server) = spawn_mock(vec![MockHttpResponse {
+            status: 200,
+            body: jev_answer("trivial", 1.2),
+            delay_ms: 0,
+        }])
+        .await;
+        let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
+        let result = classifier.classify(&request("hello")).await.unwrap();
+        assert_eq!(result.tier, ComplexityTier::Trivial);
+        assert!(result.confidence <= 0.99, "confidence {:?}", result.confidence);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jev_invalid_choice_falls_back_to_heuristic() {
+        let (base_url, _seen, server) = spawn_mock(vec![MockHttpResponse {
+            status: 200,
+            body: jev_answer("mega-tier", 0.9),
+            delay_ms: 0,
+        }])
+        .await;
+        let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
+        let result = classifier.classify(&request("Explain DNS")).await.unwrap();
+        assert_eq!(result.classifier, "heuristic", "invalid choice must fall back to heuristic");
+        assert_eq!(result.tier, ComplexityTier::Simple);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jev_http_error_falls_back_to_heuristic() {
+        let (base_url, _seen, server) = spawn_mock(vec![MockHttpResponse {
+            status: 500,
+            body: serde_json::json!({"error": "boom"}),
+            delay_ms: 0,
+        }])
+        .await;
+        let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
+        let result = classifier.classify(&request("Explain DNS")).await.unwrap();
+        assert_eq!(result.classifier, "heuristic");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jev_timeout_falls_back_to_heuristic() {
+        let (base_url, _seen, server) = spawn_mock(vec![MockHttpResponse {
+            status: 200,
+            body: jev_answer("hard", 0.9),
+            delay_ms: 2000,
+        }])
+        .await;
+        let mut config = jev_config(&base_url, ClassifierMode::Jev);
+        config.jev.timeout_ms = 200;
+        let classifier = Classifier::new(config).unwrap();
+        let result = classifier.classify(&request("Architect a distributed cache")).await.unwrap();
+        assert_eq!(result.classifier, "heuristic", "deadline must bound the jev call");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jev_disabled_endpoint_falls_back_without_calling() {
+        let mut config = jev_config("http://127.0.0.1:9", ClassifierMode::Jev);
+        config.jev.enabled = false;
+        let classifier = Classifier::new(config).unwrap();
+        let result = classifier.classify(&request("Explain DNS")).await.unwrap();
+        assert_eq!(result.classifier, "heuristic");
+    }
+
+    #[tokio::test]
+    async fn jev_missing_api_key_falls_back_without_calling() {
+        let mut config = jev_config("http://127.0.0.1:9", ClassifierMode::Jev);
+        config.jev.api_key = None;
+        let classifier = Classifier::new(config).unwrap();
+        let result = classifier.classify(&request("Explain DNS")).await.unwrap();
+        assert_eq!(result.classifier, "heuristic");
+    }
+
+    #[tokio::test]
+    async fn override_precedes_jev() {
+        let classifier = Classifier::new(jev_config("http://127.0.0.1:9", ClassifierMode::Jev)).unwrap();
+        let result = classifier.classify(&request("@route:reasoning\nhello")).await.unwrap();
+        assert_eq!(result.classifier, "override");
+        assert_eq!(result.tier, ComplexityTier::Reasoning);
+    }
+
+    #[tokio::test]
+    async fn jev_low_confidence_result_still_returned_in_jev_mode() {
+        let (base_url, _seen, server) = spawn_mock(vec![MockHttpResponse {
+            status: 200,
+            body: jev_answer("standard", 0.3),
+            delay_ms: 0,
+        }])
+        .await;
+        let classifier = Classifier::new(jev_config(&base_url, ClassifierMode::Jev)).unwrap();
+        let result = classifier.classify(&request("Implement an API endpoint")).await.unwrap();
+        assert_eq!(result.classifier, "jev", "jev mode must not silently re-classify via heuristic");
+        assert_eq!(result.tier, ComplexityTier::Standard);
+        server.await.unwrap();
     }
 }

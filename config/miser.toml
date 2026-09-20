@@ -8,8 +8,8 @@ api_key = ""
 # request_timeout_ms = 30000
 
 [classifier]
-mode = "hybrid"
-stages = ["override", "structural", "heuristic", "local_llm", "cloud_llm"]
+mode = "jev"
+stages = ["override", "structural", "heuristic", "jev", "local_llm", "cloud_llm"]
 confidence_threshold = 0.65
 
 [classifier.local_llm]
@@ -23,6 +23,19 @@ enabled = true
 model = "openai/gpt-4.1-mini"
 base_url = "https://openrouter.ai/api/v1"
 timeout_ms = 1500
+
+# Jev (TypeSafe System One) evaluation endpoint. Talks the evaluation
+# contract, not chat completions. Default path is /evaluate (Vercel AI
+# Gateway); TypeSafe direct is /systemone with model jev-latest. The API key
+# is resolved from JEV_API_KEY when left empty. With mode = "jev" the
+# classifier routes every request through Jev; mode = "hybrid" does not
+# consult this endpoint.
+[classifier.jev]
+enabled = true
+model = "jev-latest"
+base_url = "https://api.typesafe.ai/v1"
+path = "/systemone"
+timeout_ms = 3000
 
 [quality]
 enabled = true
