@@ -64,6 +64,24 @@ pub fn validate_config(config: &GatewayConfig) -> Result<(), String> {
         &mut errors,
     );
 
+    let bands = &config.routing.bands;
+    if bands.trivial_max <= 0.0
+        || bands.trivial_max >= bands.simple_max
+        || bands.simple_max >= bands.standard_max
+        || bands.standard_max >= bands.reasoning_max
+    {
+        errors.push(
+            "routing.bands must satisfy 0 < trivial_max < simple_max < standard_max < reasoning_max"
+                .to_string(),
+        );
+    }
+    if !(0.0..1.0).contains(&config.routing.switch_saving_ratio) {
+        errors.push("routing.switch_saving_ratio must be in [0, 1)".to_string());
+    }
+    if config.routing.failover_threshold == 0 {
+        errors.push("routing.failover_threshold must be at least 1".to_string());
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {

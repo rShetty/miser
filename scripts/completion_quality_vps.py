@@ -9,6 +9,14 @@ OR = 'https://openrouter.ai/api/v1/chat/completions'
 GATEWAY = 'http://127.0.0.1:8787/v1/chat/completions'
 MODELS = [('miser_auto', GATEWAY, 'auto'), ('openrouter_auto', OR, 'openrouter/auto'), ('gpt_4_1_mini', OR, 'openai/gpt-4.1-mini')]
 
+# Jev quality judge configuration
+# Set JUDGE=jev (default) or JUDGE=glm to select the quality judge model
+JUDGE = os.environ.get('JUDGE', 'jev')
+JEV_KEY = os.environ.get('JEV_API_KEY', '')
+JEV_BASE = os.environ.get('JEV_BASE_URL', 'https://api.typesafe.ai/v1')
+JEV_MODEL = os.environ.get('JEV_MODEL', 'jev-latest')
+JEV_PATH = os.environ.get('JEV_PATH', '/systemone')
+
 PRICING = {
     'openai/gpt-4.1-mini': (0.40, 1.60),
     'deepseek/deepseek-chat': (0.14, 0.28),
@@ -24,13 +32,62 @@ def cost_for(model, prompt_tokens, completion_tokens):
     return round(prompt_tokens/1e6*p[0] + completion_tokens/1e6*p[1], 6)
 
 def judge_quality(case, response_text):
-    if not KEY:
+    """Quality judge: Jev (TypeSafe System One, default) or GLM 5.2 (fallback)."""
+    if not KEY and not JEV_KEY:
         coverage = sum(x.lower() in response_text.lower() for x in case['required'])/max(1,len(case['required']))
         if case['task']=='structured':
             try: json.loads(response_text); valid_json=True
             except: valid_json=False
             if not valid_json: coverage*=.25
         return coverage
+    if JUDGE == 'jev' and JEV_KEY:
+        return judge_quality_jev(case, response_text)
+    return judge_quality_glm(case, response_text)
+
+def judge_quality_jev(case, response_text):
+    """Jev (TypeSafe System One) as quality judge using typed score question."""
+    body = {
+        "model": JEV_MODEL,
+        "state": {
+            "request": f"Task: {case['prompt']}\n\nResponse (truncated to 3000 chars): {response_text[:3000]}",
+            "tools": [],
+            "tool_history": False
+        },
+        "questions": {
+            "quality": {
+                "type": "score",
+                "instructions": "Score this AI response for correctness (factually accurate, no hallucinations), completeness (covers all required concepts and addresses the full prompt), and relevance (directly answers what was asked, no tangents). Weight correctness highest, then completeness, then relevance.",
+                "criteria": [
+                    "Completely wrong, irrelevant, or empty - fails to address the prompt at all",
+                    "Major errors, missing most required concepts, or significant tangents",
+                    "Partially correct but with notable gaps in required concepts or minor errors",
+                    "Mostly correct and complete with only minor issues",
+                    "Correct, complete, and directly relevant - covers all required concepts accurately"
+                ]
+            }
+        }
+    }
+    url = f"{JEV_BASE.rstrip('/')}{JEV_PATH}"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "Authorization": f"Bearer {JEV_KEY}"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read())
+        answers = data.get("answers", {})
+        quality = answers.get("quality", {})
+        score_val = quality.get("score")
+        if score_val is not None:
+            return float(score_val)
+        probabilities = quality.get("probabilities", {})
+        if probabilities:
+            weighted = sum(int(level) * prob for level, prob in probabilities.items())
+            return weighted / 4.0
+    except:
+        pass
+    coverage = sum(x.lower() in response_text.lower() for x in case['required'])/max(1,len(case['required']))
+    return coverage
+
+def judge_quality_glm(case, response_text):
+    """GLM 5.2 as quality judge via OpenRouter chat completions."""
     body = {'model':'z-ai/glm-5.2','messages':[
         {'role':'system','content':'You are a quality judge. Score the response 0.0-1.0 for correctness, completeness, and relevance. Return only JSON: {"score":0.0,"passed":true}'},
         {'role':'user','content':f'Task: {case["prompt"]}\n\nResponse: {response_text[:3000]}\n\nRequired elements: {", ".join(case["required"])}'}
@@ -105,7 +162,7 @@ def main():
                  'route_tiers':route_tiers,'route_models':route_models,
                  'errors':[x.get('error') for x in out if not x['ok']]}
         print(json.dumps(summary,indent=2)); allout.append({'summary':summary,'cases':out})
-    report={'timestamp':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'judge':'z-ai/glm-5.2','cases':CASES,'results':allout}
+    report={'timestamp':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'judge':JEV_MODEL if JUDGE=='jev' else 'z-ai/glm-5.2','cases':CASES,'results':allout}
     path=ROOT/'results'/'completion-quality-judged.json'; path.write_text(json.dumps(report,indent=2))
     print('REPORT='+str(path))
 main()

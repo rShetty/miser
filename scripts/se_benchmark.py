@@ -10,17 +10,84 @@ GATEWAY = 'http://127.0.0.1:8787/v1/chat/completions'
 MISER_KEY = os.environ.get('MISER_USER_KEY', '')
 MODELS = [('miser_auto', GATEWAY, 'auto', MISER_KEY), ('openrouter_auto', OR, 'openrouter/auto', KEY), ('gpt_4_1_mini', OR, 'openai/gpt-4.1-mini', KEY), ('glm_5_2', OR, 'z-ai/glm-5.2', KEY), ('claude_sonnet', OR, 'anthropic/claude-sonnet-4', KEY)]
 
+# Jev quality judge configuration
+# Set JUDGE=jev (default) or JUDGE=glm to select the quality judge model
+JUDGE = os.environ.get('JUDGE', 'jev')
+JEV_KEY = os.environ.get('JEV_API_KEY', '')
+JEV_BASE = os.environ.get('JEV_BASE_URL', 'https://api.typesafe.ai/v1')
+JEV_MODEL = os.environ.get('JEV_MODEL', 'jev-latest')
+JEV_PATH = os.environ.get('JEV_PATH', '/systemone')
+
 TIERS = ["trivial", "simple", "standard", "hard", "reasoning"]
 
 def classify_accuracy(case, actual_tier):
     return 1.0 if actual_tier == case["expected_tier"] else 0.0
 
 def judge_quality(case, response_text):
+    """Quality judge: Jev (TypeSafe System One, default) or GLM 5.2 (fallback).
+    
+    Jev uses a typed score question via the /evaluate endpoint.
+    GLM uses chat completions with JSON response format.
+    Set JUDGE=jev or JUDGE=glm via environment variable.
+    """
     if not response_text or len(response_text.strip()) < 5:
         return 0.0
-    if not KEY:
-        coverage = sum(x.lower() in response_text.lower() for x in case["required"])/max(1,len(case["required"]))
-        return coverage
+    if JUDGE == 'jev' and JEV_KEY:
+        return judge_quality_jev(case, response_text)
+    if KEY:
+        return judge_quality_glm(case, response_text)
+    coverage = sum(x.lower() in response_text.lower() for x in case["required"])/max(1,len(case["required"]))
+    return coverage
+
+def judge_quality_jev(case, response_text):
+    """Jev (TypeSafe System One) as quality judge.
+    
+    Uses a typed score question: the model scores the response 0.0-1.0
+    for correctness, completeness, and relevance. Jev returns calibrated
+    probabilities for each score level, weighted to produce a float score.
+    """
+    body = {
+        "model": JEV_MODEL,
+        "state": {
+            "request": f"Task: {case['prompt']}\n\nResponse (truncated to 3000 chars): {response_text[:3000]}",
+            "tools": [],
+            "tool_history": False
+        },
+        "questions": {
+            "quality": {
+                "type": "score",
+                "instructions": "Score this AI response for correctness (factually accurate, no hallucinations), completeness (covers all required concepts and addresses the full prompt), and relevance (directly answers what was asked, no tangents). Weight correctness highest, then completeness, then relevance.",
+                "criteria": [
+                    "Completely wrong, irrelevant, or empty - fails to address the prompt at all",
+                    "Major errors, missing most required concepts, or significant tangents",
+                    "Partially correct but with notable gaps in required concepts or minor errors",
+                    "Mostly correct and complete with only minor issues",
+                    "Correct, complete, and directly relevant - covers all required concepts accurately"
+                ]
+            }
+        }
+    }
+    url = f"{JEV_BASE.rstrip('/')}{JEV_PATH}"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "Authorization": f"Bearer {JEV_KEY}"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read())
+        answers = data.get("answers", {})
+        quality = answers.get("quality", {})
+        score_val = quality.get("score")
+        if score_val is not None:
+            return float(score_val)
+        probabilities = quality.get("probabilities", {})
+        if probabilities:
+            weighted = sum(int(level) * prob for level, prob in probabilities.items())
+            return weighted / 4.0  # Normalize 0-4 range to 0.0-1.0
+    except:
+        pass
+    coverage = sum(x.lower() in response_text.lower() for x in case["required"])/max(1,len(case["required"]))
+    return coverage
+
+def judge_quality_glm(case, response_text):
+    """GLM 5.2 as quality judge via OpenRouter chat completions."""
     body = {
         "model": "z-ai/glm-5.2",
         "messages": [
@@ -122,7 +189,7 @@ def main():
         }
         print(json.dumps(summary, indent=2), flush=True)
         allout.append({"summary": summary, "cases": out})
-    report = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "judge": "z-ai/glm-5.2", "corpus": "se_quality_cases.jsonl", "results": allout}
+    report = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "judge": JEV_MODEL if JUDGE == "jev" else "z-ai/glm-5.2", "corpus": "se_quality_cases.jsonl", "results": allout}
     path = ROOT / "results" / "se-benchmark.json"
     path.write_text(json.dumps(report, indent=2))
     print("REPORT=" + str(path))

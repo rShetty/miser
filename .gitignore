@@ -8,3 +8,5 @@ results/
 prototypes/typescript/node_modules/
 prototypes/typescript/packages/*/node_modules/
 node_modules/
+catalog/
+server.pid

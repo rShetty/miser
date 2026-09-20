@@ -1,5 +1,6 @@
 mod auth;
 mod cache;
+mod catalog;
 mod metrics;
 mod session;
 mod usage;
@@ -53,6 +54,7 @@ struct AppState {
     usage: Arc<usage::UsageLedger>,
     metrics: Arc<metrics::Metrics>,
     audit: Arc<auth::AuditLog>,
+    catalog: Arc<catalog::CatalogRouter>,
     admin_key: String,
 }
 
@@ -144,9 +146,26 @@ async fn main() -> anyhow::Result<()> {
             std::env::var("MISER_AUDIT_FILE")
                 .unwrap_or_else(|_| "/var/lib/miser/audit.jsonl".to_string()),
         ))),
+        catalog: Arc::new(catalog::CatalogRouter::load_or_seed(&config)),
         admin_key,
         config,
     };
+    if state.catalog.enabled() && state.config.routing.refresh_on_start {
+        let refresh_state = state.clone();
+        tokio::spawn(async move {
+            match refresh_state
+                .catalog
+                .refresh(&refresh_state.provider, &refresh_state.config.routing)
+                .await
+            {
+                Ok(_) => tracing::info!("catalog refreshed at startup"),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "startup catalog refresh failed; persisted or seeded pins in use"
+                ),
+            }
+        });
+    }
     let address = format!("{}:{}", state.config.host, state.config.port);
     let app = build_router(state);
     let listener = TcpListener::bind(&address).await?;
@@ -194,6 +213,38 @@ async fn shutdown_signal() {
 }
 
 impl AppState {
+    /// Feeds the upstream outcome back into the catalog router. Transport
+    /// errors (`None`) and 5xx/429 responses count as provider failures;
+    /// client errors (4xx) are the caller's fault and never trigger
+    /// failover; 2xx resets the failure counter. A promoted failover model
+    /// is sticky until restart or the next catalog refresh.
+    fn report_upstream_outcome(&self, tier: ComplexityTier, status: Option<axum::http::StatusCode>) {
+        if !self.catalog.enabled() {
+            return;
+        }
+        if matches!(status, Some(status) if status.is_success()) {
+            self.catalog.report_success(tier);
+            return;
+        }
+        let is_provider_failure = match status {
+            None => true,
+            Some(status) => status.is_server_error() || status.as_u16() == 429,
+        };
+        if !is_provider_failure {
+            return;
+        }
+        let threshold = self.config.routing.failover_threshold;
+        if let Some(new_model) = self.catalog.report_failure(tier, threshold) {
+            self.metrics.catalog_failovers_total.inc();
+            tracing::warn!(
+                tier = %format_tier(tier),
+                new_model = %new_model,
+                threshold,
+                "upstream provider failures exceeded threshold; failing over to next catalog candidate"
+            );
+        }
+    }
+
     /// Resolve the acting admin identity for audit records: the admin key
     /// id when the caller presented a valid key, else the shared admin key
     /// fingerprint.
@@ -243,6 +294,8 @@ fn build_router(state: AppState) -> Router {
         .route("/admin/usage/summary", get(usage_summary))
         .route("/admin/usage/keys/{id}", get(usage_key_detail))
         .route("/admin/usage/clients", get(usage_clients))
+        .route("/admin/catalog", get(catalog_status))
+        .route("/admin/catalog/refresh", post(refresh_catalog))
         .with_state(Arc::new(state))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -423,11 +476,19 @@ async fn completions_inner(
             }
         }
     }
-    let route = state
+    let mut route = state
         .policy
         .select(&request, &classification)
         .map_err(internal)?;
     let effective_tier = state.policy.effective_tier(&request, &classification);
+    // Catalog routing: swap the tier route's model for the tier's pinned
+    // (or failover-promoted) model. Params (max_tokens, temperature) stay
+    // from the config route; only the model id is catalog-driven.
+    if state.catalog.enabled() {
+        if let Some(model) = state.catalog.active_model(effective_tier) {
+            route.model = model;
+        }
+    }
     state
         .metrics
         .tier_requests_total
@@ -474,12 +535,15 @@ async fn completions_inner(
         Ok(upstream) => upstream,
         Err(error) => {
             state.metrics.upstream_errors_total.inc();
+            state.report_upstream_outcome(effective_tier, None);
             return Err(internal(error));
         }
     };
-    if !upstream.status().is_success() {
+    let upstream_status = upstream.status();
+    if !upstream_status.is_success() {
         state.metrics.upstream_errors_total.inc();
     }
+    state.report_upstream_outcome(effective_tier, Some(upstream_status));
     let selected_route = route.clone();
     if !stream_requested && upstream.status().is_success() {
         // Record estimated spend for per-key budget enforcement when the
@@ -1012,6 +1076,54 @@ async fn usage_clients(
     ))
 }
 
+/// Current catalog routing state: pins, active (possibly failover-promoted)
+/// models, failure counters, and the full model→tier split counts.
+async fn catalog_status(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    Ok(Json(state.catalog.summary_json()))
+}
+
+/// Re-fetches the provider catalog, re-partitions tiers, applies pin
+/// hysteresis, persists the snapshot, and swaps it in live.
+async fn refresh_catalog(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !auth::admin_auth(&headers, &state.admin_key) {
+        return Err(auth::json_error(
+            "admin access required",
+            StatusCode::UNAUTHORIZED,
+        ));
+    }
+    let actor = state.admin_actor(&headers);
+    match state
+        .catalog
+        .refresh(&state.provider, &state.config.routing)
+        .await
+    {
+        Ok(summary) => {
+            let _ = state
+                .audit
+                .append_outcome(&actor, "catalog_refresh", "openrouter", "success");
+            Ok(Json(summary))
+        }
+        Err(error) => {
+            let _ = state
+                .audit
+                .append_outcome(&actor, "catalog_refresh", "openrouter", "failure");
+            Err(auth::json_error(&error, StatusCode::BAD_GATEWAY))
+        }
+    }
+}
+
 #[cfg(test)]
 mod integration_tests {
     use super::*;
@@ -1074,6 +1186,7 @@ mod integration_tests {
                     .unwrap()
                     .as_nanos()
             )))),
+            catalog: Arc::new(catalog::CatalogRouter::load_or_seed(&config)),
             admin_key: admin_key.to_string(),
             config,
         }

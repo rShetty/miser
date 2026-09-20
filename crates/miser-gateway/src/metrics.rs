@@ -29,6 +29,9 @@ pub struct Metrics {
     pub quality_escalations_total: IntCounter,
     /// Failed or errored upstream provider responses.
     pub upstream_errors_total: IntCounter,
+    /// Times a catalog tier's active model was swapped for the next
+    /// candidate after repeated upstream failures.
+    pub catalog_failovers_total: IntCounter,
 }
 
 impl Metrics {
@@ -67,6 +70,10 @@ impl Metrics {
             "miser_upstream_errors_total",
             "Failed or errored upstream provider responses.",
         )?;
+        let catalog_failovers_total = IntCounter::new(
+            "miser_catalog_failovers_total",
+            "Catalog tier active models swapped to the next candidate after repeated upstream failures.",
+        )?;
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration_seconds.clone()))?;
@@ -75,6 +82,7 @@ impl Metrics {
         registry.register(Box::new(cache_misses_total.clone()))?;
         registry.register(Box::new(quality_escalations_total.clone()))?;
         registry.register(Box::new(upstream_errors_total.clone()))?;
+        registry.register(Box::new(catalog_failovers_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -85,6 +93,7 @@ impl Metrics {
             cache_misses_total,
             quality_escalations_total,
             upstream_errors_total,
+            catalog_failovers_total,
         })
     }
 

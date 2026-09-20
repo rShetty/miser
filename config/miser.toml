@@ -41,6 +41,15 @@ timeout_ms = 3000
 enabled = true
 minimum_score = 0.65
 escalate_on_failure = true
+# Jev (TypeSafe System One) as quality judge. Scores non-streaming responses
+# for correctness, completeness, and relevance using a typed score question.
+# Falls back to deterministic checks on failure. Key from JEV_API_KEY.
+[quality.judge]
+enabled = true
+model = "jev-latest"
+base_url = "https://api.typesafe.ai/v1"
+path = "/systemone"
+timeout_ms = 3000
 
 [provider]
 base_url = "https://openrouter.ai/api/v1"
@@ -50,6 +59,37 @@ api_key_env = "OPENROUTER_API_KEY"
 [provider.provider_preferences]
 sort = "price"
 allow_fallbacks = true
+
+[routing]
+# "catalog" partitions every OpenRouter model into the five tiers by input
+# price and pins one model per tier; "fixed" uses [tiers.*].model verbatim.
+mode = "catalog"
+# Persisted snapshot (pins + full model->tier split). Loaded at startup;
+# refreshed only via POST /admin/catalog/refresh.
+cache_path = "catalog/models.json"
+# First snapshot pins each tier to its configured [tiers.*].model, so
+# enabling catalog mode changes nothing until an explicit refresh migrates
+# a pin to a meaningfully cheaper candidate.
+seed_from_config = true
+# Refresh migrates a pin only when a candidate is at least 25% cheaper.
+switch_saving_ratio = 0.25
+# Consecutive upstream failures (5xx/429/transport) before a tier's active
+# model is swapped for the next candidate (in-memory until restart).
+failover_threshold = 3
+refresh_on_start = false
+
+[routing.bands]
+# Input price bounds (USD per 1M prompt tokens). Defaults are geometric
+# midpoints between the shipped tier anchor models.
+trivial_max = 0.035
+simple_max = 0.09
+standard_max = 0.36
+reasoning_max = 1.4
+
+[routing.filters]
+require_tools = true
+min_context = 65536
+allow_free = false
 
 [session]
 enabled = true

@@ -303,6 +303,10 @@ pub struct GatewayConfig {
     pub classifier: ClassifierConfig,
     pub tiers: BTreeMap<ComplexityTier, TierModelRouteConfig>,
     pub provider: ProviderConfig,
+    /// Catalog routing configuration. Absent from a TOML file means
+    /// `mode = "fixed"` (the pre-catalog tier→model mapping).
+    #[serde(default)]
+    pub routing: RoutingConfig,
     #[serde(default)]
     pub quality: QualityConfig,
     #[serde(default)]
@@ -311,6 +315,200 @@ pub struct GatewayConfig {
     pub session: SessionConfig,
     #[serde(flatten)]
     pub extra: ExtraFields,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
+    #[default]
+    Fixed,
+    Catalog,
+}
+
+/// Catalog routing: every OpenRouter model is banded into the five
+/// complexity tiers by input price; each tier pins one model and sticks to
+/// it (no per-request switching) until an explicit refresh applies
+/// hysteresis-gated migration or repeated upstream failures trigger
+/// failover to the next candidate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutingConfig {
+    #[serde(default)]
+    pub mode: RoutingMode,
+    /// Where the persisted catalog snapshot (pins + full tier split) is
+    /// stored. Defaults to `catalog/models.json` relative to the working
+    /// directory, overridable via `MISER_CATALOG_FILE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_path: Option<String>,
+    /// Fetch a fresh catalog from the provider at startup. Failure keeps
+    /// the persisted snapshot (or seeded pins) and is logged, never fatal.
+    #[serde(default)]
+    pub refresh_on_start: bool,
+    /// First snapshot seeds tier pins from the fixed `[tiers.*].model`
+    /// entries instead of picking the cheapest candidate, so enabling
+    /// catalog mode changes nothing until a refresh deliberately migrates.
+    #[serde(default = "default_true")]
+    pub seed_from_config: bool,
+    /// A refresh migrates a tier pin to a cheaper candidate only when the
+    /// candidate's input price is at least this fraction cheaper than the
+    /// current pin's (hysteresis against price noise).
+    #[serde(default = "default_switch_saving_ratio")]
+    pub switch_saving_ratio: f32,
+    /// Consecutive upstream failures (5xx/429/transport) on a tier's active
+    /// model before failover promotes the next candidate for that tier.
+    #[serde(default = "default_failover_threshold")]
+    pub failover_threshold: u32,
+    #[serde(default)]
+    pub bands: RoutingBands,
+    #[serde(default)]
+    pub filters: RoutingFilters,
+    #[serde(flatten)]
+    pub extra: ExtraFields,
+}
+
+fn default_switch_saving_ratio() -> f32 {
+    0.25
+}
+fn default_failover_threshold() -> u32 {
+    3
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            mode: RoutingMode::Fixed,
+            cache_path: None,
+            refresh_on_start: false,
+            seed_from_config: true,
+            switch_saving_ratio: default_switch_saving_ratio(),
+            failover_threshold: default_failover_threshold(),
+            bands: RoutingBands::default(),
+            filters: RoutingFilters::default(),
+            extra: ExtraFields::default(),
+        }
+    }
+}
+
+/// Input-price bands (USD per 1M prompt tokens) splitting the catalog into
+/// the five complexity tiers. Defaults are geometric midpoints between the
+/// shipped tier anchor models (qwen3.7-flash $0.03, deepseek-v4-flash $0.04,
+/// qwen3-coder-flash $0.20, glm-5.2 $0.65, claude-sonnet-4 $3.00).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutingBands {
+    #[serde(default = "default_trivial_max")]
+    pub trivial_max: f64,
+    #[serde(default = "default_simple_max")]
+    pub simple_max: f64,
+    #[serde(default = "default_standard_max")]
+    pub standard_max: f64,
+    #[serde(default = "default_reasoning_max")]
+    pub reasoning_max: f64,
+}
+
+fn default_trivial_max() -> f64 {
+    0.035
+}
+fn default_simple_max() -> f64 {
+    0.09
+}
+fn default_standard_max() -> f64 {
+    0.36
+}
+fn default_reasoning_max() -> f64 {
+    1.4
+}
+
+impl Default for RoutingBands {
+    fn default() -> Self {
+        Self {
+            trivial_max: default_trivial_max(),
+            simple_max: default_simple_max(),
+            standard_max: default_standard_max(),
+            reasoning_max: default_reasoning_max(),
+        }
+    }
+}
+
+/// Hard filters a catalog model must pass to become a tier candidate (pin
+/// or failover target). Non-passing models still appear in the tier split
+/// for observability but are never routed to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutingFilters {
+    /// Require tool-calling support (`supported_parameters` includes
+    /// "tools") — mandatory for coding-agent traffic.
+    #[serde(default = "default_true")]
+    pub require_tools: bool,
+    /// Minimum advertised context window in tokens.
+    #[serde(default = "default_min_context")]
+    pub min_context: u64,
+    /// Allow zero-priced and `:free`-suffixed models as candidates. Off by
+    /// default: free endpoints are heavily rate-limited.
+    #[serde(default)]
+    pub allow_free: bool,
+    /// Skip models whose id starts with any of these prefixes.
+    #[serde(default)]
+    pub deny_prefixes: Vec<String>,
+    /// For the reasoning tier's pin, prefer models advertising reasoning
+    /// support when any exist in the band.
+    #[serde(default = "default_true")]
+    pub prefer_reasoning_pin: bool,
+}
+
+fn default_min_context() -> u64 {
+    65_536
+}
+
+impl Default for RoutingFilters {
+    fn default() -> Self {
+        Self {
+            require_tools: true,
+            min_context: default_min_context(),
+            allow_free: false,
+            deny_prefixes: Vec::new(),
+            prefer_reasoning_pin: true,
+        }
+    }
+}
+
+/// One model entry extracted from the provider catalog, normalized for
+/// banding and filtering.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CatalogModel {
+    pub id: String,
+    pub name: String,
+    pub context_length: u64,
+    /// USD per 1M prompt tokens.
+    pub input_price_per_m: f64,
+    /// USD per 1M completion tokens.
+    pub output_price_per_m: f64,
+    pub tools: bool,
+    pub reasoning: bool,
+    pub text_output: bool,
+}
+
+/// Sticky per-tier routing state: the pinned model plus an ordered
+/// (cheapest-first) candidate list used for failover promotion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TierPin {
+    pub model: String,
+    pub candidates: Vec<String>,
+}
+
+/// Persisted catalog snapshot: the full model→tier split plus the sticky
+/// pin per tier. Written by catalog refresh, loaded at startup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CatalogSnapshot {
+    /// Unix seconds of the provider fetch; `None` for a seeded snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<u64>,
+    /// "openrouter" after a live fetch, "seed" for config-derived pins.
+    pub source: String,
+    pub pins: BTreeMap<ComplexityTier, TierPin>,
+    /// Every catalog model mapped to its price band tier.
+    pub model_tiers: BTreeMap<String, ComplexityTier>,
+    pub total_models: usize,
+    /// Models that failed the candidate filters (still present in
+    /// `model_tiers`, never routed to).
+    pub unranked_models: usize,
 }
 
 fn default_host() -> String {
