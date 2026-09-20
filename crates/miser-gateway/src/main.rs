@@ -36,7 +36,14 @@ use validate::validate_config;
 const DEFAULT_CONCURRENCY_LIMIT: usize = 64;
 /// Default per-request timeout when `request_timeout_ms` is absent from
 /// the config.
-const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+///
+/// Regression guard: 30s 408'd legitimate non-streaming completions.
+/// Measured hard-tier generations ran 8-30s upstream alone, before
+/// classification and the quality judge add their latency, so real
+/// traffic routinely crossed 30s and died with
+/// `{"error":{"message":"request timed out"}}`. LLM latencies justify
+/// minutes, not seconds; operators can still lower it per deployment.
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -1370,6 +1377,12 @@ mod integration_tests {
     use tower::ServiceExt;
 
     fn test_state(admin_key: &str) -> AppState {
+        test_state_with_upstream(admin_key, "http://127.0.0.1:9".to_string())
+    }
+
+    /// [`test_state`] pointed at a live upstream base_url, for
+    /// end-to-end completions tests that exercise the real request path.
+    fn test_state_with_upstream(admin_key: &str, base_url: String) -> AppState {
         let mut config: GatewayConfig = serde_json::from_value(json!({
             "host": "127.0.0.1",
             "port": 0,
@@ -1398,7 +1411,7 @@ mod integration_tests {
             classifier: Arc::new(Classifier::new(config.classifier.clone()).unwrap()),
             policy: PolicyEngine::new(config.clone()),
             provider: Provider::new(ProviderConfig {
-                base_url: "http://127.0.0.1:9".to_string(),
+                base_url,
                 api_key: Some("test".to_string()),
                 ..Default::default()
             })
@@ -1495,6 +1508,535 @@ mod integration_tests {
             content_type,
             String::from_utf8_lossy(&bytes).into_owned(),
         )
+    }
+
+    /// Like [`send`] but returns status, headers, and the raw body — for
+    /// streaming (SSE) responses and header assertions.
+    async fn send_raw(
+        app: Router,
+        method: &str,
+        uri: &str,
+        bearer: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(token) = bearer {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        if body.is_some() {
+            builder = builder.header("Content-Type", "application/json");
+        }
+        let request = match body {
+            Some(b) => builder.body(Body::from(b.to_string())).unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        let resp = app.oneshot(request).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, bytes.to_vec())
+    }
+
+    struct MockUpstream {
+        base_url: String,
+        requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockUpstream {
+        async fn requests(&self) -> Vec<Value> {
+            self.requests.lock().await.clone()
+        }
+    }
+
+    impl Drop for MockUpstream {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    /// Local mock `/chat/completions` upstream. Captures every request
+    /// body and replies after `delay`: the fixed
+    /// (`content_type`, `body_text`) pair when given, otherwise an
+    /// OpenAI-style completion echoing the request's `model` — so
+    /// assertions can verify the gateway's tier-model rewrite round-trip.
+    async fn spawn_mock_upstream(
+        delay: Duration,
+        status: StatusCode,
+        content_type: &'static str,
+        body_text: Option<String>,
+    ) -> MockUpstream {
+        let requests: Arc<tokio::sync::Mutex<Vec<Value>>> = Arc::default();
+        let fixed_body = body_text;
+        let capture_for_handler = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let capture = Arc::clone(&capture_for_handler);
+                let fixed_body = fixed_body.clone();
+                async move {
+                    let model = body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    capture.lock().await.push(body);
+                    tokio::time::sleep(delay).await;
+                    let text = fixed_body.unwrap_or_else(|| {
+                        serde_json::to_string(&json!({
+                            "id": "mock-completion",
+                            "object": "chat.completion",
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "finish_reason": "stop",
+                                "message": {"role": "assistant", "content": "mock reply"}
+                            }],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
+                        }))
+                        .unwrap()
+                    });
+                    (
+                        status,
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            HeaderValue::from_static(content_type),
+                        )],
+                        text,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let models_app = app.route(
+            "/models",
+            get(|| async { Json(json!({"data":[{"id":"mock-a"},{"id":"mock-b"}]})) }),
+        );
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, models_app).await;
+        });
+        MockUpstream {
+            base_url: format!("http://{addr}"),
+            requests,
+            handle,
+        }
+    }
+
+    /// Regression: the checked-in 30s default `request_timeout_ms` 408'd
+    /// legitimate non-streaming completions. Measured hard-tier
+    /// generations ran 8-30s upstream alone, before classification and
+    /// the quality judge added more latency, so real `model: "auto"`
+    /// traffic routinely crossed 30s and died with
+    /// `{"error":{"message":"request timed out"}}`. The default must
+    /// leave headroom for slow providers; deployments still lower it via
+    /// `request_timeout_ms`.
+    // The assert is intentionally constant: it pins a compile-time
+    // constant, which is exactly the regression it guards.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn default_request_timeout_leaves_room_for_slow_generation() {
+        assert!(
+            DEFAULT_REQUEST_TIMEOUT_MS >= 120_000,
+            "DEFAULT_REQUEST_TIMEOUT_MS = {DEFAULT_REQUEST_TIMEOUT_MS}ms is low enough to 408 real LLM completions"
+        );
+    }
+
+    /// End-to-end `auto` completion against a live slow upstream: the
+    /// tier model is rewritten into the upstream request, the routing
+    /// headers and served model agree, and a multi-second generation
+    /// completes under the default timeout instead of 408ing.
+    #[tokio::test]
+    async fn auto_completion_survives_slow_generation_end_to_end() {
+        let upstream = spawn_mock_upstream(
+            Duration::from_millis(1500),
+            StatusCode::OK,
+            "application/json",
+            None,
+        )
+        .await;
+        let app = build_router(test_state_with_upstream("", upstream.base_url.clone()));
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hello"}]});
+
+        let started = Instant::now();
+        let (status, headers, bytes) =
+            send_raw(app, "POST", "/v1/chat/completions", None, Some(payload)).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            elapsed >= Duration::from_millis(1500),
+            "returned in {elapsed:?}; the slow upstream was not waited out"
+        );
+
+        let body: Value = serde_json::from_slice(&bytes).expect("200 completion body must be JSON");
+        let served_model = body["model"].as_str().unwrap_or_default().to_owned();
+        assert!(
+            served_model.starts_with("test/"),
+            "served model should be the tier model, got {served_model:?}"
+        );
+        assert_eq!(
+            headers.get("x-miser-model").and_then(|v| v.to_str().ok()),
+            Some(served_model.as_str()),
+            "x-miser-model must agree with the served model"
+        );
+        assert!(
+            headers.get("x-miser-classifier").is_some(),
+            "routing diagnostics headers are part of the response contract"
+        );
+
+        let requests = upstream.requests().await;
+        assert_eq!(requests.len(), 1, "upstream should see exactly one request");
+        assert_eq!(
+            requests[0].get("model").and_then(Value::as_str),
+            Some(served_model.as_str()),
+            "upstream must receive the tier model, never 'auto'"
+        );
+    }
+
+    /// A configured `request_timeout_ms` must still bound the request and
+    /// surface the typed 408 JSON error rather than hang.
+    #[tokio::test]
+    async fn configured_request_timeout_enforced_with_typed_408() {
+        let upstream = spawn_mock_upstream(
+            Duration::from_secs(3),
+            StatusCode::OK,
+            "application/json",
+            None,
+        )
+        .await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state
+            .config
+            .extra
+            .insert("request_timeout_ms".into(), json!(500));
+        let app = build_router(state);
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hello"}]});
+
+        let started = Instant::now();
+        let (status, _, bytes) =
+            send_raw(app, "POST", "/v1/chat/completions", None, Some(payload)).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "took {elapsed:?}; the timeout did not fire before the upstream replied"
+        );
+        let body: Value = serde_json::from_slice(&bytes).expect("408 body must be JSON");
+        assert_eq!(body["error"]["message"], "request timed out");
+    }
+
+    /// Streaming passthrough: an `auto` streaming request relays the
+    /// upstream SSE stream and carries the routing headers.
+    #[tokio::test]
+    async fn auto_streaming_relays_upstream_events() {
+        let sse = concat!(
+            "data: {\"id\":\"mock-chunk\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"id\":\"mock-chunk\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let upstream = spawn_mock_upstream(
+            Duration::ZERO,
+            StatusCode::OK,
+            "text/event-stream",
+            Some(sse.into()),
+        )
+        .await;
+        let app = build_router(test_state_with_upstream("", upstream.base_url.clone()));
+        let payload =
+            json!({"model":"auto","stream":true,"messages":[{"role":"user","content":"hello"}]});
+
+        let (status, headers, bytes) =
+            send_raw(app, "POST", "/v1/chat/completions", None, Some(payload)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/event-stream"),
+            "stream content type must pass through"
+        );
+        let requests = upstream.requests().await;
+        assert_eq!(requests.len(), 1);
+        let tier_model = requests[0]["model"].as_str().unwrap_or_default();
+        assert!(tier_model.starts_with("test/"));
+        assert_eq!(
+            headers.get("x-miser-model").and_then(|v| v.to_str().ok()),
+            Some(tier_model),
+            "x-miser-model must name the tier model the stream was routed to"
+        );
+        let body = String::from_utf8(bytes).unwrap();
+        assert!(
+            body.contains("\"delta\":{\"content\":\"Hello\"}"),
+            "stream body must relay upstream events:\n{body}"
+        );
+        assert!(body.contains("data: [DONE]"));
+    }
+
+    /// The exact-match response cache: an identical repeat request is
+    /// served from cache (`x-miser-cache: hit-exact`) without touching
+    /// the upstream again.
+    #[tokio::test]
+    async fn identical_request_is_served_from_exact_cache() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let app = build_router(test_state_with_upstream("", upstream.base_url.clone()));
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+
+        let (first_status, first_headers, first_bytes) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            None,
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(
+            first_headers
+                .get("x-miser-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("miss")
+        );
+
+        let (second_status, second_headers, second_bytes) =
+            send_raw(app, "POST", "/v1/chat/completions", None, Some(payload)).await;
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(
+            second_headers
+                .get("x-miser-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("hit-exact"),
+            "an identical repeat request must be served from cache"
+        );
+        assert_eq!(first_bytes, second_bytes, "cached body must be identical");
+
+        let requests = upstream.requests().await;
+        assert_eq!(
+            requests.len(),
+            1,
+            "the upstream must see only the first request; the replay is served from cache"
+        );
+    }
+
+    /// Session continuity: once a conversation has been routed to a
+    /// higher tier, a trivial follow-up in the same conversation stays on
+    /// that tier instead of being downgraded.
+    #[tokio::test]
+    async fn session_continuity_keeps_conversation_on_higher_tier() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state.config.session.enabled = true;
+        let app = build_router(state);
+
+        // Tools bump the effective tier; the session stores it.
+        let tool_request = json!({
+            "model":"auto",
+            "user":"cont-1",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"shell","description":"run a shell command"}}]
+        });
+        let (status, headers, _) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            None,
+            Some(tool_request),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let elevated_model = headers
+            .get("x-miser-model")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-miser-model on the first response")
+            .to_string();
+        assert!(elevated_model.starts_with("test/"), "{elevated_model}");
+
+        // A trivial follow-up in the same conversation must stay on the
+        // stored tier instead of being downgraded to trivial.
+        let follow_up = json!({
+            "model":"auto",
+            "user":"cont-1",
+            "messages":[{"role":"user","content":"hi"}]
+        });
+        let (status, headers, _) =
+            send_raw(app, "POST", "/v1/chat/completions", None, Some(follow_up)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("x-miser-model").and_then(|v| v.to_str().ok()),
+            Some(elevated_model.as_str()),
+            "session continuity must keep the conversation on the stored tier"
+        );
+    }
+
+    /// A key's monthly budget cap is enforced after real spend is
+    /// recorded: the first request succeeds, the next is rejected with
+    /// 402 before reaching the upstream.
+    #[tokio::test]
+    async fn monthly_budget_exhaustion_returns_402() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        // Blended price turns tokens into recorded spend.
+        state
+            .config
+            .extra
+            .insert("price_per_1k_usd".into(), json!(0.001));
+        let raw = state
+            .auth
+            .create_key_with_quotas("budgeted", "-", vec![], None, Some(0.0001), None)
+            .unwrap();
+        let app = build_router(state);
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+
+        let (first, _) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(first, StatusCode::OK);
+
+        let (second, body) = send(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(second, StatusCode::PAYMENT_REQUIRED, "{body}");
+        assert_eq!(
+            upstream.requests().await.len(),
+            1,
+            "the budget-exhausted request must be rejected before the upstream"
+        );
+    }
+
+    /// Upstream failures pass through to the client with their status
+    /// and error body, plus the routing diagnostics headers.
+    #[tokio::test]
+    async fn upstream_error_is_passed_through_with_routing_headers() {
+        let upstream = spawn_mock_upstream(
+            Duration::ZERO,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application/json",
+            Some(r#"{"error":{"message":"upstream exploded"}}"#.into()),
+        )
+        .await;
+        let app = build_router(test_state_with_upstream("", upstream.base_url.clone()));
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+
+        let (status, headers, bytes) =
+            send_raw(app, "POST", "/v1/chat/completions", None, Some(payload)).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value =
+            serde_json::from_slice(&bytes).expect("upstream error body must be relayed");
+        assert_eq!(body["error"]["message"], "upstream exploded");
+        assert!(
+            headers.get("x-miser-model").is_some(),
+            "routing diagnostics must accompany the relayed error"
+        );
+    }
+
+    /// Usage attribution through the real completions path: the ledger
+    /// must attribute the request to its key and bucket the SERVED model
+    /// (never the requested "auto") in the summary.
+    #[tokio::test]
+    async fn completions_record_usage_with_served_model_and_key() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let state = test_state_with_upstream("secret-admin", upstream.base_url.clone());
+        let raw = state
+            .auth
+            .create_key_with_quotas("attributed", "cli-app", vec![], None, None, None)
+            .unwrap();
+        let key_id = state
+            .auth
+            .list_keys()
+            .unwrap()
+            .into_iter()
+            .find(|k| k.owner == "attributed")
+            .unwrap()
+            .id;
+        let app = build_router(state);
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+
+        let (status, _, bytes) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let (status, body) = send(
+            app,
+            "GET",
+            "/admin/usage/summary?window=all",
+            Some("secret-admin"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["requests"], 1, "{body}");
+        let served = body["by_model"]
+            .as_object()
+            .expect("by_model present")
+            .keys()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            served,
+            vec!["test/trivial"],
+            "by_model must bucket the served tier model, got {served:?}"
+        );
+        assert!(
+            body["by_key"][&key_id].is_object(),
+            "the request must be attributed to its key: {body}"
+        );
+    }
+
+    /// The `/v1/models` endpoint relays the upstream model list.
+    #[tokio::test]
+    async fn models_endpoint_relays_upstream_catalog() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let app = build_router(test_state_with_upstream("", upstream.base_url.clone()));
+        let (status, body) = send(app, "GET", "/v1/models", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"][0]["id"], "mock-a", "{body}");
+    }
+
+    /// Drift guard: the shipped `config/miser.toml` must keep parsing
+    /// into `GatewayConfig` and passing validation. Renamed fields, new
+    /// required keys, or invalid values fail here before any deployment.
+    #[test]
+    fn shipped_config_parses_and_validates() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/miser.toml");
+        let raw = std::fs::read_to_string(path).expect("shipped config/miser.toml is present");
+        let config: GatewayConfig = toml::from_str(&raw).expect("shipped config parses");
+        assert_eq!(
+            validate_config(&config),
+            Ok(()),
+            "shipped config must pass validation"
+        );
     }
 
     #[tokio::test]

@@ -4,8 +4,10 @@ api_key = ""
 # Global cap on in-flight requests (default: 64).
 # concurrency_limit = 64
 # Per-request timeout in milliseconds, including time spent waiting for a
-# concurrency permit (default: 30000).
-# request_timeout_ms = 30000
+# concurrency permit (default: 300000). Lower it only if your slowest
+# tier's generation time is comfortably under it; too low 408s real
+# completions.
+# request_timeout_ms = 300000
 
 [classifier]
 mode = "jev"

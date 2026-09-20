@@ -742,4 +742,382 @@ mod tests {
             Some("alt/model".to_owned())
         );
     }
+
+    // --- helpers for the tests below ---
+
+    fn router_with_pins(pins: BTreeMap<ComplexityTier, TierPin>) -> CatalogRouter {
+        let active = pins
+            .iter()
+            .map(|(tier, pin)| (*tier, pin.model.clone()))
+            .collect();
+        CatalogRouter {
+            path: PathBuf::from("/tmp/miser-catalog-unit-tests/never-written.json"),
+            enabled: true,
+            state: Mutex::new(CatalogState {
+                snapshot: CatalogSnapshot {
+                    source: "test".to_owned(),
+                    pins,
+                    ..Default::default()
+                },
+                active,
+                failures: BTreeMap::new(),
+            }),
+        }
+    }
+
+    fn temp_snapshot_path(label: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "miser_test_catalog_{}_{}_{seq}_{label}.json",
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    fn gateway_config(cache_path: &std::path::Path, seed_split: bool) -> GatewayConfig {
+        serde_json::from_value(json!({
+            "classifier": {},
+            "provider": {"api_key": "test"},
+            "tiers": {
+                "trivial": {"model": "t/model"},
+                "simple": {"model": "s/model"},
+                "standard": {"model": "std/model"},
+                "hard": {"model": "h/model"},
+                "reasoning": {"model": "r/model"}
+            },
+            "routing": {
+                "mode": "catalog",
+                "cache_path": cache_path.display().to_string(),
+                "seed_from_config": seed_split
+            }
+        }))
+        .expect("test gateway config parses")
+    }
+
+    #[test]
+    fn success_resets_failure_counter_without_promotion() {
+        let router = router_with_pins(BTreeMap::from([(
+            ComplexityTier::Trivial,
+            TierPin {
+                model: "pin/model".to_owned(),
+                candidates: vec!["pin/model".to_owned(), "alt/model".to_owned()],
+            },
+        )]));
+        // One provider failure below the threshold, then a 2xx resets it.
+        assert_eq!(router.report_failure(ComplexityTier::Trivial, 3), None);
+        router.report_success(ComplexityTier::Trivial);
+        // The counter restarted, so one fresh failure must not promote.
+        assert_eq!(router.report_failure(ComplexityTier::Trivial, 3), None);
+        assert_eq!(
+            router.active_model(ComplexityTier::Trivial),
+            Some("pin/model".to_owned())
+        );
+    }
+
+    #[test]
+    fn zero_threshold_promotes_on_first_failure() {
+        let router = router_with_pins(BTreeMap::from([(
+            ComplexityTier::Simple,
+            TierPin {
+                model: "pin/model".to_owned(),
+                candidates: vec!["pin/model".to_owned(), "alt/model".to_owned()],
+            },
+        )]));
+        assert_eq!(
+            router.report_failure(ComplexityTier::Simple, 0),
+            Some("alt/model".to_owned()),
+            "threshold is clamped to at least one failure"
+        );
+        assert_eq!(
+            router.active_model(ComplexityTier::Simple),
+            Some("alt/model".to_owned())
+        );
+    }
+
+    #[test]
+    fn switch_ratio_boundary_migrates_only_at_exact_saving() {
+        let mut routing = routing();
+        routing.switch_saving_ratio = 0.5;
+        let previous = BTreeMap::from([(
+            ComplexityTier::Simple,
+            TierPin {
+                model: "anchor/model".to_owned(),
+                candidates: vec!["anchor/model".to_owned()],
+            },
+        )]);
+        // Exactly 50% cheaper (0.08 → 0.04): the rule is <=, so migrate.
+        let models = vec![model("anchor/model", 0.08), model("cheaper/model", 0.04)];
+        let snapshot = partition(&models, &routing, &previous);
+        assert_eq!(
+            snapshot.pins[&ComplexityTier::Simple].model,
+            "cheaper/model"
+        );
+        // Just under 50%: hysteresis keeps the pin.
+        let models = vec![model("anchor/model", 0.08), model("barely/model", 0.0401)];
+        let snapshot = partition(&models, &routing, &previous);
+        assert_eq!(snapshot.pins[&ComplexityTier::Simple].model, "anchor/model");
+        // A 25% saving is below a 0.5 ratio: no migration.
+        let models = vec![model("anchor/model", 0.08), model("mid/model", 0.06)];
+        let snapshot = partition(&models, &routing, &previous);
+        assert_eq!(snapshot.pins[&ComplexityTier::Simple].model, "anchor/model");
+    }
+
+    #[test]
+    fn band_boundaries_are_inclusive_maxima() {
+        let bands = RoutingBands::default();
+        assert_eq!(
+            band_tier(bands.trivial_max, &bands),
+            ComplexityTier::Trivial
+        );
+        assert_eq!(band_tier(bands.simple_max, &bands), ComplexityTier::Simple);
+        assert_eq!(
+            band_tier(bands.standard_max, &bands),
+            ComplexityTier::Standard
+        );
+        assert_eq!(
+            band_tier(bands.reasoning_max, &bands),
+            ComplexityTier::Reasoning
+        );
+        assert_eq!(
+            band_tier(bands.trivial_max * 1.01, &bands),
+            ComplexityTier::Simple
+        );
+        assert_eq!(
+            band_tier(bands.simple_max * 1.01, &bands),
+            ComplexityTier::Standard
+        );
+        assert_eq!(
+            band_tier(bands.standard_max * 1.01, &bands),
+            ComplexityTier::Reasoning
+        );
+        assert_eq!(
+            band_tier(bands.reasoning_max * 1.01, &bands),
+            ComplexityTier::Hard
+        );
+    }
+
+    #[test]
+    fn seed_from_config_pins_configured_models_without_writing() {
+        let path = temp_snapshot_path("seed");
+        let config = gateway_config(&path, true);
+        let router = CatalogRouter::load_or_seed(&config);
+        assert!(router.enabled());
+        assert_eq!(
+            router.active_model(ComplexityTier::Trivial),
+            Some("t/model".to_owned())
+        );
+        assert_eq!(
+            router.active_model(ComplexityTier::Simple),
+            Some("s/model".to_owned())
+        );
+        assert_eq!(
+            router.active_model(ComplexityTier::Standard),
+            Some("std/model".to_owned())
+        );
+        assert_eq!(
+            router.active_model(ComplexityTier::Hard),
+            Some("h/model".to_owned())
+        );
+        assert_eq!(
+            router.active_model(ComplexityTier::Reasoning),
+            Some("r/model".to_owned())
+        );
+        assert!(!path.exists(), "seeding must not write a snapshot file");
+        // The seeded split ranks each configured model into its tier.
+        let summary = router.summary_json();
+        assert_eq!(summary["enabled"], json!(true));
+        assert_eq!(summary["tier_split_counts"]["trivial"], json!(1));
+    }
+
+    #[test]
+    fn seed_without_config_split_leaves_model_tiers_empty() {
+        let path = temp_snapshot_path("seed-nosplit");
+        let config = gateway_config(&path, false);
+        let router = CatalogRouter::load_or_seed(&config);
+        let summary = router.summary_json();
+        assert!(
+            summary["tier_split_counts"]
+                .as_object()
+                .expect("object")
+                .is_empty(),
+            "seed_from_config=false must not invent a tier split: {summary}"
+        );
+    }
+
+    #[test]
+    fn fixed_mode_disables_catalog_routing() {
+        let path = temp_snapshot_path("fixed");
+        let mut config = gateway_config(&path, true);
+        config.routing.mode = RoutingMode::Fixed;
+        assert!(!CatalogRouter::load_or_seed(&config).enabled());
+    }
+
+    #[test]
+    fn load_or_seed_reloads_persisted_snapshot() {
+        let path = temp_snapshot_path("reload");
+        let snapshot = CatalogSnapshot {
+            source: "openrouter".to_owned(),
+            fetched_at: Some(1_767_225_600),
+            pins: BTreeMap::from([(
+                ComplexityTier::Simple,
+                TierPin {
+                    model: "persisted/model".to_owned(),
+                    candidates: vec!["persisted/model".to_owned(), "backup/model".to_owned()],
+                },
+            )]),
+            model_tiers: BTreeMap::from([("persisted/model".to_owned(), ComplexityTier::Simple)]),
+            total_models: 1,
+            unranked_models: 0,
+        };
+        std::fs::write(&path, serde_json::to_string(&snapshot).unwrap()).unwrap();
+        let config = gateway_config(&path, true);
+        let router = CatalogRouter::load_or_seed(&config);
+        assert_eq!(
+            router.active_model(ComplexityTier::Simple),
+            Some("persisted/model".to_owned()),
+            "snapshot pin wins over the config seed"
+        );
+        // Tiers absent from the snapshot have no catalog decision, so the
+        // caller falls back to the fixed config route.
+        assert_eq!(router.active_model(ComplexityTier::Trivial), None);
+        let summary = router.summary_json();
+        assert_eq!(summary["source"], json!("openrouter"));
+        assert_eq!(summary["fetched_at"], json!(1_767_225_600));
+        assert_eq!(summary["tiers"][0]["pin"], json!("persisted/model"));
+        assert_eq!(summary["tiers"][0]["active"], json!("persisted/model"));
+        assert_eq!(summary["tiers"][0]["consecutive_failures"], json!(0));
+    }
+
+    #[test]
+    fn load_or_seed_falls_back_to_seed_on_corrupt_snapshot() {
+        let path = temp_snapshot_path("corrupt");
+        std::fs::write(&path, "definitely not json").unwrap();
+        let config = gateway_config(&path, true);
+        let router = CatalogRouter::load_or_seed(&config);
+        assert_eq!(
+            router.active_model(ComplexityTier::Simple),
+            Some("s/model".to_owned()),
+            "a corrupt snapshot degrades to the config seed"
+        );
+    }
+
+    #[test]
+    fn parse_catalog_normalizes_provider_payload() {
+        let data = json!({
+            "data": [
+                {
+                    "id": "vendor/model-a",
+                    "name": "Model A",
+                    "context_length": 131072,
+                    "pricing": {"prompt": "0.0000015", "completion": "0.000002"},
+                    "supported_parameters": ["tools", "reasoning"],
+                    "architecture": {"output_modalities": ["text", "image"]}
+                },
+                {"id": "vendor/defaults"},
+                {"name": "no id, skipped"}
+            ]
+        });
+        let models = parse_catalog(&data);
+        assert_eq!(models.len(), 2, "entries without an id are skipped");
+
+        let a = &models[0];
+        assert_eq!(a.id, "vendor/model-a");
+        assert!(
+            (a.input_price_per_m - 1.5).abs() < 1e-9,
+            "per-token price × 1e6, got {}",
+            a.input_price_per_m
+        );
+        assert!((a.output_price_per_m - 2.0).abs() < 1e-9);
+        assert_eq!(a.context_length, 131_072);
+        assert!(a.tools && a.reasoning && a.text_output);
+
+        let b = &models[1];
+        assert_eq!(b.id, "vendor/defaults");
+        assert_eq!(b.name, "vendor/defaults", "missing name defaults to the id");
+        assert_eq!(b.input_price_per_m, 0.0);
+        assert!(!b.tools && !b.reasoning);
+        assert!(
+            b.text_output,
+            "missing architecture defaults to text output"
+        );
+
+        assert!(
+            parse_catalog(&json!({})).is_empty(),
+            "missing data array yields no models"
+        );
+    }
+
+    #[test]
+    fn candidate_list_is_capped_at_max_candidates() {
+        let models: Vec<CatalogModel> = (0..25)
+            .map(|i| model(&format!("m{i:02}/model"), 0.01))
+            .collect();
+        let snapshot = partition(&models, &routing(), &BTreeMap::new());
+        let pin = snapshot.pins.get(&ComplexityTier::Trivial).unwrap();
+        assert_eq!(pin.candidates.len(), 20, "candidate list capped at 20");
+        assert_eq!(
+            pin.candidates[0], "m00/model",
+            "cheapest pin first; equal prices tie-break by id"
+        );
+        assert!(pin.candidates.contains(&"m19/model".to_owned()));
+        assert!(!pin.candidates.contains(&"m20/model".to_owned()));
+    }
+
+    #[test]
+    fn relaxed_filters_readmit_models_except_deny_prefixes() {
+        let mut routing = routing();
+        routing.filters.require_tools = false;
+        routing.filters.min_context = 8_192;
+        routing.filters.allow_free = true;
+        routing.filters.deny_prefixes = vec!["blocked/".to_owned()];
+
+        let mut no_tools = model("notools/model", 0.01);
+        no_tools.tools = false;
+        let mut exact_context = model("exact/model", 0.02);
+        exact_context.context_length = 8_192;
+        let blocked = model("blocked/model", 0.03);
+        let free_suffix = model("vendor/alt:free", 0.01);
+        let good = model("good/model", 0.5);
+        let models = vec![no_tools, exact_context, blocked, free_suffix, good];
+
+        let snapshot = partition(&models, &routing, &BTreeMap::new());
+        assert_eq!(
+            snapshot.unranked_models, 1,
+            "only the deny-prefixed model is filtered out"
+        );
+        assert_eq!(
+            snapshot.model_tiers.get("blocked/model"),
+            Some(&ComplexityTier::Trivial),
+            "denied models still appear in the split"
+        );
+        // Trivial pool: notools(0.01), exact(0.02), free(0.01) — the
+        // price tie between notools and vendor/alt:free breaks by id.
+        assert_eq!(
+            snapshot.pins[&ComplexityTier::Trivial].model,
+            "notools/model"
+        );
+        assert_eq!(
+            snapshot.pins[&ComplexityTier::Reasoning].model,
+            "good/model"
+        );
+    }
+
+    #[test]
+    fn min_context_boundary_is_inclusive() {
+        let mut under = model("under/model", 0.01);
+        under.context_length = 65_535;
+        let mut exact = model("exact/model", 0.02);
+        exact.context_length = 65_536;
+        let snapshot = partition(&[under, exact], &routing(), &BTreeMap::new());
+        assert_eq!(
+            snapshot.unranked_models, 1,
+            "just under the default min_context is filtered"
+        );
+        assert_eq!(snapshot.pins[&ComplexityTier::Trivial].model, "exact/model");
+    }
 }

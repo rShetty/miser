@@ -626,6 +626,7 @@ fn default_session_max_entries() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn request_preserves_unknown_fields() {
@@ -658,5 +659,259 @@ mod tests {
         let config: ClassifierConfig = toml::from_str("future_field = true").unwrap();
         assert_eq!(config.mode, ClassifierMode::Jev);
         assert_eq!(config.extra["future_field"], true);
+    }
+
+    #[test]
+    fn assistant_tool_call_messages_round_trip() {
+        let assistant = json!({
+            "role": "assistant",
+            "content": "Calling the shell.",
+            "tool_calls": [{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}}]
+        });
+        let message: ChatMessage = serde_json::from_value(assistant.clone()).unwrap();
+        assert!(message.tool_calls.is_some());
+        assert_eq!(serde_json::to_value(&message).unwrap(), assistant);
+
+        let tool = json!({"role":"tool","content":"total 0","tool_call_id":"call_1"});
+        let message: ChatMessage = serde_json::from_value(tool.clone()).unwrap();
+        assert_eq!(message.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(serde_json::to_value(&message).unwrap(), tool);
+    }
+
+    #[test]
+    fn content_parts_decode_known_and_unknown_types() {
+        let parts: Vec<ContentPart> = serde_json::from_value(json!([
+            {"type":"text","text":"look"},
+            {"type":"image_url","image_url":{"url":"https://x/img.png","detail":"high","dpi":144}},
+            {"type":"refusal","refusal":"no"},
+            {"type":"hologram","density":3}
+        ]))
+        .unwrap();
+        assert!(matches!(parts[0], ContentPart::Text { .. }));
+        match &parts[1] {
+            ContentPart::ImageUrl { image_url } => {
+                assert_eq!(image_url.url, "https://x/img.png");
+                assert_eq!(image_url.detail.as_deref(), Some("high"));
+                assert_eq!(image_url.extra["dpi"], 144);
+            }
+            other => panic!("unexpected part: {other:?}"),
+        }
+        assert!(matches!(parts[2], ContentPart::Refusal { .. }));
+        // Parts the gateway does not know must not fail the client request.
+        assert!(matches!(parts[3], ContentPart::Other));
+
+        let text: MessageContent = serde_json::from_value(json!("hello")).unwrap();
+        assert_eq!(text, MessageContent::Text("hello".into()));
+        let parts: MessageContent =
+            serde_json::from_value(json!([{"type":"text","text":"hi"}])).unwrap();
+        assert!(matches!(parts, MessageContent::Parts(_)));
+        assert_eq!(serde_json::to_value(&text).unwrap(), json!("hello"));
+    }
+
+    #[test]
+    fn sampling_and_stream_fields_round_trip() {
+        let raw = json!({
+            "model": "m",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": true,
+            "max_tokens": 256,
+            "max_completion_tokens": 512,
+            "stop": ["END"],
+            "seed": 7,
+            "user": "user-1",
+            "logprobs": {"top_logprobs": 5}
+        });
+        let request: ChatCompletionRequest = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(request.stream, Some(true));
+        assert_eq!(request.max_tokens, Some(256));
+        assert_eq!(request.max_completion_tokens, Some(512));
+        assert_eq!(serde_json::to_value(&request).unwrap(), raw);
+
+        let with_floats: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role":"user","content":"hi"}],
+            "temperature": 0.2,
+            "top_p": 0.9
+        }))
+        .unwrap();
+        assert_eq!(with_floats.temperature, Some(0.2));
+        assert_eq!(with_floats.top_p, Some(0.9));
+
+        // Omitted optionals stay out of the serialized payload an upstream
+        // sees.
+        let minimal: ChatCompletionRequest = serde_json::from_value(
+            json!({"model":"m","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .unwrap();
+        assert_eq!(minimal.stream, None);
+        assert_eq!(
+            serde_json::to_value(&minimal).unwrap(),
+            json!({"model":"m","messages":[{"role":"user","content":"hi"}]})
+        );
+    }
+
+    #[test]
+    fn tiers_serialize_lowercase_for_config_compat() {
+        assert_eq!(
+            serde_json::from_str::<ComplexityTier>("\"reasoning\"").unwrap(),
+            ComplexityTier::Reasoning
+        );
+        assert_eq!(
+            serde_json::to_string(&ComplexityTier::Hard).unwrap(),
+            "\"hard\""
+        );
+    }
+
+    #[test]
+    fn classification_result_round_trips_snake_case_enums() {
+        let result = ClassificationResult {
+            tier: ComplexityTier::Hard,
+            confidence: 0.9,
+            reasons: vec!["tools".into()],
+            classifier: "jev".into(),
+            latency_ms: 12,
+            task: Some(TaskType::Coding),
+            risk: Some(RiskLevel::High),
+            privacy: Some(PrivacyLevel::Confidential),
+            extra: Default::default(),
+        };
+        let raw = serde_json::to_value(&result).unwrap();
+        assert_eq!(raw["task"], "coding");
+        assert_eq!(raw["risk"], "high");
+        assert_eq!(raw["privacy"], "confidential");
+        assert_eq!(
+            serde_json::from_value::<ClassificationResult>(raw).unwrap(),
+            result
+        );
+    }
+
+    #[test]
+    fn classifier_endpoint_config_covers_endpoint_extras() {
+        let endpoint: ClassifierEndpointConfig = toml::from_str(
+            r#"
+            enabled = true
+            model = "jev-latest"
+            path = "/systemone"
+            api_key = "k"
+        "#,
+        )
+        .unwrap();
+        assert!(endpoint.enabled);
+        assert_eq!(endpoint.model, "jev-latest");
+        assert_eq!(endpoint.path.as_deref(), Some("/systemone"));
+        assert_eq!(endpoint.api_key.as_deref(), Some("k"));
+
+        let empty: ClassifierEndpointConfig = toml::from_str("").unwrap();
+        assert!(!empty.enabled);
+        assert_eq!(empty.model, "");
+        assert!(empty.path.is_none());
+    }
+
+    #[test]
+    fn routing_filters_and_bands_carry_sane_defaults() {
+        let filters = RoutingFilters::default();
+        assert!(filters.require_tools);
+        assert_eq!(filters.min_context, 65_536);
+        assert!(!filters.allow_free);
+        assert!(filters.deny_prefixes.is_empty());
+        assert!(filters.prefer_reasoning_pin);
+        assert_eq!(toml::from_str::<RoutingFilters>("").unwrap(), filters);
+
+        let bands = RoutingBands::default();
+        // Bands must ascend to partition the catalog into five tiers.
+        assert!(bands.trivial_max < bands.simple_max);
+        assert!(bands.simple_max < bands.standard_max);
+        assert!(bands.standard_max < bands.reasoning_max);
+        let partial: RoutingBands = toml::from_str("simple_max = 0.05").unwrap();
+        assert_eq!(partial.simple_max, 0.05);
+        assert_eq!(partial.trivial_max, bands.trivial_max);
+        assert_eq!(partial.reasoning_max, bands.reasoning_max);
+    }
+
+    #[test]
+    fn tier_route_config_round_trips_generation_params() {
+        let raw = json!({
+            "model": "openai/gpt-4.1-mini",
+            "max_tokens": 1536,
+            "provider": "openai",
+            "max_cost_per_1m": {"prompt": 0.4, "completion": 1.6}
+        });
+        let route: TierModelRouteConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(route.max_tokens, Some(1536));
+        assert_eq!(route.temperature, None);
+        assert_eq!(route.max_cost_per_1m.as_ref().unwrap().prompt, Some(0.4));
+        assert_eq!(serde_json::to_value(&route).unwrap(), raw);
+
+        let minimal: TierModelRouteConfig = serde_json::from_value(json!({"model":"m"})).unwrap();
+        assert_eq!(minimal.max_tokens, None);
+        assert_eq!(
+            serde_json::to_value(&minimal).unwrap(),
+            json!({"model":"m"})
+        );
+
+        let with_temperature: TierModelRouteConfig =
+            serde_json::from_value(json!({"model":"m","temperature":0.3})).unwrap();
+        assert_eq!(with_temperature.temperature, Some(0.3));
+    }
+
+    #[test]
+    fn quality_and_cache_defaults_load_from_empty_config() {
+        let quality: QualityConfig = toml::from_str("").unwrap();
+        assert!(!quality.enabled);
+        assert!((quality.minimum_score - 0.7).abs() < 1e-6);
+        // Serde default (bool::default) — note the divergence from
+        // QualityConfig::default(), which sets this to true.
+        assert!(!quality.escalate_on_failure);
+        assert!(quality.judge.is_none());
+
+        let cache: CacheConfig = toml::from_str("").unwrap();
+        assert!(cache.enabled);
+        assert_eq!(cache.max_entries, 10_000);
+        assert!((cache.similarity_threshold - 0.92).abs() < 1e-6);
+        assert!(!cache.semantic_enabled);
+        assert!((cache.semantic_candidate_threshold - 0.65).abs() < 1e-6);
+        assert!(cache.embedding_model.is_none());
+    }
+
+    #[test]
+    fn minimal_gateway_config_fills_host_port_and_routing_defaults() {
+        let config: GatewayConfig = serde_json::from_value(json!({
+            "classifier": {},
+            "provider": {"api_key": ""},
+            "tiers": {}
+        }))
+        .unwrap();
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 8787);
+        assert_eq!(config.routing.mode, RoutingMode::Fixed);
+        assert!(config.tiers.is_empty());
+    }
+
+    #[test]
+    fn catalog_snapshot_round_trips_tier_pins() {
+        let snapshot = CatalogSnapshot {
+            fetched_at: Some(1_700_000_000),
+            source: "openrouter".into(),
+            pins: [(
+                ComplexityTier::Hard,
+                TierPin {
+                    model: "m".into(),
+                    candidates: vec!["m".into(), "backup".into()],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            model_tiers: [("model/a".to_owned(), ComplexityTier::Simple)]
+                .into_iter()
+                .collect(),
+            total_models: 2,
+            unranked_models: 1,
+        };
+        let raw = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(raw["pins"]["hard"]["model"], "m");
+        assert_eq!(
+            serde_json::from_value::<CatalogSnapshot>(raw).unwrap(),
+            snapshot
+        );
     }
 }

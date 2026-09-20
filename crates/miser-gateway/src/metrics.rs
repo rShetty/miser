@@ -200,4 +200,91 @@ mod tests {
             "histogram bucket missing in:\n{text}"
         );
     }
+
+    #[test]
+    fn semantic_and_failover_counters_render() {
+        let metrics = Metrics::new().unwrap();
+        metrics.semantic_hits_total.inc();
+        metrics.semantic_hits_total.inc();
+        metrics.catalog_failovers_total.inc();
+        let text = metrics.render().unwrap();
+        assert!(text.contains("# HELP miser_semantic_hits_total"), "{text}");
+        assert!(text.contains("miser_semantic_hits_total 2"), "{text}");
+        assert!(
+            text.contains("# HELP miser_catalog_failovers_total"),
+            "{text}"
+        );
+        assert!(text.contains("miser_catalog_failovers_total 1"), "{text}");
+    }
+
+    #[test]
+    fn status_labels_render_as_distinct_series() {
+        let metrics = Metrics::new().unwrap();
+        metrics
+            .requests_total
+            .with_label_values(&[COMPLETIONS_ROUTE, "200"])
+            .inc();
+        metrics
+            .requests_total
+            .with_label_values(&[COMPLETIONS_ROUTE, "200"])
+            .inc();
+        metrics
+            .requests_total
+            .with_label_values(&[COMPLETIONS_ROUTE, "502"])
+            .inc();
+        let text = metrics.render().unwrap();
+        assert!(
+            text.contains(concat!(
+                "miser_requests_total{route=\"/v1/chat/completions\",",
+                "status=\"200\"} 2"
+            )),
+            "same-label children must accumulate:\n{text}"
+        );
+        assert!(
+            text.contains(concat!(
+                "miser_requests_total{route=\"/v1/chat/completions\",",
+                "status=\"502\"} 1"
+            )),
+            "different status must be its own series:\n{text}"
+        );
+    }
+
+    #[test]
+    fn histogram_buckets_are_cumulative_and_count_and_sum_render() {
+        let metrics = Metrics::new().unwrap();
+        metrics
+            .request_duration_seconds
+            .with_label_values(&[COMPLETIONS_ROUTE])
+            .observe(0.05);
+        metrics
+            .request_duration_seconds
+            .with_label_values(&[COMPLETIONS_ROUTE])
+            .observe(0.3);
+        let text = metrics.render().unwrap();
+        assert!(
+            text.contains(concat!(
+                "miser_request_duration_seconds_bucket{route=\"/v1/chat/completions\",",
+                "le=\"0.1\"} 1"
+            )),
+            "only the faster request falls under le=0.1:\n{text}"
+        );
+        assert!(
+            text.contains(concat!(
+                "miser_request_duration_seconds_bucket{route=\"/v1/chat/completions\",",
+                "le=\"0.5\"} 2"
+            )),
+            "cumulative bucket includes both observations:\n{text}"
+        );
+        assert!(
+            text.contains(concat!(
+                "miser_request_duration_seconds_count{route=\"/v1/chat/completions\"}",
+                " 2"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("miser_request_duration_seconds_sum{route=\"/v1/chat/completions\"}"),
+            "sum series must render:\n{text}"
+        );
+    }
 }

@@ -57,7 +57,7 @@ impl Classifier {
                 r"(?i)^(what is|what's|how to|how do|how does|where is)\s+(your\s+name|2\s*\+\s*2|the\s+time|the\s+date|my\s+name)\b",
                 r"(?i)\b(rename|uppercase|lowercase|trim|hello world|test input|unit test)\b.*\b(variable|file|string|line)\b",
                 r"(?i)^\s*(yes|no|true|false)\s*[.!]?\s*$",
-                r"(?i)\b(port|ip address|hostname|help|support)\b"
+                r"(?i)\b(port|ip address|hostname|help|support)\b",
             ])?,
             simple: RegexSet::new([
                 r"(?i)\b(explain|summarize|compare|convert|translate|format|describe|tell\s+me|demo|example|snippet|shell command|powershell)\b",

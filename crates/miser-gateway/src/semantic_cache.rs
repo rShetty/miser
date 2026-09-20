@@ -160,6 +160,7 @@ pub fn request_text_for_embedding(body: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn cache() -> SemanticCache {
         SemanticCache::new(10, 300, 0.75)
@@ -215,5 +216,186 @@ mod tests {
             axum::http::HeaderMap::new(),
         );
         assert!(cache.lookup(&embed_prompt("hello world example")).is_none());
+    }
+
+    fn store_entry(
+        cache: &SemanticCache,
+        embedding: Vec<f32>,
+        prompt: &str,
+        status: axum::http::StatusCode,
+        headers: &axum::http::HeaderMap,
+    ) {
+        cache.store(
+            embedding,
+            prompt.to_owned(),
+            bytes::Bytes::from(format!("body-of:{prompt}")),
+            status,
+            headers.clone(),
+        );
+    }
+
+    #[test]
+    fn hit_preserves_body_status_and_headers() {
+        let cache = cache();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "content-type",
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        let prompt = "explain the borrow checker";
+        store_entry(
+            &cache,
+            embed_prompt(prompt),
+            prompt,
+            axum::http::StatusCode::OK,
+            &headers,
+        );
+        let hit = cache
+            .lookup(&embed_prompt(prompt))
+            .expect("identical prompt must hit");
+        assert_eq!(
+            hit.body,
+            bytes::Bytes::from_static(b"body-of:explain the borrow checker")
+        );
+        assert_eq!(hit.status, axum::http::StatusCode::OK);
+        assert_eq!(hit.headers, headers);
+        assert_eq!(hit.prompt_text, prompt);
+    }
+
+    #[test]
+    fn candidate_threshold_boundary_is_inclusive() {
+        // cos([1,0], [0.6,0.8]) = 0.6 exactly in f32.
+        let emb_a = vec![1.0f32, 0.0];
+        let emb_b = vec![0.6f32, 0.8];
+
+        let inclusive = SemanticCache::new(10, 300, 0.6);
+        store_entry(
+            &inclusive,
+            emb_a.clone(),
+            "a",
+            axum::http::StatusCode::OK,
+            &axum::http::HeaderMap::new(),
+        );
+        let hit = inclusive
+            .lookup(&emb_b)
+            .expect("similarity == threshold must candidate");
+        assert!((hit.similarity - 0.6).abs() < 1e-6);
+
+        let exclusive = SemanticCache::new(10, 300, 0.65);
+        store_entry(
+            &exclusive,
+            emb_a,
+            "a",
+            axum::http::StatusCode::OK,
+            &axum::http::HeaderMap::new(),
+        );
+        assert!(
+            exclusive.lookup(&emb_b).is_none(),
+            "similarity below threshold must not candidate"
+        );
+    }
+
+    #[test]
+    fn lookup_returns_the_most_similar_entry() {
+        let cache = cache();
+        store_entry(
+            &cache,
+            vec![1.0, 0.0],
+            "x-axis prompt",
+            axum::http::StatusCode::OK,
+            &axum::http::HeaderMap::new(),
+        );
+        store_entry(
+            &cache,
+            vec![0.0, 1.0],
+            "y-axis prompt",
+            axum::http::StatusCode::OK,
+            &axum::http::HeaderMap::new(),
+        );
+        // Query closer to the y-axis entry.
+        let hit = cache
+            .lookup(&[0.05, 1.0])
+            .expect("close match must candidate");
+        assert_eq!(hit.prompt_text, "y-axis prompt");
+    }
+
+    #[test]
+    fn cap_eviction_drops_oldest_stored_entry() {
+        let cache = SemanticCache::new(2, 300, 0.75);
+        store_entry(
+            &cache,
+            embed_prompt("first prompt"),
+            "first prompt",
+            axum::http::StatusCode::OK,
+            &axum::http::HeaderMap::new(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store_entry(
+            &cache,
+            embed_prompt("second prompt"),
+            "second prompt",
+            axum::http::StatusCode::OK,
+            &axum::http::HeaderMap::new(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store_entry(
+            &cache,
+            embed_prompt("third prompt"),
+            "third prompt",
+            axum::http::StatusCode::OK,
+            &axum::http::HeaderMap::new(),
+        );
+        assert!(
+            cache.lookup(&embed_prompt("first prompt")).is_none(),
+            "oldest entry evicted at cap"
+        );
+        assert!(cache.lookup(&embed_prompt("second prompt")).is_some());
+        assert!(cache.lookup(&embed_prompt("third prompt")).is_some());
+        assert_eq!(cache.stats().0, 2);
+    }
+
+    #[test]
+    fn embed_prompt_is_deterministic_and_case_insensitive() {
+        let upper = embed_prompt("Fix the Login Bug");
+        let lower = embed_prompt("fix the login bug");
+        assert_eq!(upper.len(), 512, "fixed 512-dim feature space");
+        assert_eq!(upper, lower, "token hashing must be case-insensitive");
+    }
+
+    #[test]
+    fn empty_embedding_never_candidates() {
+        let cache = cache();
+        // A prompt with no tokens (>2 alphanumeric chars) embeds to the zero
+        // vector; cosine is defined as 0 there, below any sane threshold.
+        store_entry(
+            &cache,
+            embed_prompt("!! ??"),
+            "punctuation only",
+            axum::http::StatusCode::OK,
+            &axum::http::HeaderMap::new(),
+        );
+        assert!(cache.lookup(&embed_prompt("!! ??")).is_none());
+    }
+
+    #[test]
+    fn request_text_joins_message_contents() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "first part"},
+                {"role": "assistant", "content": "second part"},
+                {"role": "user", "content": {"structured": true}}
+            ]
+        });
+        assert_eq!(
+            request_text_for_embedding(&body),
+            "first part second part",
+            "string contents join; non-string contents are skipped"
+        );
+        let no_messages = json!({"prompt": "bare"});
+        assert_eq!(
+            request_text_for_embedding(&no_messages),
+            no_messages.to_string(),
+            "bodies without a messages array fall back to full serialization"
+        );
     }
 }
