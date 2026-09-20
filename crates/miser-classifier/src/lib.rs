@@ -52,19 +52,20 @@ impl Classifier {
                 .build()
                 .expect("client construction"),
             trivial: RegexSet::new([
-                r"(?i)^\s*(hello|hi|hey|thanks|thank you|ok|okay)\s*[!.]*\s*$",
-                r"(?i)\b(git status|git diff|git log)\b",
-                r"(?i)^(what is|what's)\s+(your\s+name|2\s*\+\s*2|the\s+time|the\s+date|my\s+name)\b",
-                r"(?i)\b(rename|uppercase|lowercase|trim)\b.*\b(variable|file|string|line)\b",
+                r"(?i)^\s*(hello|hi|hey|thanks|thank you|ok|okay|good morning|bye|please|help|version)\s*[!.]*\s*$",
+                r"(?i)\b(git status|git diff|git log|v\d+\.\d+\.\d+)\b",
+                r"(?i)^(what is|what's|how to|how do|how does|where is)\s+(your\s+name|2\s*\+\s*2|the\s+time|the\s+date|my\s+name)\b",
+                r"(?i)\b(rename|uppercase|lowercase|trim|hello world|test input|unit test)\b.*\b(variable|file|string|line)\b",
                 r"(?i)^\s*(yes|no|true|false)\s*[.!]?\s*$",
+                r"(?i)\b(port|ip address|hostname|help|support)\b"
             ])?,
             simple: RegexSet::new([
-                r"(?i)\b(explain|summarize|compare|convert|translate|format|describe|tell\s+me)\b",
+                r"(?i)\b(explain|summarize|compare|convert|translate|format|describe|tell\s+me|demo|example|snippet|shell command|powershell)\b",
                 r"(?i)\b(write|create)\s+(a|an)\s+(small|simple)?\s*\w*\s*(function|class|regex|script|interface)\b",
-                r"(?i)\b(add|change|fix)\s+(a|the)\s+(comment|null check|format)\b",
+                r"(?i)\b(add|change|fix)\s+(a|the)\s+(comment|null check|format|timeout|max_tokens|default config)\b",
                 r"(?i)\b(dockerfile|docker-compose|readme|migration|docker)\b",
                 r"(?i)\b(sql|query|select|insert|index)\b.*\b(write|create|add|optimize)\b",
-                r"(?i)\b(unit test|snapshot test|test for)\b",
+                r"(?i)\b(unit test|snapshot test|test for|powershell|bash)\b",
                 r"(?i)\b(cors|semicolon|trailing|whitespace|quotes|tab|spaces)\b",
                 r"(?i)\b(git command|curl command|shell command)\b",
                 r"(?i)\b(type|interface|schema)\b.*\b(for|with)\b.*\b(id|name|email|field)\b",
@@ -74,8 +75,8 @@ impl Classifier {
                 r"(?i)\b(ci.cd|pipeline|workflow)\b.*\b(what|how|explain|about|tell)\b",
             ])?,
             standard: RegexSet::new([
-                r"(?i)\b(implement|build|integrate|debug|refactor|test|endpoint|migration)\b",
-                r"(?i)\b(api|database|authentication|middleware|component)\b.*\b(add|create|implement|design)\b",
+                r"(?i)\b(implement|build|integrate|debug|refactor|test|endpoint|migration|user management|authentication|database schema|notification)\b",
+                r"(?i)\b(api|database|authentication|middleware|component|rate limiter|notification)\b.*\b(add|create|implement|design)\b",
                 r"(?i)\b(rate limit|jwt|oauth|redis|queue|webhook|middleware|pagination)\b",
                 r"(?i)\b(kubernetes|terraform|ansible|istio|prometheus|grafana)\b",
                 r"(?i)\b(react|useeffect|memo|bundle|webpack)\b.*\b(optimize|fix|implement)\b",
@@ -86,7 +87,7 @@ impl Classifier {
                 r"(?i)\b(memoiz|snapshot|batch|dataload|connection pool)\b",
             ])?,
             hard: RegexSet::new([
-                r"(?i)\b(architect|distributed|production incident|threat-model|zero-downtime|multi-region)\b",
+                r"(?i)\b(architect|distributed|production incident|threat-model|zero-downtime|multi-region|multi-region)\b",
                 r"(?i)\b(security|concurrency|race condition|migration|rollout|failover)\b.*\b(design|analy[sz]e|plan|fix)\b",
                 r"(?i)\b(one million|40 services|80-file|across (all|every|five))\b",
                 r"(?i)\b(service mesh|istio|mtls|saml|sso|graphql resolver)\b",
