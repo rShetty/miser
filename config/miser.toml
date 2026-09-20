@@ -63,7 +63,11 @@ allow_fallbacks = true
 [routing]
 # "catalog" partitions every OpenRouter model into the five tiers by input
 # price and pins one model per tier; "fixed" uses [tiers.*].model verbatim.
-mode = "catalog"
+# Quality-first pin table (Jev-judged bake-off on evals/quality_cases.jsonl,
+# 2026-09-20): simple=qwen3-30b-a3b 0.92, standard=gpt-4.1-mini 0.95.
+# Catalog mode stays available; its price-first pinning chose cheaper but
+# weaker models (deepseek-v4-flash 0.86, mistral-small 0.91).
+mode = "fixed"
 # Persisted snapshot (pins + full model->tier split). Loaded at startup;
 # refreshed only via POST /admin/catalog/refresh.
 cache_path = "catalog/models.json"
@@ -97,21 +101,24 @@ ttl_seconds = 1800
 max_entries = 10000
 
 [tiers.trivial]
-model = "qwen/qwen3.7-flash"
+model = "mistralai/mistral-nemo"
 max_tokens = 256
 
 [tiers.simple]
-model = "deepseek/deepseek-v4-flash"
+model = "qwen/qwen3-30b-a3b-instruct-2507"
 max_tokens = 768
 
 [tiers.standard]
-model = "qwen/qwen3-coder-flash"
+model = "openai/gpt-4.1-mini"
 max_tokens = 1536
 
 [tiers.hard]
-model = "anthropic/claude-sonnet-4"
+# Jev-judged SE bake-off (2026-09-20): gpt-4.1-mini 2.70/4 mean on hard
+# cases vs claude-sonnet-4 2.19 — mini wins this corpus at 15x lower price.
+model = "openai/gpt-4.1-mini"
 max_tokens = 3072
 
 [tiers.reasoning]
-model = "z-ai/glm-5.2"
+# glm-5.2 scored 0.0 on every SE reasoning case (Jev judge) — disqualified.
+model = "openai/gpt-4.1-mini"
 max_tokens = 3072

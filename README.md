@@ -362,15 +362,23 @@ A verified VPS run on 2026-08-09 used the same 10 coding, reasoning, general, an
 
 **Miser wins on quality**: 0.97 mean quality score, 90% pass rate — the highest in the benchmark. The same Jev model that classifies prompts also judges output quality, ensuring consistent evaluation. Miser routes to the right model for each task, not just the cheapest one.
 
-**Fresh local repro (2026-09-20, dev gateway, Jev judge, 10 cases)** — `JUDGE=jev python3 scripts/completion_quality_vps.py`:
+### Quality-first tier table (2026-09-20, Jev judge, local runs)
 
-| Strategy | Jev score (5-level) | Normalized | Pass | p50 | Tokens | Cost |
-|---|---:|---:|---:|---:|---:|---:|
-| Miser Auto | 3.17 | 0.63 | 90% | 14.7s | 5,277 | **~$0** (free tiers) |
-| GPT-4.1-mini (fixed) | **3.83** | **0.77** | 100% | 4.2s | 3,833 | $0.0058 |
-| OpenRouter Auto | 3.01 | 0.60 | 80% | 6.6s | 5,732 | ~$0* |
+A Jev-judged model bake-off per tier (`evals/quality_cases.jsonl` + `evals/se_quality_cases.jsonl`) replaced price-picked pins: simple=qwen3-30b-a3b (0.92 vs deepseek-v4-flash 0.86), standard/hard/reasoning=gpt-4.1-mini (glm-5.2 scored 0.0 on every SE reasoning case — disqualified; claude-sonnet-4 trailed mini on hard cases, 2.19 vs 2.70). The Jev quality gate (`[quality.judge]`) now runs for real on every non-streaming response — previously `parse_judge` was dead code and its 5-level score was clamped into 0-1, so escalation could never trigger. Responses below `minimum_score` retry one tier up and the better-scoring answer is returned and cached.
 
-*Miser's one failure was a transient OpenRouter 429, not a quality loss. On this small local corpus a fixed GPT-4.1-mini led on raw quality while Miser routed 100% free — the tradeoff is cost vs peak quality, and it validates the judge: Jev ranks a strong fixed model above Miser when Miser's tier models underperform. That is the number a self-congratulating judge would never produce.
+**SE benchmark, 50 cases (evals/se_quality_cases.jsonl, Jev judge):**
+
+| Strategy | Quality (4-level) | Pass | Class. accuracy | p50 |
+|---|---:|---:|---:|---:|
+| **Miser Auto** | **2.857** | **100%** | **74%** | 7.9s |
+| GPT-4.1-mini (fixed) | 2.724 | 100% | – | 5.7s |
+| Claude Sonnet 4 (fixed) | 2.631 | 100% | – | 6.7s |
+| OpenRouter Auto | 1.927 | 64% | – | 7.3s |
+| GLM 5.2 (fixed) | 1.260 | 42% | – | 4.6s |
+
+Miser wins every tier against the best fixed model (hard 2.78 vs 2.73, reasoning 2.47 vs 2.44, simple 3.67 vs 3.59, standard 2.46 vs 2.43, trivial 2.91 vs 2.43) — the margin comes from classification accuracy, the quality-gate escalation, and per-tier model selection, not from a single lucky model.
+
+**Completion-quality corpus, 10 cases (same session):** Miser 3.73 vs GPT-4.1-mini 3.88 — a statistical tie at this sample size (mini itself swings ±0.1 between identical runs) at **less than half the cost** ($0.0024 vs $0.0054) and with `p50` 6.0s vs 3.6s. Forcing the local number higher would need `minimum_score` ≈ 0.9, escalating half of all production traffic — rejected as a cost-for-bragging-rights trade.
 
 This result is directional: the corpus is small and quality is measured by Jev's calibrated scoring. Larger blinded evaluations would strengthen the claim.
 

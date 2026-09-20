@@ -1,6 +1,7 @@
 mod auth;
 mod cache;
 mod catalog;
+mod judge;
 mod metrics;
 mod session;
 mod usage;
@@ -17,8 +18,9 @@ use axum::{
 use clap::Parser;
 use miser_classifier::Classifier;
 use miser_policy::PolicyEngine;
+use miser_policy::quality::{QualityScore, deterministic_quality};
 use miser_provider::{Provider, ProviderConfig, safe_response_headers};
-use miser_types::{ChatCompletionRequest, ComplexityTier, GatewayConfig};
+use miser_types::{ChatCompletionRequest, ComplexityTier, GatewayConfig, TierModelRouteConfig};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,6 +57,7 @@ struct AppState {
     metrics: Arc<metrics::Metrics>,
     audit: Arc<auth::AuditLog>,
     catalog: Arc<catalog::CatalogRouter>,
+    quality_judge: Option<judge::QualityJudge>,
     admin_key: String,
 }
 
@@ -131,6 +134,23 @@ async fn main() -> anyhow::Result<()> {
              every classification will fall back to the heuristic until a key is set"
         );
     }
+    // The quality judge shares the Jev evaluation endpoint; when the
+    // quality config has no key of its own, fall back to the classifier's
+    // (env-resolved) key rather than silently disabling the judge.
+    let quality_judge = config
+        .quality
+        .judge
+        .as_ref()
+        .filter(|judge| judge.enabled && !judge.base_url.is_empty() && !judge.model.is_empty())
+        .map(|judge| {
+            let api_key = judge
+                .api_key
+                .clone()
+                .filter(|key| !key.is_empty())
+                .or_else(|| classifier_config.jev.api_key.clone())
+                .unwrap_or_default();
+            judge::QualityJudge::new(judge, api_key)
+        });
     let state = AppState {
         classifier: Arc::new(Classifier::new(classifier_config)?),
         policy: PolicyEngine::new(config.clone()),
@@ -152,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "/var/lib/miser/audit.jsonl".to_string()),
         ))),
         catalog: Arc::new(catalog::CatalogRouter::load_or_seed(&config)),
+        quality_judge,
         admin_key,
         config,
     };
@@ -580,6 +601,126 @@ async fn completions_inner(
         let original_status = upstream.status();
         let original_headers = safe_response_headers(upstream.headers());
         let payload = upstream.bytes().await.map_err(internal)?;
+        // Quality gate: deterministic checks first, then the Jev judge
+        // when configured ("Jev decides"), then one bounded escalation to
+        // the next tier when the score is below threshold. The better of
+        // the two responses is returned and cached.
+        let mut payload = payload;
+        let mut selected_route = selected_route;
+        let mut effective_tier = effective_tier;
+        let mut escalated = false;
+        if state.config.quality.enabled {
+            let parsed = serde_json::from_slice::<Value>(&payload).ok();
+            let response_text = parsed
+                .as_ref()
+                .and_then(|body| body["choices"][0]["message"]["content"].as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let mut check = deterministic_quality(
+                &request,
+                &parsed.unwrap_or(Value::Null),
+                &classification,
+                &state.config.quality,
+            );
+            if let Some(judge) = state.quality_judge.as_ref() {
+                if let Some(score) = judge
+                    .score(&judge::last_user_text(&request), &response_text)
+                    .await
+                {
+                    check = QualityScore {
+                        score,
+                        passed: score >= state.config.quality.minimum_score,
+                        reason: "jev-judge",
+                    };
+                }
+            }
+            if !check.passed && state.config.quality.escalate_on_failure {
+                if let Some(escalated_tier) = state.policy.escalated_tier(&request, &classification)
+                {
+                    // Tier gating mirrors the pre-flight gate: never hand a
+                    // key a tier it is not allowed to see.
+                    let tier_allowed = authenticated_key
+                        .as_ref()
+                        .map(|key| {
+                            key.allowed_tiers.is_empty()
+                                || key
+                                    .allowed_tiers
+                                    .iter()
+                                    .any(|t| t.eq_ignore_ascii_case(&format_tier(escalated_tier)))
+                        })
+                        .unwrap_or(true);
+                    if tier_allowed {
+                        if let Some(next_route) =
+                            state.policy.next(&request, &classification).ok().flatten()
+                        {
+                            let escalated_model = state
+                                .catalog
+                                .active_model(escalated_tier)
+                                .unwrap_or_else(|| next_route.model.clone());
+                            let mut escalated_body =
+                                serde_json::to_value(&request).map_err(internal)?;
+                            escalated_body["model"] = Value::String(escalated_model.clone());
+                            if let Ok(escalated_upstream) =
+                                state.provider.forward(escalated_body, None).await
+                            {
+                                if escalated_upstream.status().is_success() {
+                                    if let Ok(escalated_payload) = escalated_upstream.bytes().await
+                                    {
+                                        let escalated_score = if let Some(judge) =
+                                            state.quality_judge.as_ref()
+                                        {
+                                            let escalated_text =
+                                                serde_json::from_slice::<Value>(&escalated_payload)
+                                                    .ok()
+                                                    .and_then(|body| {
+                                                        body["choices"][0]["message"]["content"]
+                                                            .as_str()
+                                                            .map(str::to_owned)
+                                                    })
+                                                    .unwrap_or_default();
+                                            judge
+                                                .score(
+                                                    &judge::last_user_text(&request),
+                                                    &escalated_text,
+                                                )
+                                                .await
+                                        } else {
+                                            None
+                                        };
+                                        // Keep the escalated response unless the
+                                        // judge scored it strictly worse.
+                                        if escalated_score
+                                            .map(|score| score >= check.score)
+                                            .unwrap_or(true)
+                                        {
+                                            payload = escalated_payload;
+                                            selected_route = TierModelRouteConfig {
+                                                model: escalated_model,
+                                                ..next_route
+                                            };
+                                            effective_tier = escalated_tier;
+                                            escalated = true;
+                                            state.metrics.quality_escalations_total.inc();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if escalated {
+                // The escalated response carries the usage, so the
+                // deterministic/empty markers from the first attempt must
+                // not leak into the returned headers below.
+                tracing::debug!(
+                    request_id = %request_id,
+                    tier = %format_tier(effective_tier),
+                    score = %check.score,
+                    "quality gate escalated response"
+                );
+            }
+        }
         // Real usage from the provider response, attributed to the key.
         let usage = serde_json::from_slice::<Value>(&payload)
             .ok()
@@ -620,6 +761,10 @@ async fn completions_inner(
                 HeaderValue::from_str(&request_id).unwrap(),
             )
             .header("x-miser-cache", HeaderValue::from_static("miss"))
+            .header(
+                "x-miser-escalated",
+                HeaderValue::from_static(if escalated { "true" } else { "false" }),
+            )
             .header(
                 "x-miser-tier",
                 HeaderValue::from_str(&format_tier(effective_tier)).unwrap(),
@@ -1204,6 +1349,7 @@ mod integration_tests {
                     .as_nanos()
             )))),
             catalog: Arc::new(catalog::CatalogRouter::load_or_seed(&config)),
+            quality_judge: None,
             admin_key: admin_key.to_string(),
             config,
         }

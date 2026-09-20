@@ -40,8 +40,7 @@ impl PolicyEngine {
         request: &ChatCompletionRequest,
         classification: &ClassificationResult,
     ) -> Result<Option<TierModelRouteConfig>, PolicyError> {
-        let tier = self.effective_tier(request, classification);
-        let Some(next_tier) = next_tier(tier) else {
+        let Some(next_tier) = self.escalated_tier(request, classification) else {
             return Ok(None);
         };
         self.config
@@ -50,6 +49,17 @@ impl PolicyEngine {
             .cloned()
             .map(Some)
             .ok_or(PolicyError::MissingRoute(next_tier))
+    }
+
+    /// One tier above the effective tier, when one exists. Drives
+    /// quality-escalation: a response that fails the quality gate is
+    /// retried with this tier's model.
+    pub fn escalated_tier(
+        &self,
+        request: &ChatCompletionRequest,
+        classification: &ClassificationResult,
+    ) -> Option<ComplexityTier> {
+        next_tier(self.effective_tier(request, classification))
     }
 
     pub fn effective_tier(
