@@ -148,7 +148,16 @@ impl Classifier {
                 .llm(request, &self.config.cloud_llm, "cloud_llm", started)
                 .await
                 .or(Ok(heuristic)),
-            ClassifierMode::Jev => self.jev(request, started).await.or(Ok(heuristic)),
+            ClassifierMode::Jev => match self.jev(request, started).await {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    // Fallback is intentional (availability over accuracy) but
+                    // must be observable: under mode = "jev" this header flip
+                    // is the only signal of a Jev outage.
+                    tracing::warn!(error = %error, "jev classification failed; falling back to heuristic");
+                    Ok(heuristic)
+                }
+            },
             ClassifierMode::Hybrid => {
                 if heuristic.confidence >= self.config.confidence_threshold {
                     return Ok(heuristic);
@@ -407,7 +416,16 @@ impl Classifier {
                 }
             }
         });
-        let path = endpoint.path.as_deref().unwrap_or("/evaluate");
+        let path = match endpoint.path.as_deref() {
+            Some("") | None => "/evaluate",
+            Some(p) if p.starts_with("http://") || p.starts_with("https://") => p,
+            Some(p) if p.starts_with('/') => p,
+            Some(p) => {
+                // Tolerate a missing leading slash rather than silently
+                // mis-joining onto the base URL.
+                &format!("/{p}")
+            }
+        };
         let url = if path.starts_with("http://") || path.starts_with("https://") {
             path.to_string()
         } else {

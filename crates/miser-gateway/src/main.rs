@@ -116,6 +116,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    if classifier_config.mode == miser_types::ClassifierMode::Jev
+        && classifier_config.jev.api_key.as_deref().unwrap_or_default().is_empty()
+    {
+        tracing::warn!(
+            "classifier.mode is 'jev' but no JEV_API_KEY is configured; \
+             every classification will fall back to the heuristic until a key is set"
+        );
+    }
     let state = AppState {
         classifier: Arc::new(Classifier::new(classifier_config)?),
         policy: PolicyEngine::new(config.clone()),

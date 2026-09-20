@@ -10,6 +10,16 @@ curl -fsS http://127.0.0.1:8787/health/live
 curl -fsS http://127.0.0.1:8787/health/ready
 ```
 
+## Classifier (Jev) operations
+
+Miser's default classifier is Jev, TypeSafe's System One evaluation model, reached at `https://api.typesafe.ai/v1/systemone` with model `jev-latest` (config: `[classifier.jev]`). Operationally it behaves like a dependency of the request path:
+
+- **Key**: `JEV_API_KEY` from the environment (env file loaded by the service unit). Rotate by issuing a new key in the TypeSafe Console, updating the env file, and `systemctl restart miser`. A missing, empty, or invalid key does **not** take the gateway down — classification silently falls back to the zero-cost heuristic.
+- **Detecting fallback**: the per-request classifier that decided the tier is returned in `x-miser-classifier` (values `jev`, `heuristic`, `override`, …) and in the response's routing metadata. Sustained `classifier=heuristic` traffic while `classifier.mode = "jev"` means the Jev endpoint is unreachable, the key is invalid, or the 3s timeout (`[classifier.jev].timeout_ms`) is too tight for your network.
+- **Timeout**: p50 is ~340 ms, p99 ~1.2 s from a datacenter network. Raise `timeout_ms` before raising alert thresholds if your egress is slow.
+- **Cost**: Jev usage tokens are returned per call and surfaced by the evaluator (`classification_cost_usd`). At default prices ($0.04/M in, $0.16/M out) classification costs ≈ $0.05 per 1,000 requests — compare with the tier-routing savings it enables.
+- **Latency budget**: the classification call is inside the request path (before upstream model selection). If p95 request latency regresses, first check whether the increase is in the classifier (`x-miser-*` timing) or upstream.
+
 ## Metrics
 
 The gateway exposes Prometheus metrics at `/metrics` (text exposition format, no authentication — keep the port private or scrape through an authenticated reverse proxy):

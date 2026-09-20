@@ -1,10 +1,26 @@
 # Miser
 
-Miser is an open-source, Rust-based AI gateway that routes OpenAI-compatible requests to the cheapest capable model through OpenRouter.
+Miser is an open-source, Rust-based AI gateway that routes OpenAI-compatible requests to the cheapest **capable** model through OpenRouter — using [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), TypeSafe's System One evaluation model, as its default prompt classifier.
 
 <p align="center">
   <img src="./docs/icon.svg?v=2" alt="Miser cost-saving AI gateway" width="220">
 </p>
+
+## Why Jev classification
+
+Routing quality is classification quality. Miser classifies every prompt into a complexity tier (trivial → simple → standard → hard → reasoning) and routes accordingly. Since v0.4 the classifier is a single Jev evaluation call — one shared state (prompt text, tool names, tool history) answers two typed questions (tier + task) with calibrated probabilities. Benchmarked against the previous zero-cost regex classifier on 2,210 labeled prompts (2,100 tuning + 116 held-out; held-out never used for tuning):
+
+| held-out corpus (116) | exact | adjacent | MAE | under-route | over-route | p50 |
+|---|---:|---:|---:|---:|---:|---:|
+| regex heuristic (old default) | 74.1% | 90.5% | 0.388 | 9.5% | 16.4% | <1ms |
+| **Jev (default)** | **90.5%** | **100%** | **0.095** | **6.0%** | **3.4%** | ~340ms |
+
+- **Over-routing down 5×** — trivial prompts stop paying frontier-model prices.
+- **Under-routing down** — the dangerous direction (hard work sent to weak models) improves too.
+- **Cost**: ~$0.05 per 1,000 classifications at $0.04/M input + $0.16/M output tokens.
+- **Graceful degradation**: on timeout, failure, or missing `JEV_API_KEY`, Miser falls back to the zero-cost heuristic — a missing key degrades accuracy, never availability.
+
+Full methodology, tuning history, and reproduction commands: [docs/EVALUATION.md](docs/EVALUATION.md).
 
 ## Documentation
 
@@ -23,36 +39,47 @@ OpenCode / Codex / Aider / SDK
               v
       Miser Gateway :8787
               |
-   override -> structural -> heuristics
+   override -> structural -> Jev (tier + task, default)
+              |         \-> heuristic (fallback / mode=heuristic)
               |
-       local LLM (optional)
+       local LLM (optional, mode=hybrid)
               |
-       cloud LLM (optional)
+       cloud LLM (optional, mode=hybrid)
               |
    tier policy -> OpenRouter model
 ```
 
-The gateway is stateless, preserves unknown OpenAI request fields, forwards streaming responses, and exposes routing metadata through `x-miser-*` headers.
+The gateway is stateless, preserves unknown OpenAI request fields, forwards streaming responses, and exposes routing metadata through `x-miser-*` headers (including the selected tier and which classifier decided it).
 
 ## Classifier modes
 
-Configure `classifier.mode` in `config/miser.toml`:
+Configure `classifier.mode` in `config/miser.toml` (`jev` is the default):
 
+- `jev`: **default**. TypeSafe System One evaluation model (`jev-latest` via TypeSafe direct, or `typesafe-ai/jev` via Vercel AI Gateway); one evaluation call classifies tier and task. Key from `JEV_API_KEY`.
 - `heuristic`: zero-cost, local structural and regex classification
 - `local_llm`: OpenAI-compatible Ollama or local endpoint
 - `cloud_llm`: OpenAI-compatible cloud classifier
-- `jev`: **default**. TypeSafe System One evaluation model (`jev-latest` via TypeSafe direct, or `typesafe-ai/jev` via Vercel AI Gateway); classifies through a typed choice question, not chat completions. Key from `JEV_API_KEY`. Falls back to the heuristic when the endpoint is unreachable or the key is missing.
 - `hybrid`: heuristics first, then bounded local/cloud fallback
-
-The default jev mode classifies every request with a single evaluation call (~340 ms p50) and falls back to the zero-cost heuristic on failure, so a missing key degrades gracefully instead of breaking the gateway.
 
 ## Run locally
 
+Get a Jev API key from the [TypeSafe Console](https://console.typesafe.ai/) (or a [Vercel AI Gateway](https://vercel.com/ai-gateway/models/jev) key), then:
+
 ```bash
 cp config/miser.env.example .env
-export OPENROUTER_API_KEY=sk-or-...
+echo "JEV_API_KEY=<your-key>" >> .env      # classifier
+export OPENROUTER_API_KEY=sk-or-...       # upstream models
 cargo run -p miser-gateway -- --config config/miser.toml
 ```
+
+Or one-shot with the bundled script (loads repo `.env`, builds, starts in background):
+
+```bash
+./start_server.sh
+curl http://localhost:8787/health/live
+```
+
+Prefer zero-setup? `classifier.mode = "heuristic"` needs no key at all.
 
 Configure OpenCode:
 
@@ -83,13 +110,14 @@ Configure OpenCode:
 
 ## Evaluation
 
-The versioned corpus is `evals/cases.jsonl`.
+Classifier corpora: `evals/classifier_cases.jsonl` (116 adversarial held-out cases) and `evals/classifier_cases_large.jsonl` (2,100 tuning cases, generator in `scripts/generate_classifier_corpus.py`).
 
 ```bash
-cargo run -p miser-evals -- --mode heuristic
+export JEV_API_KEY=...   # enables the jev rows
+scripts/classifier_benchmark.sh
 ```
 
-The evaluator reports exact and adjacent-tier accuracy plus a confusion matrix. Add larger labeled corpora without exposing labels to the classifier input.
+The harness reports exact/adjacent accuracy, MAE, under/over-routing, p50/avg latency, estimated classification cost, and fallback counts per mode. The legacy `evals/cases.jsonl` corpus predates the current tier-labeling doctrine and over-credits keyword matching — use the `classifier_cases*` corpora. Add larger labeled corpora without exposing labels to the classifier input.
 
 ### VPS benchmark
 
@@ -149,7 +177,8 @@ Miser is compared against publicly documented 2026 gateway benchmarks. Gateway o
 
 | Gateway | Language | Gateway overhead (p99) | Classification accuracy | Classification latency (p50) | Semantic caching | Cost per 1M requests | Open source |
 |---|---|---:|---:|---:|---|---:|---|
-| **Miser** | Rust | <1ms | 92% exact / 92% adjacent | <1ms (heuristic) | Exact + TF-IDF similarity | ~$0.000175 | MIT |
+| **Miser (heuristic mode)** | Rust | <1ms | 92% exact / 92% adjacent | <1ms (heuristic) | Exact + TF-IDF similarity | ~$0.000175 | MIT |
+| **Miser (Jev, default)** | Rust | <1ms | 90.5% exact / 100% adjacent | ~340ms | Exact + TF-IDF similarity | ~$0.000175 + ~$0.05/1k classifications | MIT |
 | LiteLLM Rust (beta) | Rust | 0.7ms | N/A (no classification) | N/A | Redis-backed | ~$0.000175 | MIT |
 | Portkey | Node.js | 2.3ms | N/A (no classification) | N/A | Yes (hosted) | ~$0.001042 | Apache 2.0 (core) |
 | Bifrost | Rust | 4.5ms | N/A (no classification) | N/A | No | ~$0.001008 | Proprietary |
@@ -182,7 +211,7 @@ Miser achieves the highest quality score (0.9283), matching GPT-4.1-mini within 
 Miser's differentiators:
 
 1. **Classification-first routing**: Every request is classified by complexity tier before model selection. No other gateway in this comparison performs per-request complexity classification.
-2. **Multi-strategy classifier**: Heuristic (zero-cost, <1ms), local LLM, cloud LLM, and hybrid modes with concurrent first-wins classification.
+2. **Model-judged classification**: Jev (TypeSafe System One) as default classifier — typed choice questions with calibrated probabilities, tool-context-aware agentic floors, ~$0.05/1k classifications — plus zero-cost heuristic, local LLM, cloud LLM, and hybrid modes.
 3. **Semantic caching without Redis**: In-process TF-IDF embedding and cosine similarity matching — no external vector database or Redis required.
 4. **Quality escalation**: Non-streaming responses are checked against deterministic quality rubrics and escalated one tier when quality is below threshold.
 5. **Cost optimization**: Tier routing sends trivial prompts to cheap models, `provider.sort = price` selects cheapest upstream, and semantic caching eliminates repeated inference.

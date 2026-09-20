@@ -204,10 +204,13 @@ CONCEPT_PAIRS = [
 def build_cases(repeat: int):
     cases = []
 
+    prefix = {"trivial": "tv", "simple": "sm", "standard": "st",
+              "hard": "hd", "reasoning": "rs"}
+
     def add(tier, text):
         for _ in range(repeat):
             cases.append({
-                "id": f"{tier[0]}{len(cases):05d}",
+                "id": f"{prefix[tier]}{len(cases):05d}",
                 "expected_tier": tier,
                 "request": {"model": "auto",
                             "messages": [{"role": "user", "content": text}]},

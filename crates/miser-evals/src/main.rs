@@ -1,6 +1,6 @@
 use clap::Parser;
 use miser_classifier::Classifier;
-use miser_types::{ChatCompletionRequest, ClassifierMode, ComplexityTier};
+use miser_types::{ChatCompletionRequest, ClassifierConfig, ClassifierMode, ComplexityTier};
 use serde::Deserialize;
 mod quality;
 
@@ -21,11 +21,31 @@ struct Args {
     #[arg(long)]
     config: Option<String>,
     /// Parallel in-flight classifications. Results print in corpus order;
-    /// latency percentiles under concurrency > 1 include queueing.
+    /// latency is measured per classification and excludes semaphore wait.
     #[arg(long, default_value_t = 1)]
     concurrency: usize,
+    /// USD per 1M input tokens for the classifier model (Jev default 0.04).
+    #[arg(long, default_value_t = default_price_in())]
+    price_in: f64,
+    /// USD per 1M output tokens for the classifier model (Jev default 0.16).
+    #[arg(long, default_value_t = default_price_out())]
+    price_out: f64,
     #[arg(long)]
     quality: Option<String>,
+}
+
+fn default_price_in() -> f64 {
+    std::env::var("MISER_PRICE_IN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.04)
+}
+
+fn default_price_out() -> f64 {
+    std::env::var("MISER_PRICE_OUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.16)
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,7 +74,15 @@ async fn main() -> anyhow::Result<()> {
             let gateway: miser_types::GatewayConfig = toml::from_str(&raw)?;
             gateway.classifier
         }
-        None => serde_json::from_str("{}").unwrap(),
+        None => {
+            let mut config: ClassifierConfig = serde_json::from_str("{}").unwrap();
+            // Bare runs (no --config) have no endpoint settings; executing the
+            // default jev mode there would just report all-fallback failures.
+            if mode.is_none() {
+                config.mode = ClassifierMode::Heuristic;
+            }
+            config
+        }
     };
     if let Some(mode) = mode {
         config.mode = mode;
@@ -128,8 +156,18 @@ async fn main() -> anyhow::Result<()> {
             fallbacks += 1;
         }
         if let Some(usage) = output.extra.get("usage") {
-            input_tokens += usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            output_tokens += usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            // TypeSafe returns input_tokens/output_tokens; OpenAI-style
+            // payloads use prompt_tokens/completion_tokens.
+            input_tokens += usage
+                .get("input_tokens")
+                .or_else(|| usage.get("prompt_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            output_tokens += usage
+                .get("output_tokens")
+                .or_else(|| usage.get("completion_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
         }
         *matrix
             .entry(format!("{:?}", case.expected_tier))
@@ -158,7 +196,16 @@ async fn main() -> anyhow::Result<()> {
         println!("latency_ms_avg={avg:.1} latency_ms_p50={p50} latency_ms_p95={p95} latency_ms_p99={p99}");
     }
     if input_tokens > 0 || output_tokens > 0 {
-        println!("tokens_in={input_tokens} tokens_out={output_tokens}");
+        let cost =
+            input_tokens as f64 / 1e6 * args.price_in + output_tokens as f64 / 1e6 * args.price_out;
+        let per_1k = if metrics.total > 0 {
+            cost / metrics.total as f64 * 1000.0
+        } else {
+            0.0
+        };
+        println!(
+            "tokens_in={input_tokens} tokens_out={output_tokens} classification_cost_usd={cost:.4} cost_per_1k_classifications_usd={per_1k:.4}"
+        );
     }
     println!("confusion={}", serde_json::to_string_pretty(&matrix)?);
     Ok(())
