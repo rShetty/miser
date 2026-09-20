@@ -95,6 +95,13 @@ require_tools = true
 min_context = 65536
 allow_free = false
 
+[cache]
+enabled = true
+semantic_enabled = true
+# Candidates are loose (recall-first); the Jev equivalence judge decides
+# what actually gets served.
+semantic_candidate_threshold = 0.65
+
 [session]
 enabled = true
 ttl_seconds = 1800

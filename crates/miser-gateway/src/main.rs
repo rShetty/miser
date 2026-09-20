@@ -3,6 +3,7 @@ mod cache;
 mod catalog;
 mod judge;
 mod metrics;
+mod semantic_cache;
 mod session;
 mod usage;
 mod validate;
@@ -57,6 +58,7 @@ struct AppState {
     metrics: Arc<metrics::Metrics>,
     audit: Arc<auth::AuditLog>,
     catalog: Arc<catalog::CatalogRouter>,
+    semantic_cache: Arc<semantic_cache::SemanticCache>,
     quality_judge: Option<judge::QualityJudge>,
     admin_key: String,
 }
@@ -172,6 +174,11 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "/var/lib/miser/audit.jsonl".to_string()),
         ))),
         catalog: Arc::new(catalog::CatalogRouter::load_or_seed(&config)),
+        semantic_cache: Arc::new(semantic_cache::SemanticCache::new(
+            config.cache.max_entries,
+            300,
+            config.cache.semantic_candidate_threshold,
+        )),
         quality_judge,
         admin_key,
         config,
@@ -464,6 +471,7 @@ async fn completions_inner(
     // Capture the client's requested model before routing overwrites
     // request.model; the usage ledger records both.
     let requested_model = request.model.clone();
+    let stream_requested = request.stream.unwrap_or(false);
     let body = serde_json::to_value(&request).map_err(internal)?;
     let cache_key = cache::request_hash(&body);
     if let Some((cached_body, cached_status, cached_headers)) = state.cache.get(cache_key) {
@@ -493,6 +501,63 @@ async fn completions_inner(
             .header("x-miser-cache", HeaderValue::from_static("hit-exact"))
             .body(axum::body::Body::from(cached_body))
             .map_err(internal);
+    }
+    // Semantic cache: embedding retrieval flags a candidate, the Jev
+    // equivalence judge decides whether the cached response actually
+    // answers this request. Two-stage, so bag-of-words similarity alone
+    // never serves an answer. Structured-output requests are excluded:
+    // a cached response built for a different response_format contract
+    // could break the client's parser.
+    if state.config.cache.enabled
+        && state.config.cache.semantic_enabled
+        && request.response_format.is_none()
+        && !stream_requested
+    {
+        let embedding_text = semantic_cache::request_text_for_embedding(&body);
+        let candidate = state
+            .semantic_cache
+            .lookup(&semantic_cache::embed_prompt(&embedding_text));
+        if let Some(hit) = candidate {
+            let new_prompt = judge::last_user_text(&request);
+            let validated = match state.quality_judge.as_ref() {
+                Some(judge) => judge.equivalent(&new_prompt, &hit.prompt_text).await == Some(true),
+                // No judge configured: fall back to near-duplicate text
+                // only, mirroring the exact-match safety bar.
+                None => hit.similarity >= state.config.cache.similarity_threshold,
+            };
+            if validated {
+                state.metrics.semantic_hits_total.inc();
+                record_usage(
+                    &state,
+                    authenticated_key.as_ref(),
+                    &request.model,
+                    &requested_model,
+                    "-",
+                    0,
+                    0,
+                    started.elapsed(),
+                    true,
+                    hit.status.as_u16(),
+                    &request_id,
+                );
+                let mut response = Response::builder().status(hit.status);
+                for (name, value) in &hit.headers {
+                    response = response.header(name, value);
+                }
+                return response
+                    .header(
+                        "x-miser-request-id",
+                        HeaderValue::from_str(&request_id).unwrap(),
+                    )
+                    .header("x-miser-cache", HeaderValue::from_static("hit-semantic"))
+                    .header(
+                        "x-miser-semantic-similarity",
+                        HeaderValue::from_str(&format!("{:.3}", hit.similarity)).unwrap(),
+                    )
+                    .body(axum::body::Body::from(hit.body))
+                    .map_err(internal);
+            }
+        }
     }
     state.metrics.cache_misses_total.inc();
     let mut classification = state
@@ -552,7 +617,6 @@ async fn completions_inner(
             state.session.update(&key, effective_tier);
         }
     }
-    let stream_requested = request.stream.unwrap_or(false);
     request.model = route.model.clone();
     if request.max_tokens.is_none() {
         if let Some(max_tokens) = route.max_tokens {
@@ -751,6 +815,18 @@ async fn completions_inner(
             original_status,
             original_headers.clone(),
         );
+        // Semantic cache gets the final (quality-gated, possibly escalated)
+        // response so near-duplicate requests reuse the best answer.
+        if state.config.cache.enabled && state.config.cache.semantic_enabled {
+            let embedding_text = semantic_cache::request_text_for_embedding(&body);
+            state.semantic_cache.store(
+                semantic_cache::embed_prompt(&embedding_text),
+                embedding_text,
+                payload.clone(),
+                original_status,
+                original_headers.clone(),
+            );
+        }
         let mut response = Response::builder().status(original_status);
         for (name, value) in &original_headers {
             response = response.header(name, value);
@@ -1349,6 +1425,11 @@ mod integration_tests {
                     .as_nanos()
             )))),
             catalog: Arc::new(catalog::CatalogRouter::load_or_seed(&config)),
+            semantic_cache: Arc::new(semantic_cache::SemanticCache::new(
+                config.cache.max_entries,
+                300,
+                config.cache.semantic_candidate_threshold,
+            )),
             quality_judge: None,
             admin_key: admin_key.to_string(),
             config,

@@ -556,6 +556,14 @@ pub struct CacheConfig {
     pub max_entries: usize,
     #[serde(default = "default_similarity")]
     pub similarity_threshold: f32,
+    /// Serve semantically-similar cached responses (embedding candidate +
+    /// Jev equivalence validation). Requires a configured quality judge.
+    #[serde(default)]
+    pub semantic_enabled: bool,
+    /// Embedding similarity above which a cached response becomes a
+    /// validation candidate. The judge decides whether it is served.
+    #[serde(default = "default_semantic_candidate_threshold")]
+    pub semantic_candidate_threshold: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
     #[serde(flatten)]
@@ -568,6 +576,8 @@ impl Default for CacheConfig {
             enabled: true,
             max_entries: 10_000,
             similarity_threshold: 0.92,
+            semantic_enabled: false,
+            semantic_candidate_threshold: 0.75,
             embedding_model: None,
             extra: ExtraFields::new(),
         }
@@ -581,6 +591,9 @@ fn default_cache_entries() -> usize {
 }
 fn default_similarity() -> f32 {
     0.92
+}
+fn default_semantic_candidate_threshold() -> f32 {
+    0.65
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -12,7 +12,7 @@ The gateway is stateless. It does not persist prompts or completions. API keys a
 - Per-request complexity classification: Jev (TypeSafe System One, default), heuristic, local-LLM, cloud-LLM, and hybrid modes.
 - Concurrent first-wins classification using `tokio::select!` to minimize classification latency.
 - Cost-aware tier-to-model routing with open-weight models for trivial/simple/standard tasks and frontier models for hard/reasoning tasks.
-- Exact-match response caching with FNV hash and 5-minute TTL to eliminate repeated inference.
+- Exact-match response caching with FNV hash and 5-minute TTL to eliminate repeated inference, plus a Jev-validated semantic cache: embedding retrieval flags near-duplicate prompts (recall-first) and the judge confirms answer-equivalence before serving the cached response.
 - API key authentication with admin management endpoints and SHA-256 hashed key store.
 - Quality escalation for non-streaming responses (deterministic checks, one-tier retry).
 - Conservative fallback when a classifier is unavailable.

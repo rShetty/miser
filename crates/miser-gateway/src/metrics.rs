@@ -23,6 +23,8 @@ pub struct Metrics {
     pub tier_requests_total: IntCounterVec,
     /// Exact-match response cache hits.
     pub cache_hits_total: IntCounter,
+    /// Semantic cache hits validated by the Jev equivalence judge.
+    pub semantic_hits_total: IntCounter,
     /// Response cache misses.
     pub cache_misses_total: IntCounter,
     /// Requests escalated above the classifier's original tier.
@@ -62,6 +64,10 @@ impl Metrics {
         let cache_hits_total =
             IntCounter::new("miser_cache_hits_total", "Exact-match response cache hits.")?;
         let cache_misses_total = IntCounter::new("miser_cache_misses_total", "Cache misses.")?;
+        let semantic_hits_total = IntCounter::new(
+            "miser_semantic_hits_total",
+            "Semantic cache hits validated by the Jev equivalence judge.",
+        )?;
         let quality_escalations_total = IntCounter::new(
             "miser_quality_escalations_total",
             "Requests escalated above the classifier's original tier.",
@@ -80,6 +86,7 @@ impl Metrics {
         registry.register(Box::new(tier_requests_total.clone()))?;
         registry.register(Box::new(cache_hits_total.clone()))?;
         registry.register(Box::new(cache_misses_total.clone()))?;
+        registry.register(Box::new(semantic_hits_total.clone()))?;
         registry.register(Box::new(quality_escalations_total.clone()))?;
         registry.register(Box::new(upstream_errors_total.clone()))?;
         registry.register(Box::new(catalog_failovers_total.clone()))?;
@@ -91,6 +98,7 @@ impl Metrics {
             tier_requests_total,
             cache_hits_total,
             cache_misses_total,
+            semantic_hits_total,
             quality_escalations_total,
             upstream_errors_total,
             catalog_failovers_total,
