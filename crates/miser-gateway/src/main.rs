@@ -687,22 +687,32 @@ async fn completions_inner(
                 .and_then(|body| body["choices"][0]["message"]["content"].as_str())
                 .unwrap_or_default()
                 .to_owned();
+            // A tool-calling turn carries no prose, so there is nothing for
+            // the judge to grade. Scoring the empty string against the prompt
+            // failed every agentic turn and triggered a needless escalation.
+            let tool_call_only = response_text.trim().is_empty()
+                && parsed
+                    .as_ref()
+                    .and_then(|body| body["choices"][0]["message"]["tool_calls"].as_array())
+                    .is_some_and(|calls| !calls.is_empty());
             let mut check = deterministic_quality(
                 &request,
                 &parsed.unwrap_or(Value::Null),
                 &classification,
                 &state.config.quality,
             );
-            if let Some(judge) = state.quality_judge.as_ref() {
-                if let Some(score) = judge
-                    .score(&judge::last_user_text(&request), &response_text)
-                    .await
-                {
-                    check = QualityScore {
-                        score,
-                        passed: score >= state.config.quality.minimum_score,
-                        reason: "jev-judge",
-                    };
+            if !tool_call_only {
+                if let Some(judge) = state.quality_judge.as_ref() {
+                    if let Some(score) = judge
+                        .score(&judge::last_user_text(&request), &response_text)
+                        .await
+                    {
+                        check = QualityScore {
+                            score,
+                            passed: score >= state.config.quality.minimum_score,
+                            reason: "jev-judge",
+                        };
+                    }
                 }
             }
             if !check.passed && state.config.quality.escalate_on_failure {
@@ -724,10 +734,19 @@ async fn completions_inner(
                         if let Some(next_route) =
                             state.policy.next(&request, &classification).ok().flatten()
                         {
-                            let escalated_model = state
-                                .catalog
-                                .active_model(escalated_tier)
-                                .unwrap_or_else(|| next_route.model.clone());
+                            // Mirror the pre-flight gate: in `fixed` mode the
+                            // configured [tiers.*].model is authoritative, so
+                            // reading a persisted snapshot pin here silently
+                            // overrode the operator's model choice on exactly
+                            // the escalated (hardest) requests.
+                            let escalated_model = if state.catalog.enabled() {
+                                state
+                                    .catalog
+                                    .active_model(escalated_tier)
+                                    .unwrap_or_else(|| next_route.model.clone())
+                            } else {
+                                next_route.model.clone()
+                            };
                             let mut escalated_body =
                                 serde_json::to_value(&request).map_err(internal)?;
                             escalated_body["model"] = Value::String(escalated_model.clone());

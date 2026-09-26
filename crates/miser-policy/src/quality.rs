@@ -28,10 +28,21 @@ pub fn deterministic_quality(
             reason: "quality-disabled",
         };
     }
-    let content = response["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or_default();
+    let message = &response["choices"][0]["message"];
+    let content = message["content"].as_str().unwrap_or_default();
+    // A turn that only calls tools has `content: null` by design, so the
+    // empty-content check below used to hard-fail every tool-calling
+    // response (score 0.0) and force a pointless escalation. Emitting a
+    // well-formed tool call is a complete answer, so score it as one.
+    let tool_calls = message["tool_calls"].as_array();
     if content.trim().is_empty() {
+        if tool_calls.is_some_and(|calls| !calls.is_empty()) {
+            return QualityScore {
+                score: 0.85,
+                passed: true,
+                reason: "tool-calls",
+            };
+        }
         return QualityScore {
             score: 0.0,
             passed: false,
@@ -134,6 +145,52 @@ mod tests {
 
     fn response(content: &str) -> Value {
         json!({"choices":[{"message":{"content":content}}]})
+    }
+
+    #[test]
+    fn tool_call_response_passes_instead_of_failing_as_empty() {
+        // A tool-calling turn carries `content: null` by design. Treating it
+        // as an empty answer scored every agentic turn 0.0, which forced an
+        // escalation to a weaker tier on every single tool call.
+        let tool_call_response = json!({
+            "choices":[{"message":{
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "grep", "arguments": "{\"pattern\":\"TODO\"}"}
+                }]
+            }}]
+        });
+        let score = deterministic_quality(
+            &chat_request(None),
+            &tool_call_response,
+            &classification(Some(TaskType::Agentic)),
+            &config(0.65),
+        );
+        assert!(score.passed, "tool call must not fail the quality gate");
+        assert_eq!(score.reason, "tool-calls");
+        assert!(score.score >= 0.65);
+
+        // A genuinely empty response must still fail.
+        let empty = deterministic_quality(
+            &chat_request(None),
+            &response(""),
+            &classification(None),
+            &config(0.65),
+        );
+        assert!(!empty.passed);
+        assert_eq!(empty.reason, "empty-content");
+
+        // An empty `tool_calls` array is not a substantive answer either.
+        let empty_calls = deterministic_quality(
+            &chat_request(None),
+            &json!({"choices":[{"message":{"content":null,"tool_calls":[]}}]}),
+            &classification(None),
+            &config(0.65),
+        );
+        assert!(!empty_calls.passed);
+        assert_eq!(empty_calls.reason, "empty-content");
     }
 
     #[test]
