@@ -6,8 +6,19 @@ api_key = ""
 # Per-request timeout in milliseconds, including time spent waiting for a
 # concurrency permit (default: 300000). Lower it only if your slowest
 # tier's generation time is comfortably under it; too low 408s real
-# completions.
+# completions. Also used as the upstream HTTP client's own timeout.
 # request_timeout_ms = 300000
+
+# Blended USD per 1k tokens, used to convert usage into a dollar figure for
+# per-key `monthly_budget_usd` enforcement and for `cost_usd` in the usage
+# report. Unset (the default) means no price is assumed: budget caps are not
+# enforced and every reported cost is 0.00. Set it to a deliberately
+# conservative blended rate -- it is one number for all five tiers, so it
+# over- rather than under-estimates, and a cap is only as good as this figure.
+# Enforced against a per-call `max_tokens` estimate, charged once per
+# successful upstream call (a quality-gate escalation is a second call, and is
+# charged again); rejected calls are not charged.
+# price_per_1k_usd = 0.002
 
 [classifier]
 mode = "jev"

@@ -53,11 +53,24 @@ ApiKey {
   owner: String,
   created_at: u64,             // Unix timestamp
   active: bool,
-  allowed_tiers: Vec<String>,  // future: per-key tier restrictions
-  rate_limit_rpm: Option<u32>, // future: per-key rate limits
-  monthly_budget_usd: Option<f64>, // future: per-key budget
+  allowed_tiers: Vec<String>,  // empty = every tier allowed
+  rate_limit_rpm: Option<u32>, // fixed-window per-minute request cap
+  monthly_budget_usd: Option<f64>, // spend cap; requires `price_per_1k_usd`
 }
 ```
+
+All three are enforced on `/v1/chat/completions`. Budget enforcement converts
+usage to dollars with the top-level `price_per_1k_usd`; with that unset no
+price is assumed, so caps are not enforced and reported `cost_usd` is `0.00`.
+The amount charged is a per-call `max_tokens` estimate, applied once per
+*successful* upstream call — a quality-gate escalation issues a second call and
+is charged again, while a call the provider rejected is not charged. The
+reported figure in `/admin/usage/*` uses the provider's real `usage` block
+instead, summed across every call a request made.
+
+`active` and `expires_at` are set at creation and changeable via
+`PATCH /admin/keys/{id}`; a revoked key (`active: false`) reports `403` rather
+than `401`, and rotating its secret does not reactivate it.
 
 Stored in `/var/lib/miser/keys.json` as `{"keys": [ApiKey, ...]}`.
 
