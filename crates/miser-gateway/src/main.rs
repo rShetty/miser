@@ -45,6 +45,10 @@ const DEFAULT_CONCURRENCY_LIMIT: usize = 64;
 /// minutes, not seconds; operators can still lower it per deployment.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 300_000;
 
+/// Ledger key id used to attribute completions authenticated by the shared
+/// admin key, so that spend shows up in usage reporting instead of vanishing.
+const ADMIN_KEY_ATTRIBUTION_ID: &str = "key_admin";
+
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(long, default_value = "config/miser.toml")]
@@ -483,6 +487,28 @@ async fn completions_inner(
                         StatusCode::UNAUTHORIZED,
                     ));
                 }
+                // The shared admin key is deliberately usable on the data plane
+                // so an operator can smoke-test without minting a key. It is
+                // still real traffic against the operator's upstream account, so
+                // it is attributed to a synthetic key rather than dropped:
+                // leaving this `None` made `record_usage` a no-op, and the spend
+                // was invisible in `/admin/usage/summary`.
+                //
+                // No rate limit, no budget and an empty tier allowlist, so the
+                // quota and gating block below stays a no-op for it -- exactly
+                // as it was when the key was `None`. Only attribution changes.
+                authenticated_key = Some(auth::ApiKey {
+                    id: ADMIN_KEY_ATTRIBUTION_ID.to_owned(),
+                    key_hash: String::new(),
+                    owner: "admin-key".to_owned(),
+                    client: "admin-key".to_owned(),
+                    created_at: unix_now(),
+                    active: true,
+                    allowed_tiers: Vec::new(),
+                    rate_limit_rpm: None,
+                    monthly_budget_usd: None,
+                    expires_at: None,
+                });
             }
         }
     }
@@ -2884,6 +2910,61 @@ mod integration_tests {
         assert!(
             quotas.check_budget(&id, 0.0001),
             "a deleted key must not keep its spend on the books forever"
+        );
+    }
+
+    /// Traffic authenticated by the shared admin key must still be accounted
+    /// for.
+    ///
+    /// The admin key is deliberately accepted on `/v1/chat/completions` so an
+    /// operator can smoke-test without minting a key, but it left
+    /// `authenticated_key` as `None`, and `record_usage` returns immediately on
+    /// `None`. So every such request was served, billed to the operator's
+    /// upstream account, and then vanished: `GET /admin/usage/summary` reported
+    /// `requests: 0, cost_usd: 0.0` for all of it. The untracked spend was
+    /// invisible in the very dashboard built to detect it.
+    ///
+    /// The quota and tier gates are unchanged in effect -- the synthetic key
+    /// carries no rate limit, no budget and no tier allowlist, so all three are
+    /// no-ops, exactly as they were when the key was `None`.
+    #[tokio::test]
+    async fn admin_key_traffic_is_attributed_in_the_usage_ledger() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let mut state = test_state_with_upstream("secret-admin", upstream.base_url.clone());
+        state
+            .config
+            .extra
+            .insert("price_per_1k_usd".into(), json!(0.001));
+        let usage = Arc::clone(&state.usage);
+        let app = build_router(state);
+
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+        let (status, _, body) = send_raw(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some("secret-admin"),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let summary = usage.summarize(None, None, None);
+        assert_eq!(
+            summary.requests, 1,
+            "admin-key traffic must appear in the ledger"
+        );
+        assert!(
+            summary.cost_usd > 0.0,
+            "admin-key traffic must contribute to reported cost, got {}",
+            summary.cost_usd
+        );
+        assert_eq!(
+            summary.by_key.len(),
+            1,
+            "it must be attributed somewhere queryable: {:?}",
+            summary.by_key
         );
     }
 

@@ -212,18 +212,18 @@ impl UsageLedger {
             day_agg.cost_usd += record.cost_usd;
         }
         // Round costs so JSON output stays readable.
-        summary.cost_usd = round2(summary.cost_usd);
+        summary.cost_usd = round_micros(summary.cost_usd);
         for v in summary.by_model.values_mut() {
-            v.cost_usd = round2(v.cost_usd);
+            v.cost_usd = round_micros(v.cost_usd);
         }
         for v in summary.by_key.values_mut() {
-            v.cost_usd = round2(v.cost_usd);
+            v.cost_usd = round_micros(v.cost_usd);
         }
         for v in summary.by_client.values_mut() {
-            v.cost_usd = round2(v.cost_usd);
+            v.cost_usd = round_micros(v.cost_usd);
         }
         for v in summary.by_day.values_mut() {
-            v.cost_usd = round2(v.cost_usd);
+            v.cost_usd = round_micros(v.cost_usd);
         }
         summary
     }
@@ -246,8 +246,17 @@ fn day_of(ts: u64) -> Option<String> {
     Some(format!("{y:04}-{m:02}-{d:02}"))
 }
 
-fn round2(v: f64) -> f64 {
-    (v * 100.0).round() / 100.0
+/// Trim floating-point noise from a reported dollar amount without destroying
+/// small values.
+///
+/// This used to round to whole cents, which silently reported any bucket under
+/// half a cent as `$0.00` -- and a single cheap completion costs a small
+/// fraction of a cent, so per-request, per-model, per-key, per-client and
+/// per-day costs all read as free. Six decimals keeps the sums free of
+/// `0.30000000000000004`-style artefacts while staying far below the precision
+/// any real spend is quoted at.
+fn round_micros(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
 }
 
 #[cfg(test)]
@@ -305,11 +314,20 @@ mod tests {
         assert_eq!(summary.requests, 3);
         assert_eq!(summary.prompt_tokens, 300);
         assert_eq!(summary.completion_tokens, 150);
+        // Reported to micro-dollar precision, not whole cents: 0.111 + 0.111 +
+        // 1.0 is 1.222, and truncating it to 1.22 would both lose real spend
+        // and, at the small end of the range, report a whole request as free.
         assert!(
-            (summary.cost_usd - 1.22).abs() < 1e-9,
-            "cost rounded to 2dp: {}",
+            (summary.cost_usd - 1.222).abs() < 1e-9,
+            "cost should keep micro-dollar precision: {}",
             summary.cost_usd
         );
+        // Float noise is still trimmed: 0.1 + 0.2 must not serialise as
+        // 0.30000000000000004.
+        let noisy = UsageLedger::new(temp_path("noise"));
+        noisy.record(&record(1, "k", "c", "m", "t", 0.1));
+        noisy.record(&record(2, "k", "c", "m", "t", 0.2));
+        assert_eq!(noisy.summarize(None, None, None).cost_usd, 0.3);
 
         // Attribution uses the serving model; requested_model is carried on
         // the record but never merged into by_model buckets.
@@ -503,6 +521,42 @@ mod tests {
         let summary = ledger.summarize(None, None, None);
         assert_eq!(summary.requests, 2, "good records must survive");
         assert!((summary.cost_usd - 4.0).abs() < 1e-9);
+        let _ = std::fs::remove_file(&path);
+    }
+    /// Sub-cent spend must not be rounded away to zero.
+    ///
+    /// Every cost in the summary was passed through `round2`, which rounds to
+    /// whole cents. A single cheap request costs a fraction of a cent -- 3
+    /// prompt + 5 completion tokens at $0.001/1k is $0.000008 -- so
+    /// `(0.000008 * 100).round() / 100` is `0.0` and the report said the request
+    /// cost nothing. The same applied to every per-model, per-key, per-client
+    /// and per-day bucket, so any bucket under half a cent was reported as
+    /// $0.00 and cost attribution quietly stopped working for exactly the
+    /// small-spend case it is most needed for.
+    #[test]
+    fn sub_cent_costs_are_preserved_in_the_rollup() {
+        let path = temp_path("subcent");
+        let ledger = UsageLedger::new(path.clone());
+        ledger.record(&record(1, "k", "c", "m/one", "simple", 0.000008));
+        ledger.record(&record(2, "k", "c", "m/one", "simple", 0.000004));
+
+        let summary = ledger.summarize(None, None, None);
+        assert!(
+            summary.cost_usd > 0.0,
+            "a fraction of a cent must not round to zero"
+        );
+        assert!(
+            (summary.cost_usd - 0.000012).abs() < 1e-9,
+            "got {}",
+            summary.cost_usd
+        );
+        for (label, value) in [
+            ("by_model", summary.by_model["m/one"].cost_usd),
+            ("by_key", summary.by_key["k"].cost_usd),
+            ("by_client", summary.by_client["c"].cost_usd),
+        ] {
+            assert!(value > 0.0, "{label} must not round to zero, got {value}");
+        }
         let _ = std::fs::remove_file(&path);
     }
 }
