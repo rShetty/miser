@@ -34,7 +34,8 @@ curl -fsS http://127.0.0.1:8787/metrics
 | `miser_request_duration_seconds` | `route` | Request latency histogram |
 | `miser_tier_requests_total` | `tier` | Requests served per effective classification tier |
 | `miser_cache_hits_total` / `miser_cache_misses_total` | — | Exact-match response cache outcomes |
-| `miser_quality_escalations_total` | — | Requests escalated above the classifier's original tier |
+| `miser_quality_escalations_total` | — | Responses the Jev quality gate rejected and retried one tier up |
+| `miser_tier_floors_total` | — | Requests whose tier was raised by a pre-flight floor (tools, low confidence, structured output, agentic task, tool history); no quality check runs |
 | `miser_upstream_errors_total` | — | Failed or errored upstream provider responses |
 
 Scrape example for Prometheus:

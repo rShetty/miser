@@ -618,7 +618,12 @@ async fn completions_inner(
         .with_label_values(&[&format_tier(effective_tier)])
         .inc();
     if effective_tier > classification.tier {
-        state.metrics.quality_escalations_total.inc();
+        // A pre-flight floor, not a quality decision. This must not touch
+        // `quality_escalations_total`: agentic traffic floors to Hard by
+        // construction, so folding these in made that counter report the
+        // judge as active on requests it never graded, and double-counted
+        // the ones that genuinely were escalated.
+        state.metrics.tier_floors_total.inc();
     }
     // Per-key tier gating: an empty allowlist means all tiers are allowed.
     if let Some(key) = &authenticated_key {
@@ -1889,6 +1894,60 @@ mod integration_tests {
             upstream.requests().await.len(),
             1,
             "the rewrite must not have reached the upstream"
+        );
+    }
+
+    /// A pre-flight tier floor is not a quality escalation.
+    ///
+    /// `effective_tier` raises the tier for tools, low confidence,
+    /// `response_format`, an agentic task, or tool history -- none of which
+    /// involve the quality gate. Those requests used to increment
+    /// `miser_quality_escalations_total`, so the counter meant "tier was
+    /// raised" rather than "the Jev judge rejected a response", and
+    /// double-counted the requests that genuinely were escalated. Agentic
+    /// traffic floors to Hard by construction, so the metric was dominated by
+    /// requests no judge ever saw.
+    #[tokio::test]
+    async fn tier_floor_does_not_count_as_a_quality_escalation() {
+        let upstream = spawn_mock_upstream(
+            Duration::from_millis(0),
+            StatusCode::OK,
+            "application/json",
+            None,
+        )
+        .await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        // Keep the quality gate off so nothing can escalate for real: this
+        // test is only about the floor path.
+        state.config.quality.enabled = false;
+        let app = build_router(state);
+
+        // A trivial-sounding prompt that nevertheless carries a tool, so
+        // policy floors the tier above the classifier's.
+        let payload = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "noop"}}]
+        });
+        let (status, _, body) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            None,
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let (_, _, metrics) = send_raw(app, "GET", "/metrics", None, None).await;
+        let metrics = String::from_utf8_lossy(&metrics);
+        assert!(
+            metrics.contains("miser_tier_floors_total 1"),
+            "the tool floor should be recorded as a floor:\n{metrics}"
+        );
+        assert!(
+            metrics.contains("miser_quality_escalations_total 0"),
+            "a tier floor must not be reported as a quality escalation:\n{metrics}"
         );
     }
 

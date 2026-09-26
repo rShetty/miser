@@ -27,8 +27,14 @@ pub struct Metrics {
     pub semantic_hits_total: IntCounter,
     /// Response cache misses.
     pub cache_misses_total: IntCounter,
-    /// Requests escalated above the classifier's original tier.
+    /// Responses the Jev quality gate rejected, which were then retried one
+    /// tier up. Counts only real gate escalations, so it measures the judge.
     pub quality_escalations_total: IntCounter,
+    /// Requests whose tier was raised above the classifier's tier by a
+    /// pre-flight floor (tools, low confidence, structured output, agentic
+    /// task, tool history). No quality check runs for these, so they are
+    /// deliberately kept out of `quality_escalations_total`.
+    pub tier_floors_total: IntCounter,
     /// Failed or errored upstream provider responses.
     pub upstream_errors_total: IntCounter,
     /// Times a catalog tier's active model was swapped for the next
@@ -70,7 +76,11 @@ impl Metrics {
         )?;
         let quality_escalations_total = IntCounter::new(
             "miser_quality_escalations_total",
-            "Requests escalated above the classifier's original tier.",
+            "Responses the Jev quality gate rejected, which were then retried one tier up.",
+        )?;
+        let tier_floors_total = IntCounter::new(
+            "miser_tier_floors_total",
+            "Requests whose tier was raised above the classifier's tier by a pre-flight floor (tools, low confidence, structured output, agentic task, tool history).",
         )?;
         let upstream_errors_total = IntCounter::new(
             "miser_upstream_errors_total",
@@ -88,6 +98,7 @@ impl Metrics {
         registry.register(Box::new(cache_misses_total.clone()))?;
         registry.register(Box::new(semantic_hits_total.clone()))?;
         registry.register(Box::new(quality_escalations_total.clone()))?;
+        registry.register(Box::new(tier_floors_total.clone()))?;
         registry.register(Box::new(upstream_errors_total.clone()))?;
         registry.register(Box::new(catalog_failovers_total.clone()))?;
 
@@ -100,6 +111,7 @@ impl Metrics {
             cache_misses_total,
             semantic_hits_total,
             quality_escalations_total,
+            tier_floors_total,
             upstream_errors_total,
             catalog_failovers_total,
         })
@@ -215,6 +227,27 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("miser_catalog_failovers_total 1"), "{text}");
+    }
+
+    #[test]
+    fn tier_floor_counter_is_distinct_from_quality_escalations() {
+        // A pre-flight floor (tools, low confidence, structured output,
+        // agentic task, tool history) raises the tier without any quality
+        // check running. Counting those as quality escalations made
+        // `miser_quality_escalations_total` meaningless for the Jev gate:
+        // agentic traffic floors to Hard by construction, so nearly every
+        // request incremented it while the judge never graded anything.
+        let metrics = Metrics::new().unwrap();
+        metrics.tier_floors_total.inc();
+        metrics.tier_floors_total.inc();
+        metrics.tier_floors_total.inc();
+        let text = metrics.render().unwrap();
+        assert!(text.contains("# HELP miser_tier_floors_total"), "{text}");
+        assert!(text.contains("miser_tier_floors_total 3"), "{text}");
+        assert!(
+            text.contains("miser_quality_escalations_total 0"),
+            "floors must not touch the quality counter:\n{text}"
+        );
     }
 
     #[test]
