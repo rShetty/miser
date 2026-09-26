@@ -786,14 +786,25 @@ async fn completions_inner(
                             if let Ok(escalated_upstream) =
                                 state.provider.forward(escalated_body, None).await
                             {
-                                if escalated_upstream.status().is_success() {
-                                    // Read the retry's own status and headers
-                                    // before consuming the body, so they can
-                                    // replace the first attempt's if this
-                                    // response is the one we serve.
-                                    let escalated_status = escalated_upstream.status();
-                                    let escalated_headers =
-                                        safe_response_headers(escalated_upstream.headers());
+                                // The retry's status and headers are read
+                                // before the success guard, not inside it: a
+                                // failing retry previously fell out of this
+                                // block entirely, so nothing about it was
+                                // reported. The retry is a real upstream call
+                                // against a *different* tier's active model, so
+                                // without this the model the gateway escalated
+                                // to could never accumulate failures and never
+                                // fail over, however many escalating requests it
+                                // broke -- every one of them burning a first
+                                // attempt plus a failing escalation.
+                                let escalated_status = escalated_upstream.status();
+                                let escalated_headers =
+                                    safe_response_headers(escalated_upstream.headers());
+                                state.report_upstream_outcome(
+                                    escalated_tier,
+                                    Some(escalated_status),
+                                );
+                                if escalated_status.is_success() {
                                     if let Ok(escalated_payload) = escalated_upstream.bytes().await
                                     {
                                         // The retry was really made and really
@@ -1541,6 +1552,19 @@ mod integration_tests {
         test_state_with_upstream(admin_key, "http://127.0.0.1:9".to_string())
     }
 
+    /// [`test_state_with_upstream`] with the config adjusted before the
+    /// `AppState` is assembled. Needed for anything the state builds eagerly
+    /// from config -- notably the catalog router, whose snapshot is loaded in
+    /// `test_state_with_upstream` itself, so mutating `config.routing` after
+    /// the fact would have no effect.
+    fn test_state_with(
+        admin_key: &str,
+        base_url: String,
+        tune: impl FnOnce(&mut GatewayConfig),
+    ) -> AppState {
+        test_state_tuned(admin_key, base_url, tune)
+    }
+
     /// A per-call unique scratch file under the temp dir.
     ///
     /// Uniqueness comes from a process-wide atomic counter, NOT from a
@@ -1589,6 +1613,15 @@ mod integration_tests {
     /// [`test_state`] pointed at a live upstream base_url, for
     /// end-to-end completions tests that exercise the real request path.
     fn test_state_with_upstream(admin_key: &str, base_url: String) -> AppState {
+        test_state_tuned(admin_key, base_url, |_| {})
+    }
+
+    /// The real implementation behind the two helpers above.
+    fn test_state_tuned(
+        admin_key: &str,
+        base_url: String,
+        tune: impl FnOnce(&mut GatewayConfig),
+    ) -> AppState {
         let mut config: GatewayConfig = serde_json::from_value(json!({
             "host": "127.0.0.1",
             "port": 0,
@@ -1605,6 +1638,7 @@ mod integration_tests {
         }))
         .expect("test config parses");
         config.session.enabled = false;
+        tune(&mut config);
         let keys_file = unique_temp_path("miser_test_keys", "json");
         let usage_file = unique_temp_path("miser_test_usage", "jsonl");
         let audit_file = unique_temp_path("miser_test_audit", "jsonl");
@@ -1753,7 +1787,35 @@ mod integration_tests {
         content_type: &'static str,
         body_text: Option<String>,
     ) -> MockUpstream {
-        spawn_mock_upstream_inner(delay, status, content_type, body_text, false).await
+        spawn_mock_upstream_inner(
+            delay,
+            status,
+            content_type,
+            body_text,
+            MockBehaviour::default(),
+        )
+        .await
+    }
+
+    /// As [`spawn_mock_upstream`], but every call from the `fail_from_call`-th
+    /// onwards answers `503`. Lets a test make the *first* upstream call succeed
+    /// and a later one -- a quality-gate escalation -- fail.
+    async fn spawn_mock_upstream_failing_after(
+        first_calls: u64,
+        content_type: &'static str,
+        body_text: Option<String>,
+    ) -> MockUpstream {
+        spawn_mock_upstream_inner(
+            Duration::ZERO,
+            StatusCode::OK,
+            content_type,
+            body_text,
+            MockBehaviour {
+                fail_from_call: Some(first_calls),
+                tag_calls: false,
+            },
+        )
+        .await
     }
 
     /// As [`spawn_mock_upstream`], but every reply also carries a distinct
@@ -1767,7 +1829,25 @@ mod integration_tests {
         content_type: &'static str,
         body_text: Option<String>,
     ) -> MockUpstream {
-        spawn_mock_upstream_inner(delay, status, content_type, body_text, true).await
+        spawn_mock_upstream_inner(
+            delay,
+            status,
+            content_type,
+            body_text,
+            MockBehaviour {
+                fail_from_call: None,
+                tag_calls: true,
+            },
+        )
+        .await
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct MockBehaviour {
+        /// Answer 503 from this call index onwards.
+        fail_from_call: Option<u64>,
+        /// Stamp a per-call `x-request-id`.
+        tag_calls: bool,
     }
 
     async fn spawn_mock_upstream_inner(
@@ -1775,7 +1855,7 @@ mod integration_tests {
         status: StatusCode,
         content_type: &'static str,
         body_text: Option<String>,
-        tag_calls: bool,
+        behaviour: MockBehaviour,
     ) -> MockUpstream {
         let requests: Arc<tokio::sync::Mutex<Vec<Value>>> = Arc::default();
         let call_index = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1797,6 +1877,18 @@ mod integration_tests {
                     let call = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     capture.lock().await.push(body);
                     tokio::time::sleep(delay).await;
+                    if behaviour.fail_from_call.is_some_and(|from| call >= from) {
+                        let payload = json!({
+                            "error": {"message": "upstream unavailable", "code": 503}
+                        })
+                        .to_string();
+                        let mut headers = axum::http::HeaderMap::new();
+                        headers.insert(
+                            axum::http::header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        );
+                        return (StatusCode::SERVICE_UNAVAILABLE, headers, payload);
+                    }
                     let text = fixed_body.unwrap_or_else(|| {
                         serde_json::to_string(&json!({
                             "id": "mock-completion",
@@ -1816,7 +1908,7 @@ mod integration_tests {
                         axum::http::header::CONTENT_TYPE,
                         HeaderValue::from_static(content_type),
                     );
-                    if tag_calls {
+                    if behaviour.tag_calls {
                         headers.insert(
                             "x-request-id",
                             HeaderValue::from_str(&format!("mock-call-{call}")).unwrap(),
@@ -2548,6 +2640,74 @@ mod integration_tests {
         let key: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(key["active"], json!(false), "still revoked");
         assert_eq!(key["expires_at"], json!(1), "expiry was recorded");
+    }
+
+    /// A failing quality-gate escalation must count against the catalog
+    /// failover machinery.
+    ///
+    /// `report_upstream_outcome` was only ever called for the *first* attempt.
+    /// The escalated retry is a real upstream call that can fail on its own --
+    /// and it runs against a different, more expensive tier's active model --
+    /// yet its outcome was discarded. So the model the gateway escalated *to*
+    /// could never accumulate failures and could never fail over, no matter how
+    /// many escalating requests it broke. Every one of those requests kept
+    /// burning a first attempt plus a failing escalation against a model the
+    /// failover logic was supposed to protect.
+    #[tokio::test]
+    async fn failed_escalation_is_reported_to_the_failover_counter() {
+        // First call succeeds, the escalation (second call) fails with 503.
+        let upstream = spawn_mock_upstream_failing_after(1, "application/json", None).await;
+        let app = build_router(test_state_with(
+            "secret-admin",
+            upstream.base_url.clone(),
+            |config| {
+                config.routing.mode = miser_types::RoutingMode::Catalog;
+                config.routing.failover_threshold = 1;
+                config.quality.enabled = true;
+                config.quality.minimum_score = 0.99;
+                config.quality.escalate_on_failure = true;
+            },
+        ));
+
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+        // An admin key is configured, so the completions path is no longer in
+        // open-access mode and the request must authenticate.
+        let (status, _, body) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some("secret-admin"),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            upstream.requests().await.len(),
+            2,
+            "the gate should have escalated, and the retry should have failed"
+        );
+
+        let (status, _, body) =
+            send_raw(app, "GET", "/admin/catalog", Some("secret-admin"), None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let catalog: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            catalog["enabled"],
+            json!(true),
+            "catalog routing must be on"
+        );
+        let simple = catalog["tiers"]
+            .as_array()
+            .expect("tiers array")
+            .iter()
+            .find(|tier| tier["tier"] == json!("simple"))
+            .expect("simple tier present")
+            .clone();
+        assert_eq!(
+            simple["consecutive_failures"],
+            json!(1),
+            "the escalated call's 503 must be counted against the escalated tier: {simple}"
+        );
     }
 
     /// A configured `request_timeout_ms` must still bound the request and
