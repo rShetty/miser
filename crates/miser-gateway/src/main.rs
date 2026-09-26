@@ -1399,6 +1399,51 @@ mod integration_tests {
         test_state_with_upstream(admin_key, "http://127.0.0.1:9".to_string())
     }
 
+    /// A per-call unique scratch file under the temp dir.
+    ///
+    /// Uniqueness comes from a process-wide atomic counter, NOT from a
+    /// wall-clock timestamp. Tests share a process and run in parallel, and
+    /// `SystemTime::now()` on a coarse-granularity clock (common in
+    /// containers and VMs) returns the *same* nanosecond reading to two
+    /// threads that ask within the same tick. That made two tests pick the
+    /// same keys file, so a key created by one test turned up in the other
+    /// test's `AuthManager` and an unrelated test intermittently failed with
+    /// `401 invalid API key`. A counter is race-free by construction.
+    fn unique_temp_path(prefix: &str, extension: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}_{}_{n}.{extension}", std::process::id()))
+    }
+
+    /// The keys/usage/audit files are only isolated if `unique_temp_path` is,
+    /// so pin that guarantee directly instead of waiting for the suite to trip
+    /// over a collision at random.
+    #[test]
+    fn scratch_paths_are_unique_under_concurrency() {
+        use std::collections::HashSet;
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..64)
+                        .map(|_| unique_temp_path("miser_test_keys", "json"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        for handle in handles {
+            for path in handle.join().expect("scratch path thread") {
+                assert!(
+                    seen.insert(path.clone()),
+                    "unique_temp_path handed out a duplicate: {}",
+                    path.display()
+                );
+            }
+        }
+        assert_eq!(seen.len(), 8 * 64);
+    }
+
     /// [`test_state`] pointed at a live upstream base_url, for
     /// end-to-end completions tests that exercise the real request path.
     fn test_state_with_upstream(admin_key: &str, base_url: String) -> AppState {
@@ -1418,14 +1463,9 @@ mod integration_tests {
         }))
         .expect("test config parses");
         config.session.enabled = false;
-        let keys_file = std::env::temp_dir().join(format!(
-            "miser_test_keys_{}_{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let keys_file = unique_temp_path("miser_test_keys", "json");
+        let usage_file = unique_temp_path("miser_test_usage", "jsonl");
+        let audit_file = unique_temp_path("miser_test_audit", "jsonl");
         AppState {
             classifier: Arc::new(Classifier::new(config.classifier.clone()).unwrap()),
             policy: PolicyEngine::new(config.clone()),
@@ -1439,23 +1479,9 @@ mod integration_tests {
             session: Arc::new(session::SessionTracker::new(100, 60)),
             auth: Arc::new(auth::AuthManager::new(keys_file)),
             quotas: Arc::new(auth::QuotaEnforcer::new()),
-            usage: Arc::new(usage::UsageLedger::new(std::env::temp_dir().join(format!(
-                "miser_test_usage_{}_{}.jsonl",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            )))),
+            usage: Arc::new(usage::UsageLedger::new(usage_file)),
             metrics: Arc::new(metrics::Metrics::new().unwrap()),
-            audit: Arc::new(auth::AuditLog::new(std::env::temp_dir().join(format!(
-                "miser_test_audit_{}_{}.jsonl",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            )))),
+            audit: Arc::new(auth::AuditLog::new(audit_file)),
             catalog: Arc::new(catalog::CatalogRouter::load_or_seed(&config)),
             semantic_cache: Arc::new(semantic_cache::SemanticCache::new(
                 config.cache.max_entries,
