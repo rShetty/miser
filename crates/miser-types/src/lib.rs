@@ -35,9 +35,28 @@ pub struct ImageUrl {
     pub extra: ExtraFields,
 }
 
+/// OpenAI-compatible clients send `content: null` on assistant messages that
+/// carry only `tool_calls`. `MessageContent` has no null variant, so axum's
+/// `Json` extractor rejected the whole request with 422 before any routing
+/// happened. Treat null and an absent `content` as empty text.
+fn default_content() -> MessageContent {
+    MessageContent::Text(String::new())
+}
+
+fn deserialize_content<'de, D>(deserializer: D) -> Result<MessageContent, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(default_content()),
+        Some(value) => serde_json::from_value(value).map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default = "default_content", deserialize_with = "deserialize_content")]
     pub content: MessageContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -706,6 +725,41 @@ mod tests {
             serde_json::from_value(json!([{"type":"text","text":"hi"}])).unwrap();
         assert!(matches!(parts, MessageContent::Parts(_)));
         assert_eq!(serde_json::to_value(&text).unwrap(), json!("hello"));
+    }
+
+    #[test]
+    fn assistant_tool_call_message_with_null_content_decodes() {
+        // OpenCode, Claude Code, and other OpenAI-compatible clients send
+        // `content: null` when an assistant turn carries only tool_calls.
+        // Before this was accepted, axum's Json extractor rejected the whole
+        // request with 422 and the gateway never routed it.
+        let raw = json!({
+            "model": "auto",
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "file body"}
+            ]
+        });
+        let request: ChatCompletionRequest =
+            serde_json::from_value(raw).expect("null content must decode");
+        assert_eq!(request.messages.len(), 3);
+        assert_eq!(request.messages[1].content, MessageContent::Text(String::new()));
+        assert!(request.messages[1].tool_calls.is_some());
+        assert_eq!(request.messages[2].role, "tool");
+
+        // An absent content key is equally valid.
+        let absent: ChatMessage =
+            serde_json::from_value(json!({"role": "assistant"})).unwrap();
+        assert_eq!(absent.content, MessageContent::Text(String::new()));
     }
 
     #[test]
