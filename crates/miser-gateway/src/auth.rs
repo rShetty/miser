@@ -801,6 +801,23 @@ impl QuotaEnforcer {
         }
         entry.1 += amount_usd;
     }
+
+    /// Drop all quota state for a key.
+    ///
+    /// Without this, `windows` and `spend` only ever grew: entries were
+    /// inserted by `or_insert` and never removed, and `delete_key` reaches
+    /// `AuthManager`, which has no handle on the enforcer. Every key id that
+    /// ever carried a rate limit or ever spent money would leave an entry
+    /// behind for the life of the process, and a recycled id would inherit a
+    /// stranger's spend and rate-limit window.
+    pub fn forget(&self, key_id: &str) {
+        if let Ok(mut windows) = self.windows.lock() {
+            windows.remove(key_id);
+        }
+        if let Ok(mut spend) = self.spend.lock() {
+            spend.remove(key_id);
+        }
+    }
 }
 
 #[cfg(test)]

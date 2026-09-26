@@ -1402,6 +1402,9 @@ async fn delete_key(
     }
     match state.auth.delete_key(&id) {
         Ok(_) => {
+            // The key is gone, so its rate-limit window and accumulated spend
+            // must go with it rather than lingering for the life of the process.
+            state.quotas.forget(&id);
             let actor = state.admin_actor(&headers);
             let _ = state
                 .audit
@@ -2824,6 +2827,62 @@ mod integration_tests {
                 "window={unknown:?} must fall back to a bounded window"
             );
         }
+    }
+
+    /// Deleting a key must release its quota state.
+    ///
+    /// `QuotaEnforcer`'s `windows` and `spend` maps only ever grew -- entries
+    /// were inserted by `or_insert` and never removed. `delete_key` reaches
+    /// `AuthManager`, which has no handle on the enforcer, so every key id that
+    /// ever carried a rate limit or ever spent money left a permanent entry
+    /// behind for the life of the process. On a long-lived gateway that issues
+    /// per-tenant keys the maps grow monotonically, and a recycled id would
+    /// inherit a stranger's spend and rate-limit window.
+    #[tokio::test]
+    async fn deleting_a_key_releases_its_quota_state() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let mut state = test_state_with_upstream("secret-admin", upstream.base_url.clone());
+        state
+            .config
+            .extra
+            .insert("price_per_1k_usd".into(), json!(0.001));
+        let (id, raw) = state
+            .auth
+            .create_key_full("ephemeral", "-", vec![], None, Some(0.0001), None)
+            .unwrap();
+        let quotas = Arc::clone(&state.quotas);
+        let app = build_router(state);
+
+        // One request exhausts the (deliberately tiny) cap.
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !quotas.check_budget(&id, 0.0001),
+            "the cap should be exhausted before the delete"
+        );
+
+        let (status, _, body) = send_raw(
+            app,
+            "DELETE",
+            &format!("/admin/keys/{id}"),
+            Some("secret-admin"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert!(
+            quotas.check_budget(&id, 0.0001),
+            "a deleted key must not keep its spend on the books forever"
+        );
     }
 
     /// A configured `request_timeout_ms` must still bound the request and
