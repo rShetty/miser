@@ -122,12 +122,16 @@ model = "openai/gpt-4.1-mini"
 max_tokens = 1536
 
 [tiers.hard]
-# Jev-judged SE bake-off (2026-09-20): gpt-4.1-mini 2.70/4 mean on hard
-# cases vs claude-sonnet-4 2.19 — mini wins this corpus at 15x lower price.
-model = "openai/gpt-4.1-mini"
-max_tokens = 3072
+# Was gpt-4.1-mini, chosen by a 2026-09-20 Jev bake-off on *static* SE
+# prompts. That corpus does not measure multi-step tool use, and in
+# practice the model produced no-op edits on real agentic tasks. Hard
+# tier is where coding-agent traffic lands, so quality wins here.
+model = "anthropic/claude-sonnet-5"
+max_tokens = 8192
 
 [tiers.reasoning]
 # glm-5.2 scored 0.0 on every SE reasoning case (Jev judge) — disqualified.
-model = "openai/gpt-4.1-mini"
-max_tokens = 3072
+# A stale catalog snapshot also pinned this tier to a "flash" model until
+# the escalation path learned to respect `fixed` mode.
+model = "anthropic/claude-sonnet-5"
+max_tokens = 8192
