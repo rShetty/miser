@@ -673,27 +673,19 @@ async fn completions_inner(
     state.report_upstream_outcome(effective_tier, Some(upstream_status));
     let selected_route = route.clone();
     if !stream_requested && upstream.status().is_success() {
-        // Record estimated spend for per-key budget enforcement when the
-        // operator configured a blended price (USD per 1k tokens).
+        // Charge the first upstream call to the key's budget. An escalation
+        // below issues a second real call and is charged again, so a
+        // quality-gated request is never silently free.
         if let Some(key) = &authenticated_key {
-            if let Some(price) = state
-                .config
-                .extra
-                .get("price_per_1k_usd")
-                .and_then(Value::as_f64)
-            {
-                // Usage is parsed from the buffered payload below; a cheap
-                // estimate from max_tokens keeps accounting monotonic even
-                // when usage fields are absent.
-                let est_tokens = request.max_tokens.unwrap_or(512) as f64;
-                state
-                    .quotas
-                    .record_spend(&key.id, est_tokens / 1000.0 * price);
-            }
+            charge_budget(&state, key, estimated_call_tokens(&request));
         }
         let original_status = upstream.status();
         let original_headers = safe_response_headers(upstream.headers());
         let payload = upstream.bytes().await.map_err(internal)?;
+        // Captured now, before the quality gate can replace `payload` with an
+        // escalated response. Every successful upstream call is billed, so
+        // the discarded attempt's tokens must not be lost.
+        let mut settled_usage = usage_tokens(&payload);
         // Quality gate: deterministic checks first, then the Jev judge
         // when configured ("Jev decides"), then one bounded escalation to
         // the next tier when the score is below threshold. The better of
@@ -778,6 +770,22 @@ async fn completions_inner(
                                 if escalated_upstream.status().is_success() {
                                     if let Ok(escalated_payload) = escalated_upstream.bytes().await
                                     {
+                                        // The retry was really made and really
+                                        // billed, whether or not its answer is
+                                        // the one we end up serving, so charge
+                                        // and accumulate it here rather than
+                                        // inside the keep-or-discard branch.
+                                        if let Some(key) = &authenticated_key {
+                                            charge_budget(
+                                                &state,
+                                                key,
+                                                estimated_call_tokens(&request),
+                                            );
+                                        }
+                                        let (escalated_prompt, escalated_completion) =
+                                            usage_tokens(&escalated_payload);
+                                        settled_usage.0 += escalated_prompt;
+                                        settled_usage.1 += escalated_completion;
                                         let escalated_score = if let Some(judge) =
                                             state.quality_judge.as_ref()
                                         {
@@ -833,25 +841,18 @@ async fn completions_inner(
                 );
             }
         }
-        // Real usage from the provider response, attributed to the key.
-        let usage = serde_json::from_slice::<Value>(&payload)
-            .ok()
-            .and_then(|body| body.get("usage").cloned())
-            .unwrap_or(Value::Null);
+        // Real usage from every upstream call this request made, attributed
+        // to the key. `settled_usage` already sums a quality-gate escalation's
+        // discarded attempt, so re-parsing the final payload here would drop
+        // it and under-report the client's actual spend.
         record_usage(
             &state,
             authenticated_key.as_ref(),
             &selected_route.model,
             &requested_model,
             &format_tier(effective_tier),
-            usage
-                .get("prompt_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            usage
-                .get("completion_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            settled_usage.0,
+            settled_usage.1,
             started.elapsed(),
             false,
             original_status.as_u16(),
@@ -911,17 +912,20 @@ async fn completions_inner(
     let status = upstream.status();
     let safe_headers = safe_response_headers(upstream.headers());
     let stream = upstream.bytes_stream();
-    // Streaming: token counts arrive inside the stream, so record the same
-    // monotonic estimate the budget enforcer uses.
-    if authenticated_key.is_some() {
+    // Streaming: token counts arrive inside the stream, so charge and record
+    // the same monotonic estimate the non-streaming path uses. The charge is
+    // what makes a monthly budget cap mean anything -- without it a client
+    // could set `stream: true` and spend without limit.
+    if let Some(key) = &authenticated_key {
+        charge_budget(&state, key, estimated_call_tokens(&request));
         record_usage(
             &state,
-            authenticated_key.as_ref(),
+            Some(key),
             &selected_route.model,
             &requested_model,
             &format_tier(effective_tier),
             0,
-            request.max_tokens.unwrap_or(512) as u64,
+            estimated_call_tokens(&request) as u64,
             started.elapsed(),
             false,
             status.as_u16(),
@@ -1014,6 +1018,52 @@ fn record_usage(
         status,
         request_id: request_id.to_string(),
     });
+}
+
+/// `usage.prompt_tokens` / `usage.completion_tokens` from a provider payload,
+/// defaulting to 0 when the provider reported no usage block.
+fn usage_tokens(payload: &[u8]) -> (u64, u64) {
+    serde_json::from_slice::<Value>(payload)
+        .ok()
+        .and_then(|body| body.get("usage").cloned())
+        .map(|usage| {
+            (
+                usage
+                    .get("prompt_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                usage
+                    .get("completion_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0))
+}
+
+/// Conservative token estimate for one upstream call, used for budget
+/// enforcement. Real usage is not available until the body has been read, and
+/// a budget cap is a safety mechanism that should over- rather than
+/// under-charge, so this mirrors the long-standing `max_tokens` convention.
+fn estimated_call_tokens(request: &ChatCompletionRequest) -> f64 {
+    request.max_tokens.unwrap_or(512) as f64
+}
+
+/// Charge one upstream call against a key's monthly budget. No-op unless the
+/// operator configured a blended `price_per_1k_usd`.
+///
+/// Called once per *successful upstream call*, not once per client request: a
+/// quality-gate escalation issues a second real call, and that money is spent
+/// whether or not the escalated answer is the one served.
+fn charge_budget(state: &AppState, key: &auth::ApiKey, tokens: f64) {
+    if let Some(price) = state
+        .config
+        .extra
+        .get("price_per_1k_usd")
+        .and_then(Value::as_f64)
+    {
+        state.quotas.record_spend(&key.id, tokens / 1000.0 * price);
+    }
 }
 
 /// Parse a reporting window query value ("24h" | "7d" | "30d" | "all")
@@ -1948,6 +1998,156 @@ mod integration_tests {
         assert!(
             metrics.contains("miser_quality_escalations_total 0"),
             "a tier floor must not be reported as a quality escalation:\n{metrics}"
+        );
+    }
+
+    /// A quality-gate escalation issues a *second* real upstream call, and
+    /// both calls cost money. Neither was accounted for correctly:
+    ///
+    /// - The budget enforcer was charged once, before the gate ran, so the
+    ///   escalated call -- the expensive one, at a higher tier -- was free.
+    ///   The cap under-counted exactly when the gate was doing its job.
+    /// - The usage ledger parsed `usage` from the *final* payload only, so
+    ///   the discarded first call's tokens and cost vanished from per-key and
+    ///   per-client spend rollups.
+    ///
+    /// Both calls are now charged, and the ledger sums their real usage
+    /// while still writing one record per client request (so request counts
+    /// stay correct).
+    #[tokio::test]
+    async fn escalated_request_charges_and_records_both_upstream_calls() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state
+            .config
+            .extra
+            .insert("price_per_1k_usd".into(), json!(0.001));
+        // Force the gate to reject and escalate. No judge is configured, so
+        // `deterministic_quality` decides: the mock's "mock reply" scores
+        // 0.65, which is below this threshold.
+        state.config.quality.enabled = true;
+        state.config.quality.minimum_score = 0.99;
+        state.config.quality.escalate_on_failure = true;
+
+        let (key_id, raw) = state
+            .auth
+            .create_key_full("escalating", "-", vec![], None, None, None)
+            .unwrap();
+        let quotas = Arc::clone(&state.quotas);
+        let usage = Arc::clone(&state.usage);
+        let app = build_router(state);
+
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+        let (status, headers, body) = send_raw(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            headers
+                .get("x-miser-escalated")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "the gate should have escalated this request"
+        );
+        assert_eq!(
+            upstream.requests().await.len(),
+            2,
+            "an escalation must issue a second upstream call"
+        );
+
+        // The mock reports 3 prompt / 5 completion tokens per call, so both
+        // calls together are 6 / 10. Recording only the escalated payload
+        // would report half of that.
+        let summary = usage.summarize(None, Some(&key_id), None);
+        assert_eq!(
+            summary.requests, 1,
+            "one client request is one ledger record, even when it cost two calls"
+        );
+        assert_eq!(
+            summary.prompt_tokens, 6,
+            "the discarded first call's prompt tokens must still be billed"
+        );
+        assert_eq!(
+            summary.completion_tokens, 10,
+            "the discarded first call's completion tokens must still be billed"
+        );
+
+        // Each call is charged the conservative max_tokens estimate, so the
+        // key's recorded spend must have doubled. A cap above one call's
+        // charge but below two must therefore now read as exhausted.
+        assert!(
+            !quotas.check_budget(&key_id, 0.0008),
+            "the escalated call was not charged to the budget"
+        );
+    }
+
+    /// Streaming must not be a way to spend for free.
+    ///
+    /// Budget enforcement lived entirely inside the non-streaming branch, so a
+    /// client that set `stream: true` was recorded in the usage ledger but
+    /// never charged. A key with a `monthly_budget_usd` cap could therefore
+    /// issue unlimited streaming requests and never exhaust it. The comment on
+    /// the streaming `record_usage` call even claimed it recorded "the same
+    /// monotonic estimate the budget enforcer uses", which was not true.
+    #[tokio::test]
+    async fn streaming_requests_are_charged_to_the_monthly_budget() {
+        let sse = concat!(
+            "data: {\"id\":\"mock-chunk\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let upstream = spawn_mock_upstream(
+            Duration::ZERO,
+            StatusCode::OK,
+            "text/event-stream",
+            Some(sse.into()),
+        )
+        .await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state
+            .config
+            .extra
+            .insert("price_per_1k_usd".into(), json!(0.001));
+        let raw = state
+            .auth
+            .create_key_with_quotas("streaming", "-", vec![], None, Some(0.0001), None)
+            .unwrap();
+        let app = build_router(state);
+        let payload =
+            json!({"model":"auto","stream":true,"messages":[{"role":"user","content":"hi"}]});
+
+        let (first, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(first, StatusCode::OK, "{body}");
+
+        let (second, body) = send(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(
+            second,
+            StatusCode::PAYMENT_REQUIRED,
+            "a streaming request must be charged, so the cap is exhausted: {body}"
+        );
+        assert_eq!(
+            upstream.requests().await.len(),
+            1,
+            "the budget-exhausted request must be rejected before the upstream"
         );
     }
 
