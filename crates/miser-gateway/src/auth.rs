@@ -481,10 +481,11 @@ mod tests {
     /// must still boot.
     #[test]
     fn absent_key_store_boots_empty() {
-        let path = std::env::temp_dir().join(format!(
-            "miser_auth_test_absent_{}.json",
-            std::process::id()
-        ));
+        // Counter-based, not pid-only: the counter restarts at 0 in every new
+        // process, so a pid-only name can collide under pid reuse -- and a
+        // leftover file at that path would make `AuthManager::new` fail on a
+        // read, turning this into a spurious panic.
+        let path = temp_store("absent");
         let _ = std::fs::remove_file(&path);
         assert!(
             AuthManager::new(path.clone()).is_ok(),
@@ -523,6 +524,11 @@ mod tests {
             "the failed write must not leave a stray temp file at {}",
             tmp.display()
         );
+
+        // Clean up the directory. A leftover directory at a pid+counter path
+        // would make the *next* run's `AuthManager::new` fail on a read, since
+        // the counter restarts at 0 in every process.
+        std::fs::remove_dir_all(&path).expect("clean up the placeholder directory");
     }
 
     /// The hash chain must survive concurrent appends.

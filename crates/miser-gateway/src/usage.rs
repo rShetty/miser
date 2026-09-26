@@ -128,11 +128,23 @@ impl UsageLedger {
         client: Option<String>,
     ) -> UsageSummary {
         let ledger = std::sync::Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             ledger.summarize(since_ts, key_id.as_deref(), client.as_deref())
         })
         .await
-        .unwrap_or_default()
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                // A panicking scan or a runtime shutdown must not be reported as
+                // a successful, all-zero report: that is the same
+                // "spend is invisible" failure this endpoint exists to prevent.
+                tracing::error!(
+                    error = %error,
+                    "usage aggregation failed; reporting an empty summary"
+                );
+                UsageSummary::default()
+            }
+        }
     }
 
     /// Aggregate every recorded request in the window defined by the

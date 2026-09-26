@@ -98,12 +98,15 @@ fn request_timeout(config: &GatewayConfig) -> Duration {
 /// `provider_preferences` is applied by the caller, which can propagate a
 /// serialisation failure.
 fn provider_client_config(config: &GatewayConfig, api_key: &str) -> ProviderConfig {
+    let deadline_ms = request_timeout(config).as_millis() as u64;
     ProviderConfig {
         base_url: config.provider.base_url.clone(),
         api_key: Some(api_key.to_owned()),
-        // Rounded up, and never zero: `as_secs` would floor a sub-second
-        // deadline to 0, which reqwest reads as "time out immediately".
-        timeout_seconds: Some(request_timeout(config).as_secs().max(1)),
+        // Rounded *up*, and never zero. `as_secs` would floor instead, which
+        // makes the transport give up before the request layer does -- and for
+        // a sub-second deadline, flooring to 0 is worse still: reqwest reads a
+        // zero timeout as "fail immediately", so every request would error.
+        timeout_seconds: Some(deadline_ms.div_ceil(1000).max(1)),
         ..Default::default()
     }
 }
@@ -2777,6 +2780,16 @@ mod integration_tests {
             |config| {
                 config.routing.mode = miser_types::RoutingMode::Catalog;
                 config.routing.failover_threshold = 1;
+                // Without this the router loads the relative, gitignored
+                // `catalog/models.json`, i.e. whatever snapshot happens to exist
+                // in the working directory. That file is developer-local, so the
+                // test would depend on the checkout and could promote real models
+                // rather than the config seed.
+                config.routing.cache_path = Some(
+                    unique_temp_path("miser_test_catalog_seed", "json")
+                        .display()
+                        .to_string(),
+                );
                 config.quality.enabled = true;
                 config.quality.minimum_score = 0.99;
                 config.quality.escalate_on_failure = true;
@@ -2855,6 +2868,27 @@ mod integration_tests {
             Some(45)
         );
 
+        // Sub-second deadlines must round *up*, never down: flooring makes the
+        // transport give up before the request layer, and flooring all the way
+        // to zero makes reqwest fail every request instantly.
+        let mut fractional = base.clone();
+        fractional
+            .extra
+            .insert("request_timeout_ms".into(), json!(2_500u64));
+        assert_eq!(
+            provider_client_config(&fractional, "sk-test").timeout_seconds,
+            Some(3),
+            "a 2.5s deadline must not become a 2s transport timeout"
+        );
+        let mut tiny = base.clone();
+        tiny.extra
+            .insert("request_timeout_ms".into(), json!(500u64));
+        assert_eq!(
+            provider_client_config(&tiny, "sk-test").timeout_seconds,
+            Some(1),
+            "a sub-second deadline must not floor to an immediate failure"
+        );
+
         // A nonsense value must not produce a zero timeout, which reqwest
         // treats as "give up immediately".
         let mut broken = base.clone();
@@ -2875,17 +2909,26 @@ mod integration_tests {
     /// rotated. Only an explicit `all` may do that.
     #[test]
     fn unknown_usage_window_falls_back_to_a_bounded_one() {
-        let now = unix_now();
-        assert_eq!(window_since(Some("24h")), Some(now.saturating_sub(86_400)));
-        assert_eq!(window_since(Some("7d")), Some(now.saturating_sub(604_800)));
-        assert_eq!(
-            window_since(Some("30d")),
-            Some(now.saturating_sub(2_592_000))
+        // `window_since` reads the clock itself, so bracket rather than snapshot
+        // it: a second boundary falling between the two calls would otherwise
+        // fail the test.
+        let before = unix_now();
+        let day = window_since(Some("24h")).expect("24h is bounded");
+        let after = unix_now();
+        assert!(
+            (before.saturating_sub(86_400)..=after.saturating_sub(86_400)).contains(&day),
+            "24h should resolve to now-86400 within the bracket, got {day}"
         );
+        // Ordering, not exact values: a shorter window has a *later* lower
+        // bound, so 24h > 7d > 30d.
+        let week = window_since(Some("7d")).expect("7d is bounded");
+        let month = window_since(Some("30d")).expect("30d is bounded");
+        assert!(day > week, "24h is a later lower bound than 7d");
+        assert!(week > month, "7d is a later lower bound than 30d");
         assert_eq!(
             window_since(None),
-            Some(now.saturating_sub(2_592_000)),
-            "the default must be bounded"
+            window_since(Some("30d")),
+            "the default must be the same bounded 30d window"
         );
         assert_eq!(
             window_since(Some("all")),
@@ -3054,6 +3097,16 @@ mod integration_tests {
         let state = test_state_with("secret-admin", format!("http://{addr}"), |config| {
             config.routing.mode = miser_types::RoutingMode::Catalog;
             config.routing.failover_threshold = 1;
+            // Without this the router loads the relative, gitignored
+            // `catalog/models.json`, i.e. whatever snapshot happens to exist in
+            // the working directory. That file is developer-local, so the test
+            // would depend on the checkout and could promote real models rather
+            // than the config seed.
+            config.routing.cache_path = Some(
+                unique_temp_path("miser_test_catalog_seed", "json")
+                    .display()
+                    .to_string(),
+            );
         });
         let catalog = Arc::clone(&state.catalog);
         let app = build_router(state);

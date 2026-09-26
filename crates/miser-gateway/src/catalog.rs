@@ -191,20 +191,46 @@ impl CatalogRouter {
         if state.active.get(&tier).map(String::as_str) != Some(model) {
             return None;
         }
+        // Resolve the successor *before* touching the counter. A tier whose
+        // active model is absent from its own candidate list has no successor,
+        // and incrementing first would leave a count that only ever grows and
+        // can never be cleared or promoted past -- an unbounded, permanently
+        // un-clearable figure that `summary_json` would report.
         let count = state.failures.entry(tier).or_insert(0);
         *count += 1;
         if *count < threshold.max(1) {
             return None;
         }
-        let current = state.active.get(&tier).cloned()?;
-        let pin = state.snapshot.pins.get(&tier)?;
-        // `None` when the active model is absent from its own candidate list
-        // rather than a `usize::MAX` sentinel that the increment below would
-        // overflow. A panic here would be raised while the state mutex is held,
-        // poisoning it: `active_model` would return `None` forever and catalog
-        // routing would be silently dead for the life of the process.
-        let position = pin.candidates.iter().position(|model| model == &current)?;
-        let next = pin.candidates.get(position + 1)?.clone();
+        // Resolve the successor only once the threshold is crossed.
+        //
+        // `position` is `None` when the active model is absent from its own
+        // candidate list, rather than a `usize::MAX` sentinel that the increment
+        // would overflow -- a panic here would be raised while the state mutex is
+        // held, poisoning it, so `active_model` would return `None` forever and
+        // catalog routing would be silently dead for the life of the process.
+        let position = state
+            .active
+            .get(&tier)
+            .zip(state.snapshot.pins.get(&tier))
+            .and_then(|(current, pin)| pin.candidates.iter().position(|m| m == current));
+        let Some(position) = position else {
+            // An inconsistent snapshot: this tier's failures cannot promote
+            // anything, so a count here would only grow and never be cleared.
+            state.failures.insert(tier, 0);
+            return None;
+        };
+        let Some(next) = state
+            .snapshot
+            .pins
+            .get(&tier)
+            .and_then(|pin| pin.candidates.get(position + 1))
+            .cloned()
+        else {
+            // The candidate list is exhausted. The failure is real, so the count
+            // is kept -- it still reports the tier's health, and a success or a
+            // refresh clears it.
+            return None;
+        };
         state.active.insert(tier, next.clone());
         state.failures.insert(tier, 0);
         Some(next)
@@ -581,19 +607,35 @@ fn parse_model(entry: &Value) -> Option<CatalogModel> {
         .unwrap_or(&id)
         .to_owned();
     let pricing = entry.get("pricing").cloned().unwrap_or(Value::Null);
+    // A price that is present but not a finite number ("NaN", "inf", "1e400")
+    // means the provider is telling us nothing usable about this model, so the
+    // model is dropped rather than given a substitute price. Both substitutes
+    // are wrong in a way that matters: coercing to 0.0 puts it in the cheapest
+    // band, where `pin_choice` then picks it as the *cheapest* pin and first
+    // failover target, while leaving NaN in place makes every band comparison
+    // false so it falls into `Hard` and, once pinned, can never be migrated
+    // away because `best <= current * (1 - ratio)` is false forever. An absent
+    // price is different and stays lenient at 0.0 -- that is a genuinely free
+    // model, already gated by `allow_free`.
+    let unpriceable = |key: &str| -> bool {
+        pricing
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|raw| raw.parse::<f64>().is_ok_and(|v| !v.is_finite()))
+    };
+    if unpriceable("prompt") || unpriceable("completion") {
+        tracing::warn!(
+            model = %id,
+            "dropping catalog entry with a non-finite price"
+        );
+        return None;
+    }
     let price = |key: &str| -> f64 {
         pricing
             .get(key)
             .and_then(Value::as_str)
             .and_then(|raw| raw.parse::<f64>().ok())
             .map(|per_token| per_token * 1_000_000.0)
-            // `is_finite` matters as much as the parse: "NaN", "inf" and "1e400"
-            // all parse successfully, and every band comparison is false for
-            // NaN, so such a model fell through to `Hard` -- the most expensive
-            // band -- and became a legal failover target. If one was ever a pin,
-            // the hysteresis test `best <= current * (1 - ratio)` is false
-            // forever and it stayed pinned permanently.
-            .filter(|per_million| per_million.is_finite())
             .unwrap_or(0.0)
     };
     let context_length = entry
@@ -1050,23 +1092,33 @@ mod tests {
     /// `best.price <= current_price * (1 - ratio)` is `x <= NaN`, i.e. false
     /// forever, so the garbage model was pinned permanently.
     #[test]
-    fn non_finite_prices_are_rejected() {
+    fn non_finite_prices_drop_the_model() {
         for raw in ["NaN", "nan", "inf", "-inf", "Infinity", "1e400"] {
             let payload = json!({"data": [{
                 "id": "x/bad",
                 "pricing": {"prompt": raw, "completion": "0"},
                 "context_length": 200000
             }]});
-            let parsed = parse_catalog(&payload);
             assert!(
-                parsed.iter().all(|m| m.input_price_per_m.is_finite()),
-                "{raw} must not become a price, got {:?}",
-                parsed
-                    .iter()
-                    .map(|m| m.input_price_per_m)
-                    .collect::<Vec<_>>()
+                parse_catalog(&payload).is_empty(),
+                "{raw} must drop the model, not give it a substitute price"
             );
         }
+
+        // The point of dropping rather than substituting: 0.0 would make the
+        // entry the *cheapest* in the catalog, so `pin_choice` would pin it and
+        // make it the first failover target. A genuinely free model is still
+        // admitted at 0.0 -- a different case, already gated by `allow_free`.
+        let free = json!({"data": [{
+            "id": "x/free",
+            "pricing": {"prompt": "0", "completion": "0"},
+            "context_length": 200000
+        }]});
+        assert_eq!(
+            parse_catalog(&free).first().map(|m| m.input_price_per_m),
+            Some(0.0),
+            "a genuinely free model keeps its 0.0 price"
+        );
     }
 
     /// The Reasoning tier's failover targets must themselves be
@@ -1248,14 +1300,92 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A 2xx catalog response with no `data` array must not be persisted: it
-    /// would write a snapshot with no pins and an empty model->tier split,
-    /// destroying state the contract says survives until the next real refresh.
-    #[test]
-    fn empty_catalog_payload_is_rejected_rather_than_persisted() {
+    /// A 2xx catalog response carrying no usable models must be rejected, with
+    /// the previous pins left in force and nothing written to disk.
+    ///
+    /// `parse_catalog` yields no models for a body with no `data` array, and
+    /// `partition` would then produce a snapshot with no pins and an empty
+    /// model->tier split -- destroying the state the module's stability contract
+    /// says survives until a real refresh, and clearing every tier's failure
+    /// streak. Previously the guard was a `parse_catalog` sanity check that
+    /// never touched `refresh`, so this behaviour had no coverage at all.
+    #[tokio::test]
+    async fn empty_catalog_payload_is_rejected_and_leaves_the_pins_alone() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let body = r#"{"object":"list"}"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let path = temp_snapshot_path("empty_payload");
+        let previous = CatalogSnapshot {
+            source: "test".to_owned(),
+            pins: BTreeMap::from([(
+                ComplexityTier::Simple,
+                TierPin {
+                    model: "s/keep-me".to_owned(),
+                    candidates: vec!["s/keep-me".to_owned()],
+                },
+            )]),
+            model_tiers: BTreeMap::from([("s/keep-me".to_owned(), ComplexityTier::Simple)]),
+            ..Default::default()
+        };
+        let router = CatalogRouter {
+            path: path.clone(),
+            enabled: true,
+            refresh_lock: Mutex::new(()),
+            state: Mutex::new(CatalogState {
+                active: BTreeMap::from([(ComplexityTier::Simple, "s/keep-me".to_owned())]),
+                failures: BTreeMap::from([(ComplexityTier::Simple, 2)]),
+                snapshot: previous.clone(),
+            }),
+        };
+        let provider = miser_provider::Provider::new(miser_provider::ProviderConfig {
+            base_url: format!("http://{addr}"),
+            api_key: Some("test".to_owned()),
+            ..Default::default()
+        })
+        .expect("provider builds");
+
+        let error = router
+            .refresh(&provider, &routing())
+            .await
+            .expect_err("a catalog with no models must be refused");
         assert!(
-            parse_catalog(&json!({"object": "list"})).is_empty(),
-            "sanity: no data array yields no models"
+            error.contains("no models"),
+            "the error should say why: {error}"
+        );
+
+        // The pins stay in force, the failure streak is not wiped, and nothing
+        // reached the disk.
+        assert_eq!(
+            router.active_model(ComplexityTier::Simple).as_deref(),
+            Some("s/keep-me"),
+            "the previous pin must survive a refused refresh"
+        );
+        let state = router.state.lock().unwrap();
+        assert_eq!(
+            state.failures.get(&ComplexityTier::Simple),
+            Some(&2),
+            "a refused refresh must not clear the failure counters"
+        );
+        assert_eq!(state.snapshot, previous, "in-memory snapshot is unchanged");
+        drop(state);
+        assert!(
+            !path.exists(),
+            "a refused refresh must not write a snapshot at all"
         );
     }
 
