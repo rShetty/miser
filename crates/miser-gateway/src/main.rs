@@ -688,8 +688,11 @@ async fn completions_inner(
         if let Some(key) = &authenticated_key {
             charge_budget(&state, key, estimated_call_tokens(&request));
         }
-        let original_status = upstream.status();
-        let original_headers = safe_response_headers(upstream.headers());
+        // The status and pass-through headers of whichever response is
+        // ultimately served. Renamed from `original_*` because a quality-gate
+        // escalation replaces both along with the body.
+        let mut settled_status = upstream.status();
+        let mut settled_headers = safe_response_headers(upstream.headers());
         let payload = upstream.bytes().await.map_err(internal)?;
         // Captured now, before the quality gate can replace `payload` with an
         // escalated response. Every successful upstream call is billed, so
@@ -777,6 +780,13 @@ async fn completions_inner(
                                 state.provider.forward(escalated_body, None).await
                             {
                                 if escalated_upstream.status().is_success() {
+                                    // Read the retry's own status and headers
+                                    // before consuming the body, so they can
+                                    // replace the first attempt's if this
+                                    // response is the one we serve.
+                                    let escalated_status = escalated_upstream.status();
+                                    let escalated_headers =
+                                        safe_response_headers(escalated_upstream.headers());
                                     if let Ok(escalated_payload) = escalated_upstream.bytes().await
                                     {
                                         // The retry was really made and really
@@ -823,6 +833,13 @@ async fn completions_inner(
                                             .unwrap_or(true)
                                         {
                                             payload = escalated_payload;
+                                            // The body is now the retry's, so the
+                                            // response the client sees -- and the
+                                            // pair both cache layers persist --
+                                            // must describe the retry rather than
+                                            // the discarded attempt.
+                                            settled_status = escalated_status;
+                                            settled_headers = escalated_headers;
                                             selected_route = TierModelRouteConfig {
                                                 model: escalated_model,
                                                 ..next_route
@@ -864,14 +881,14 @@ async fn completions_inner(
             settled_usage.1,
             started.elapsed(),
             false,
-            original_status.as_u16(),
+            settled_status.as_u16(),
             &request_id,
         );
         state.cache.store(
             cache_key,
             payload.clone(),
-            original_status,
-            original_headers.clone(),
+            settled_status,
+            settled_headers.clone(),
         );
         // Semantic cache gets the final (quality-gated, possibly escalated)
         // response so near-duplicate requests reuse the best answer.
@@ -881,12 +898,12 @@ async fn completions_inner(
                 semantic_cache::embed_prompt(&embedding_text),
                 embedding_text,
                 payload.clone(),
-                original_status,
-                original_headers.clone(),
+                settled_status,
+                settled_headers.clone(),
             );
         }
-        let mut response = Response::builder().status(original_status);
-        for (name, value) in &original_headers {
+        let mut response = Response::builder().status(settled_status);
+        for (name, value) in &settled_headers {
             response = response.header(name, value);
         }
         return response
@@ -1692,13 +1709,40 @@ mod integration_tests {
         content_type: &'static str,
         body_text: Option<String>,
     ) -> MockUpstream {
+        spawn_mock_upstream_inner(delay, status, content_type, body_text, false).await
+    }
+
+    /// As [`spawn_mock_upstream`], but every reply also carries a distinct
+    /// `x-request-id: mock-call-<n>`. That header is on the gateway's
+    /// allow-list of pass-through response headers, so it makes the identity of
+    /// the upstream call visible to the client -- which is how a test can tell
+    /// whose headers accompany an escalated body.
+    async fn spawn_mock_upstream_tagged(
+        delay: Duration,
+        status: StatusCode,
+        content_type: &'static str,
+        body_text: Option<String>,
+    ) -> MockUpstream {
+        spawn_mock_upstream_inner(delay, status, content_type, body_text, true).await
+    }
+
+    async fn spawn_mock_upstream_inner(
+        delay: Duration,
+        status: StatusCode,
+        content_type: &'static str,
+        body_text: Option<String>,
+        tag_calls: bool,
+    ) -> MockUpstream {
         let requests: Arc<tokio::sync::Mutex<Vec<Value>>> = Arc::default();
+        let call_index = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let fixed_body = body_text;
         let capture_for_handler = Arc::clone(&requests);
+        let counter_for_handler = Arc::clone(&call_index);
         let app = Router::new().route(
             "/chat/completions",
             post(move |Json(body): Json<Value>| {
                 let capture = Arc::clone(&capture_for_handler);
+                let counter = Arc::clone(&counter_for_handler);
                 let fixed_body = fixed_body.clone();
                 async move {
                     let model = body
@@ -1706,6 +1750,7 @@ mod integration_tests {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned();
+                    let call = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     capture.lock().await.push(body);
                     tokio::time::sleep(delay).await;
                     let text = fixed_body.unwrap_or_else(|| {
@@ -1722,17 +1767,22 @@ mod integration_tests {
                         }))
                         .unwrap()
                     });
-                    (
-                        status,
-                        [(
-                            axum::http::header::CONTENT_TYPE,
-                            HeaderValue::from_static(content_type),
-                        )],
-                        text,
-                    )
+                    let mut headers = axum::http::HeaderMap::new();
+                    headers.insert(
+                        axum::http::header::CONTENT_TYPE,
+                        HeaderValue::from_static(content_type),
+                    );
+                    if tag_calls {
+                        headers.insert(
+                            "x-request-id",
+                            HeaderValue::from_str(&format!("mock-call-{call}")).unwrap(),
+                        );
+                    }
+                    (status, headers, text)
                 }
             }),
         );
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let models_app = app.route(
             "/models",
@@ -2226,6 +2276,47 @@ mod integration_tests {
             headers.get("x-miser-tier").and_then(|v| v.to_str().ok()),
             Some("trivial"),
             "tenant B must not inherit tenant A's session tier (key_a={a_id})"
+        );
+    }
+
+    /// An escalated response must ship the escalated call's own status and
+    /// headers, not the discarded attempt's.
+    ///
+    /// The gateway snapshots `settled_status` / `settled_headers` before the
+    /// quality gate runs and then swaps in the retry's body, but never refreshes
+    /// the snapshot. So a client asking for a retry got the retry's bytes
+    /// labelled with the first call's `x-request-id` and timing headers, and
+    /// both cache layers stored that mismatched pair to replay later. Not
+    /// protocol-breaking -- `content-length` is not on the pass-through
+    /// allow-list, so axum recomputes it -- but the response stops describing
+    /// itself, and the mislabelled pair is persisted.
+    #[tokio::test]
+    async fn escalated_response_ships_the_escalated_calls_headers() {
+        let upstream =
+            spawn_mock_upstream_tagged(Duration::ZERO, StatusCode::OK, "application/json", None)
+                .await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state.config.quality.enabled = true;
+        state.config.quality.minimum_score = 0.99;
+        state.config.quality.escalate_on_failure = true;
+        let app = build_router(state);
+
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+        let (status, headers, body) =
+            send_raw(app, "POST", "/v1/chat/completions", None, Some(payload)).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            headers
+                .get("x-miser-escalated")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "the gate should have escalated this request"
+        );
+        assert_eq!(upstream.requests().await.len(), 2, "expected a retry");
+        assert_eq!(
+            headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some("mock-call-1"),
+            "the body came from the second call, so its headers must too"
         );
     }
 
