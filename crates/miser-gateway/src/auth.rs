@@ -50,6 +50,22 @@ pub enum AuthError {
     AlreadyExists,
 }
 
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            AuthError::InvalidKey => "invalid API key",
+            AuthError::Inactive => "API key inactive",
+            AuthError::Expired => "API key expired",
+            AuthError::StoreError => "key store could not be read or written",
+            AuthError::NotFound => "key not found",
+            AuthError::AlreadyExists => "key already exists",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for AuthError {}
+
 /// Current Unix time in seconds; `0` if the clock is before the epoch.
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -59,19 +75,25 @@ fn unix_now() -> u64 {
 }
 
 impl AuthManager {
-    pub fn new(path: PathBuf) -> Self {
+    /// Load the key store.
+    ///
+    /// Fails if the file exists but cannot be read or parsed. That state means
+    /// a previous write was lost or truncated, and silently continuing with an
+    /// empty store would invalidate every issued key -- and, since the gateway
+    /// drops to unauthenticated open access when no admin key is configured,
+    /// would quietly leave the gateway wide open. A missing file is a fresh
+    /// install and is fine.
+    pub fn new(path: PathBuf) -> Result<Self, AuthError> {
         let store = if path.exists() {
-            match fs::read_to_string(&path) {
-                Ok(text) => serde_json::from_str(&text).unwrap_or(KeyStore { keys: vec![] }),
-                Err(_) => KeyStore { keys: vec![] },
-            }
+            let text = fs::read_to_string(&path).map_err(|_| AuthError::StoreError)?;
+            serde_json::from_str(&text).map_err(|_| AuthError::StoreError)?
         } else {
             KeyStore { keys: vec![] }
         };
-        Self {
+        Ok(Self {
             store: Mutex::new(store),
             path,
-        }
+        })
     }
 
     pub fn validate(&self, bearer: &str) -> Result<ApiKey, AuthError> {
@@ -232,11 +254,42 @@ impl AuthManager {
         self.persist(&store)
     }
 
+    /// Write the store out atomically.
+    ///
+    /// `File::create` truncates before the first byte is written, so a crash,
+    /// a full disk, or a read-only remount mid-write left the key store empty
+    /// or half-written -- destroying the only copy of every key hash, with no
+    /// way back. Writing a sibling temp file, flushing it, and renaming it over
+    /// the target means a reader only ever sees the old file or the new one.
+    /// The temp file must share a directory with the target for `rename` to be
+    /// atomic, and is removed if the rename fails so the next boot does not
+    /// trip over it.
     fn persist(&self, store: &KeyStore) -> Result<(), AuthError> {
         let text = serde_json::to_string_pretty(store).map_err(|_| AuthError::StoreError)?;
-        let mut file = fs::File::create(&self.path).map_err(|_| AuthError::StoreError)?;
-        file.write_all(text.as_bytes())
-            .map_err(|_| AuthError::StoreError)?;
+        let tmp = self.path.with_file_name(format!(
+            "{}.tmp",
+            self.path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "keys.json".to_string())
+        ));
+        let write = (|| -> std::io::Result<()> {
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp, &self.path)?;
+            Ok(())
+        })();
+        if let Err(error) = write {
+            let _ = fs::remove_file(&tmp);
+            tracing::error!(
+                path = %self.path.display(),
+                error = %error,
+                "failed to persist the key store; the change was NOT saved"
+            );
+            return Err(AuthError::StoreError);
+        }
         Ok(())
     }
 }
@@ -368,20 +421,87 @@ mod tests {
         assert_eq!(keys.len(), 256, "CSPRNG keys must not collide");
     }
 
+    /// Unique per call, from a process-wide counter rather than a wall-clock
+    /// reading: this machine's clock is coarse enough to hand two concurrent
+    /// threads the same nanosecond value, which made tests share a key store.
     fn temp_store(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "miser_auth_test_{tag}_{}_{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "miser_auth_test_{tag}_{}_{n}.json",
+            std::process::id()
         ))
+    }
+
+    /// A key store that exists but cannot be parsed means the last write was
+    /// lost or truncated. Booting with an empty store would invalidate every
+    /// issued key, and -- because the gateway drops to unauthenticated open
+    /// access when no admin key is configured -- would quietly turn the
+    /// gateway into an open proxy. Refuse to start instead.
+    #[test]
+    fn corrupt_key_store_is_rejected_rather_than_silently_emptied() {
+        let path = temp_store("corrupt");
+        std::fs::write(&path, "{ this is not json").unwrap();
+        assert!(
+            AuthManager::new(path.clone()).is_err(),
+            "a truncated key store must not be treated as 'no keys exist'"
+        );
+        // The evidence is left on disk for the operator to recover.
+        assert!(path.exists(), "the unparseable store must not be deleted");
+    }
+
+    /// Guard against over-correcting: a fresh install has no key store yet and
+    /// must still boot.
+    #[test]
+    fn absent_key_store_boots_empty() {
+        let path = std::env::temp_dir().join(format!(
+            "miser_auth_test_absent_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            AuthManager::new(path.clone()).is_ok(),
+            "a missing key store is a fresh install, not corruption"
+        );
+        assert!(
+            AuthManager::new(path)
+                .unwrap()
+                .list_keys()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A persist that cannot complete must report the failure and leave no
+    /// partial file behind for the next boot to trip over.
+    #[test]
+    fn failed_persist_reports_the_error_and_cleans_up() {
+        let path = temp_store("persist_fail");
+        let manager = AuthManager::new(path.clone()).unwrap();
+        // Put a directory where the store belongs: the temp write still
+        // succeeds but the final rename cannot, which is the partial-failure
+        // case that matters. Nothing is written until the first mutation, so
+        // the path is still free to occupy.
+        std::fs::create_dir_all(&path).unwrap();
+
+        let result = manager.create_key_with_quotas("o", "-", vec![], None, None, None);
+        assert!(result.is_err(), "persist must surface the failure");
+
+        let tmp = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            !tmp.exists(),
+            "the failed write must not leave a stray temp file at {}",
+            tmp.display()
+        );
     }
 
     #[test]
     fn expired_key_is_rejected_by_validate() {
-        let manager = AuthManager::new(temp_store("expired"));
+        let manager = AuthManager::new(temp_store("expired")).unwrap();
         let now = unix_now();
         let raw = manager
             .create_key_with_quotas(
@@ -398,7 +518,7 @@ mod tests {
 
     #[test]
     fn key_expiring_in_the_future_is_accepted() {
-        let manager = AuthManager::new(temp_store("future"));
+        let manager = AuthManager::new(temp_store("future")).unwrap();
         let raw = manager
             .create_key_with_quotas("fresh", "-", vec![], None, None, Some(unix_now() + 3_600))
             .unwrap();
@@ -409,7 +529,7 @@ mod tests {
 
     #[test]
     fn key_without_expiry_never_expires() {
-        let manager = AuthManager::new(temp_store("noexpiry"));
+        let manager = AuthManager::new(temp_store("noexpiry")).unwrap();
         let raw = manager
             .create_key_with_quotas("steady", "-", vec![], None, None, None)
             .unwrap();
@@ -420,7 +540,7 @@ mod tests {
 
     #[test]
     fn rotation_replaces_secret_and_invalidates_old_key() {
-        let manager = AuthManager::new(temp_store("rotate"));
+        let manager = AuthManager::new(temp_store("rotate")).unwrap();
         let old_raw = manager
             .create_key_with_quotas("rotating", "-", vec!["hard".into()], Some(60), None, None)
             .unwrap();
@@ -446,14 +566,14 @@ mod tests {
     #[test]
     fn rotation_survives_restart_from_disk() {
         let path = temp_store("rotate_persist");
-        let manager = AuthManager::new(path.clone());
+        let manager = AuthManager::new(path.clone()).unwrap();
         let old_raw = manager
             .create_key_with_quotas("persisted", "-", vec![], None, None, None)
             .unwrap();
         let id = manager.list_keys().unwrap()[0].id.clone();
         let new_raw = manager.rotate_key(&id).unwrap();
 
-        let restarted = AuthManager::new(path);
+        let restarted = AuthManager::new(path).unwrap();
         assert!(matches!(
             restarted.validate(&old_raw),
             Err(AuthError::InvalidKey)
@@ -463,7 +583,7 @@ mod tests {
 
     #[test]
     fn rotation_of_unknown_key_fails() {
-        let manager = AuthManager::new(temp_store("rotate_missing"));
+        let manager = AuthManager::new(temp_store("rotate_missing")).unwrap();
         assert!(matches!(
             manager.rotate_key("key_does_not_exist"),
             Err(AuthError::NotFound)

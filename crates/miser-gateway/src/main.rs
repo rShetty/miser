@@ -169,7 +169,14 @@ async fn main() -> anyhow::Result<()> {
             config.session.max_entries,
             config.session.ttl_seconds,
         )),
-        auth: Arc::new(auth::AuthManager::new(std::path::PathBuf::from(auth_path))),
+        auth: Arc::new(
+            auth::AuthManager::new(std::path::PathBuf::from(&auth_path)).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to load the API key store at {auth_path}: {e}. \
+                     Refusing to start rather than booting with no keys."
+                )
+            })?,
+        ),
         quotas: Arc::new(auth::QuotaEnforcer::new()),
         usage: Arc::new(usage::UsageLedger::new(std::path::PathBuf::from(
             std::env::var("MISER_USAGE_FILE")
@@ -1575,7 +1582,7 @@ mod integration_tests {
             .unwrap(),
             cache: Arc::new(cache::ResponseCache::new(100, 60)),
             session: Arc::new(session::SessionTracker::new(100, 60)),
-            auth: Arc::new(auth::AuthManager::new(keys_file)),
+            auth: Arc::new(auth::AuthManager::new(keys_file).expect("fresh test key store loads")),
             quotas: Arc::new(auth::QuotaEnforcer::new()),
             usage: Arc::new(usage::UsageLedger::new(usage_file)),
             metrics: Arc::new(metrics::Metrics::new().unwrap()),
