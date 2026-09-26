@@ -18,6 +18,7 @@ use miser_types::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -187,6 +188,13 @@ impl CatalogRouter {
             .await
             .map_err(|error| format!("catalog fetch failed: {error}"))?;
         let models = parse_catalog(&data);
+        if models.is_empty() {
+            // A 2xx body with no usable `data` array would otherwise persist a
+            // snapshot with no pins and an empty model->tier split, wiping the
+            // state the contract says survives until a real refresh. The
+            // previous pins stay in force and nothing is written.
+            return Err("catalog fetch returned no models; keeping the current pins".to_owned());
+        }
         let mut snapshot = partition(&models, routing, &self.current_pins());
 
         // A tier whose filtered pool is empty keeps its previous pin — the
@@ -206,27 +214,7 @@ impl CatalogRouter {
         snapshot.fetched_at = Some(unix_now());
         snapshot.source = "openrouter".to_owned();
 
-        let changed: Vec<(ComplexityTier, String, String)> = {
-            let mut state = self.state.lock().map_err(|_| "catalog lock poisoned")?;
-            let mut changed = Vec::new();
-            for tier in ALL_TIERS {
-                let old = state.snapshot.pins.get(&tier).map(|pin| pin.model.clone());
-                if let Some(pin) = snapshot.pins.get(&tier) {
-                    if old.as_deref() != Some(pin.model.as_str()) {
-                        changed.push((tier, old.unwrap_or_default(), pin.model.clone()));
-                    }
-                }
-                if let Some(pin) = snapshot.pins.get(&tier) {
-                    state.active.insert(tier, pin.model.clone());
-                } else {
-                    state.active.remove(&tier);
-                }
-            }
-            state.failures.clear();
-            state.snapshot = snapshot.clone();
-            changed
-        };
-        self.persist(&snapshot)?;
+        let changed: Vec<(ComplexityTier, String, String)> = self.commit(&snapshot)?;
 
         let migrated: Vec<Value> = changed
             .iter()
@@ -298,6 +286,50 @@ impl CatalogRouter {
         })
     }
 
+    /// Persist the snapshot, then swap the in-memory state.
+    ///
+    /// The order is load-bearing. Swapping first meant a failed write returned
+    /// an error the endpoint reported as `catalog_refresh/failure` with a 502,
+    /// while live traffic was already being served from the new pins and every
+    /// failure counter had been cleared -- and the next restart would silently
+    /// revert to the pins still on disk. Persisting first means a failure
+    /// changes nothing observable.
+    fn commit(
+        &self,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<Vec<(ComplexityTier, String, String)>, String> {
+        self.persist(snapshot)?;
+        let mut state = self.state.lock().map_err(|_| "catalog lock poisoned")?;
+        let mut changed = Vec::new();
+        for tier in ALL_TIERS {
+            let old = state.snapshot.pins.get(&tier).map(|pin| pin.model.clone());
+            if let Some(pin) = snapshot.pins.get(&tier) {
+                if old.as_deref() != Some(pin.model.as_str()) {
+                    changed.push((tier, old.unwrap_or_default(), pin.model.clone()));
+                }
+            }
+            if let Some(pin) = snapshot.pins.get(&tier) {
+                state.active.insert(tier, pin.model.clone());
+            } else {
+                state.active.remove(&tier);
+            }
+        }
+        state.failures.clear();
+        state.snapshot = snapshot.clone();
+        Ok(changed)
+    }
+
+    /// Write the snapshot atomically.
+    ///
+    /// `fs::write` is `File::create` (O_TRUNC) plus `write_all`, and callers
+    /// reach it after releasing the state lock -- so two overlapping refreshes
+    /// (the startup task and the admin endpoint both refresh) each truncated and
+    /// wrote from offset 0 and interleaved into invalid JSON, and a crash or a
+    /// full disk did the same. Either way the next boot read a corrupt file and
+    /// silently re-derived every pin from config, contradicting the stability
+    /// contract. A sibling temp file, flushed and renamed, means a reader only
+    /// ever sees the old snapshot or the new one. The temp file must share a
+    /// directory with the target for `rename` to be atomic.
     fn persist(&self, snapshot: &CatalogSnapshot) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
@@ -305,8 +337,25 @@ impl CatalogRouter {
         }
         let data = serde_json::to_string_pretty(snapshot)
             .map_err(|error| format!("failed to encode snapshot: {error}"))?;
-        std::fs::write(&self.path, data)
-            .map_err(|error| format!("failed to write snapshot: {error}"))?;
+        let tmp = self.path.with_file_name(format!(
+            "{}.tmp",
+            self.path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "models.json".to_string())
+        ));
+        let write = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(data.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, &self.path)?;
+            Ok(())
+        })();
+        if let Err(error) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("failed to write catalog snapshot: {error}"));
+        }
         Ok(())
     }
 }
@@ -765,18 +814,118 @@ mod tests {
         }
     }
 
+    /// `temp_snapshot_path` mixes a monotonic counter with a wall-clock
+    /// reading so it cannot collide, unlike either alone.
     fn temp_snapshot_path(label: &str) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
         std::env::temp_dir().join(format!(
-            "miser_test_catalog_{}_{}_{seq}_{label}.json",
-            std::process::id(),
-            nanos
+            "miser_test_catalog_{}_{seq}_{label}.json",
+            std::process::id()
         ))
+    }
+
+    /// The snapshot is written atomically, so a reader only ever sees a whole
+    /// file and a failed write leaves nothing behind.
+    ///
+    /// `std::fs::write` is `File::create` (O_TRUNC) plus `write_all`, and the
+    /// state lock was already released by the time it ran, so two overlapping
+    /// refreshes -- the startup task and the admin endpoint both refresh -- each
+    /// truncated and wrote from offset 0, interleaving into invalid JSON. A
+    /// crash or a full disk did the same. Either way the next boot read a
+    /// corrupt file and silently re-derived every pin from config.
+    #[test]
+    fn snapshot_is_written_atomically_and_leaves_no_temp_file() {
+        let path = temp_snapshot_path("atomic");
+        let mut router = router_with_pins(BTreeMap::new());
+        router.path = path.clone();
+
+        let snapshot = CatalogSnapshot {
+            source: "test".to_owned(),
+            pins: BTreeMap::from([(
+                ComplexityTier::Simple,
+                TierPin {
+                    model: "s/pinned".to_owned(),
+                    candidates: vec!["s/pinned".to_owned(), "s/next".to_owned()],
+                },
+            )]),
+            ..Default::default()
+        };
+        router.commit(&snapshot).expect("commit succeeds");
+
+        let text = std::fs::read_to_string(&path).expect("snapshot written");
+        let reloaded: CatalogSnapshot =
+            serde_json::from_str(&text).expect("the file on disk is whole, not torn");
+        assert_eq!(reloaded.pins[&ComplexityTier::Simple].model, "s/pinned");
+        assert!(
+            !temp_sibling(&path).exists(),
+            "no temp file may be left at {}",
+            temp_sibling(&path).display()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn temp_sibling(path: &std::path::Path) -> std::path::PathBuf {
+        path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ))
+    }
+
+    /// If the snapshot cannot be written, live routing must not move.
+    ///
+    /// The old order swapped `active`, wiped the failure counters and installed
+    /// the new snapshot *before* persisting, so a failed write returned an error
+    /// that the endpoint reported as `catalog_refresh/failure` with a 502 --
+    /// while traffic was already being served from the new pins and the next
+    /// restart silently reverted to the old ones.
+    #[test]
+    fn failed_commit_leaves_live_routing_untouched() {
+        // A directory where the snapshot belongs: the write cannot succeed.
+        let path = temp_snapshot_path("commit_fail");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let mut router = router_with_pins(BTreeMap::from([(
+            ComplexityTier::Simple,
+            TierPin {
+                model: "s/original".to_owned(),
+                candidates: vec!["s/original".to_owned()],
+            },
+        )]));
+        router.path = path.clone();
+
+        let replacement = CatalogSnapshot {
+            source: "test".to_owned(),
+            pins: BTreeMap::from([(
+                ComplexityTier::Simple,
+                TierPin {
+                    model: "s/replacement".to_owned(),
+                    candidates: vec!["s/replacement".to_owned()],
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(
+            router.commit(&replacement).is_err(),
+            "an unwritable snapshot must surface the failure"
+        );
+        assert_eq!(
+            router.active_model(ComplexityTier::Simple),
+            Some("s/original".to_owned()),
+            "a failed write must not change what traffic is routed to"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A 2xx catalog response with no `data` array must not be persisted: it
+    /// would write a snapshot with no pins and an empty model->tier split,
+    /// destroying state the contract says survives until the next real refresh.
+    #[test]
+    fn empty_catalog_payload_is_rejected_rather_than_persisted() {
+        assert!(
+            parse_catalog(&json!({"object": "list"})).is_empty(),
+            "sanity: no data array yields no models"
+        );
     }
 
     fn gateway_config(cache_path: &std::path::Path, seed_split: bool) -> GatewayConfig {
