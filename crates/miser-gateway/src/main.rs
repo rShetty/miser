@@ -298,13 +298,14 @@ impl AppState {
     fn report_upstream_outcome(
         &self,
         tier: ComplexityTier,
+        model: &str,
         status: Option<axum::http::StatusCode>,
     ) {
         if !self.catalog.enabled() {
             return;
         }
         if matches!(status, Some(status) if status.is_success()) {
-            self.catalog.report_success(tier);
+            self.catalog.report_success(tier, model);
             return;
         }
         let is_provider_failure = match status {
@@ -315,7 +316,7 @@ impl AppState {
             return;
         }
         let threshold = self.config.routing.failover_threshold;
-        if let Some(new_model) = self.catalog.report_failure(tier, threshold) {
+        if let Some(new_model) = self.catalog.report_failure(tier, model, threshold) {
             self.metrics.catalog_failovers_total.inc();
             tracing::warn!(
                 tier = %format_tier(tier),
@@ -700,7 +701,7 @@ async fn completions_inner(
         Ok(upstream) => upstream,
         Err(error) => {
             state.metrics.upstream_errors_total.inc();
-            state.report_upstream_outcome(effective_tier, None);
+            state.report_upstream_outcome(effective_tier, &route.model, None);
             return Err(internal(error));
         }
     };
@@ -708,7 +709,7 @@ async fn completions_inner(
     if !upstream_status.is_success() {
         state.metrics.upstream_errors_total.inc();
     }
-    state.report_upstream_outcome(effective_tier, Some(upstream_status));
+    state.report_upstream_outcome(effective_tier, &route.model, Some(upstream_status));
     let selected_route = route.clone();
     if !stream_requested && upstream.status().is_success() {
         // Charge the first upstream call to the key's budget. An escalation
@@ -824,6 +825,7 @@ async fn completions_inner(
                                     safe_response_headers(escalated_upstream.headers());
                                 state.report_upstream_outcome(
                                     escalated_tier,
+                                    &escalated_model,
                                     Some(escalated_status),
                                 );
                                 if escalated_status.is_success() {

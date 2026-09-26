@@ -147,17 +147,38 @@ impl CatalogRouter {
         state.active.get(&tier).cloned()
     }
 
-    pub fn report_success(&self, tier: ComplexityTier) {
+    /// Record a success for `model` on `tier`.
+    ///
+    /// Ignored unless `model` is the tier's current active model. Requests are
+    /// served concurrently, so a straggler success for a model the tier has
+    /// already been promoted off must not clear the streak of the model that
+    /// replaced it -- otherwise the replacement can never accumulate
+    /// consecutive failures and so never fails over.
+    pub fn report_success(&self, tier: ComplexityTier, model: &str) {
         if let Ok(mut state) = self.state.lock() {
-            state.failures.remove(&tier);
+            if state.active.get(&tier).map(String::as_str) == Some(model) {
+                state.failures.remove(&tier);
+            }
         }
     }
 
-    /// Records an upstream failure for the tier's active model. When
-    /// consecutive failures reach `threshold`, promotes the next candidate
-    /// and returns the new active model.
-    pub fn report_failure(&self, tier: ComplexityTier, threshold: u32) -> Option<String> {
+    /// Records an upstream failure for `model` on `tier`. When consecutive
+    /// failures reach `threshold`, promotes the next candidate and returns the
+    /// new active model.
+    ///
+    /// Ignored unless `model` is the tier's current active model: a late
+    /// failure for a model already promoted off says nothing about its
+    /// replacement and must not advance the replacement's streak.
+    pub fn report_failure(
+        &self,
+        tier: ComplexityTier,
+        model: &str,
+        threshold: u32,
+    ) -> Option<String> {
         let mut state = self.state.lock().ok()?;
+        if state.active.get(&tier).map(String::as_str) != Some(model) {
+            return None;
+        }
         let count = state.failures.entry(tier).or_insert(0);
         *count += 1;
         if *count < threshold.max(1) {
@@ -783,15 +804,21 @@ mod tests {
             }),
         };
         // Below threshold: no promotion.
-        assert_eq!(router.report_failure(ComplexityTier::Simple, 3), None);
-        assert_eq!(router.report_failure(ComplexityTier::Simple, 3), None);
+        assert_eq!(
+            router.report_failure(ComplexityTier::Simple, "pin/model", 3),
+            None
+        );
+        assert_eq!(
+            router.report_failure(ComplexityTier::Simple, "pin/model", 3),
+            None
+        );
         assert_eq!(
             router.active_model(ComplexityTier::Simple),
             Some("pin/model".to_owned())
         );
         // Third failure crosses the threshold.
         assert_eq!(
-            router.report_failure(ComplexityTier::Simple, 3),
+            router.report_failure(ComplexityTier::Simple, "pin/model", 3),
             Some("alt/model".to_owned())
         );
         assert_eq!(
@@ -800,15 +827,18 @@ mod tests {
         );
         // Success keeps the promoted model (no demotion thrash) and resets
         // the counter.
-        router.report_success(ComplexityTier::Simple);
+        router.report_success(ComplexityTier::Simple, "alt/model");
         assert_eq!(
             router.active_model(ComplexityTier::Simple),
             Some("alt/model".to_owned())
         );
         // A fresh failure cycle re-promotes from the promoted model's
         // position; the list is exhausted → None.
-        router.report_failure(ComplexityTier::Simple, 1);
-        assert_eq!(router.report_failure(ComplexityTier::Simple, 1), None);
+        router.report_failure(ComplexityTier::Simple, "alt/model", 1);
+        assert_eq!(
+            router.report_failure(ComplexityTier::Simple, "alt/model", 1),
+            None
+        );
         assert_eq!(
             router.active_model(ComplexityTier::Simple),
             Some("alt/model".to_owned())
@@ -968,7 +998,7 @@ mod tests {
         }
         // Must return cleanly rather than overflowing, and the router must stay
         // usable afterwards.
-        let promoted = router.report_failure(ComplexityTier::Simple, 1);
+        let promoted = router.report_failure(ComplexityTier::Simple, "s/ghost", 1);
         assert!(
             promoted.is_none(),
             "there is no successor to an unknown active model, got {promoted:?}"
@@ -1049,6 +1079,88 @@ mod tests {
         }
     }
 
+    /// The failure counter must track the model that is actually failing, not
+    /// merely the tier.
+    ///
+    /// `report_success` cleared the counter by tier alone, so with several
+    /// requests in flight against a tier a *late* success for the
+    /// pre-promotion model wiped the streak of the model promoted in its place.
+    /// `concurrency_limit` is 64 by default, so such stragglers are routine: the
+    /// promoted model could fail indefinitely without ever accumulating
+    /// `failover_threshold` *consecutive* failures, and so would never promote
+    /// to the next candidate -- the failover machinery silently stopped
+    /// protecting against a model that was already broken.
+    #[test]
+    fn outcomes_for_a_superseded_model_are_ignored() {
+        let router = router_with_pins(BTreeMap::from([(
+            ComplexityTier::Simple,
+            TierPin {
+                model: "s/a".to_owned(),
+                candidates: vec!["s/a".to_owned(), "s/b".to_owned(), "s/c".to_owned()],
+            },
+        )]));
+
+        // Two failures promote a -> b.
+        assert_eq!(
+            router.report_failure(ComplexityTier::Simple, "s/a", 2),
+            None
+        );
+        assert_eq!(
+            router.report_failure(ComplexityTier::Simple, "s/a", 2),
+            Some("s/b".to_owned())
+        );
+        assert_eq!(
+            router.active_model(ComplexityTier::Simple).as_deref(),
+            Some("s/b")
+        );
+
+        // A straggler success for `a` must not clear b's streak, so b's next
+        // two failures still promote.
+        router.report_success(ComplexityTier::Simple, "s/a");
+        assert_eq!(
+            router.report_failure(ComplexityTier::Simple, "s/b", 2),
+            None
+        );
+        assert_eq!(
+            router.report_failure(ComplexityTier::Simple, "s/b", 2),
+            Some("s/c".to_owned())
+        );
+    }
+
+    /// A straggler *failure* for a superseded model must not be charged to its
+    /// replacement, which is a different model with a different track record.
+    #[test]
+    fn failures_for_a_superseded_model_do_not_advance_the_replacement() {
+        let router = router_with_pins(BTreeMap::from([(
+            ComplexityTier::Simple,
+            TierPin {
+                model: "s/a".to_owned(),
+                candidates: vec!["s/a".to_owned(), "s/b".to_owned()],
+            },
+        )]));
+
+        assert_eq!(
+            router.report_failure(ComplexityTier::Simple, "s/a", 1),
+            Some("s/b".to_owned())
+        );
+        // Two stragglers from `a` land after the promotion. With a threshold of
+        // 2, counting them would promote b off the end of the list; they must
+        // be dropped instead.
+        assert_eq!(
+            router.report_failure(ComplexityTier::Simple, "s/a", 2),
+            None
+        );
+        assert_eq!(
+            router.report_failure(ComplexityTier::Simple, "s/a", 2),
+            None
+        );
+        assert_eq!(
+            router.active_model(ComplexityTier::Simple).as_deref(),
+            Some("s/b"),
+            "b must not be promoted by failures that belonged to a"
+        );
+    }
+
     /// A 2xx catalog response with no `data` array must not be persisted: it
     /// would write a snapshot with no pins and an empty model->tier split,
     /// destroying state the contract says survives until the next real refresh.
@@ -1090,10 +1202,16 @@ mod tests {
             },
         )]));
         // One provider failure below the threshold, then a 2xx resets it.
-        assert_eq!(router.report_failure(ComplexityTier::Trivial, 3), None);
-        router.report_success(ComplexityTier::Trivial);
+        assert_eq!(
+            router.report_failure(ComplexityTier::Trivial, "pin/model", 3),
+            None
+        );
+        router.report_success(ComplexityTier::Trivial, "pin/model");
         // The counter restarted, so one fresh failure must not promote.
-        assert_eq!(router.report_failure(ComplexityTier::Trivial, 3), None);
+        assert_eq!(
+            router.report_failure(ComplexityTier::Trivial, "pin/model", 3),
+            None
+        );
         assert_eq!(
             router.active_model(ComplexityTier::Trivial),
             Some("pin/model".to_owned())
@@ -1110,7 +1228,7 @@ mod tests {
             },
         )]));
         assert_eq!(
-            router.report_failure(ComplexityTier::Simple, 0),
+            router.report_failure(ComplexityTier::Simple, "pin/model", 0),
             Some("alt/model".to_owned()),
             "threshold is clamped to at least one failure"
         );
