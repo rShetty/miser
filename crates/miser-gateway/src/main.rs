@@ -1239,6 +1239,33 @@ async fn get_key(
     }
 }
 
+/// Strictly read one optional admin-supplied field into the absent / clear /
+/// set trichotomy that `AuthManager::update_key_quotas` expects.
+///
+/// `Value::as_*` cannot express that trichotomy: it maps a wrong-typed value to
+/// `None`, which the store then assigns, so `{"monthly_budget_usd": "10.00"}`
+/// -- a stringified number, exactly what a shell-quoted curl or a client that
+/// stringifies numerics sends -- silently deleted the spend cap, and
+/// `{"rate_limit_rpm": "60"}` deleted the rate limit, while the handler
+/// answered `200 {"updated": true}`. A non-array `allowed_tiers` became an
+/// empty allowlist, which the completions path reads as "every tier allowed".
+/// These fields gate spend and access, so a value that is present but
+/// unparseable is a client error rather than something to guess at. Parsing
+/// into the target type also range-checks for free: an `rpm` above `u32::MAX`
+/// used to truncate via `as u32`.
+fn patch_field<T>(body: &Value, field: &str) -> Result<Option<Option<T>>, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match body.get(field) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(value) => serde_json::from_value::<T>(value.clone())
+            .map(|parsed| Some(Some(parsed)))
+            .map_err(|error| format!("{field} is invalid: {error}")),
+    }
+}
+
 async fn update_key(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -1251,24 +1278,21 @@ async fn update_key(
             StatusCode::UNAUTHORIZED,
         ));
     }
-    let allowed_tiers = body.get("allowed_tiers").map(|v| {
-        v.as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
-    });
-    let rate_limit_rpm = body
-        .get("rate_limit_rpm")
-        .map(|v| v.as_u64().map(|n| n as u32));
-    let monthly_budget_usd = body.get("monthly_budget_usd").map(|v| v.as_f64());
-    let client = body
-        .get("client")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    // An explicit null clears the allowlist, which the completions path reads
+    // as "every tier allowed" -- the same state an empty array denotes.
+    let allowed_tiers = patch_field::<Vec<String>>(&body, "allowed_tiers")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?
+        .map(|inner| inner.unwrap_or_default());
+    let rate_limit_rpm = patch_field::<u32>(&body, "rate_limit_rpm")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?;
+    let monthly_budget_usd = patch_field::<f64>(&body, "monthly_budget_usd")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?;
+    // `client` is a label rather than a control, and the store has no notion
+    // of clearing it, so an explicit null resets it to the "-" placeholder via
+    // `normalize_client` instead of erroring.
+    let client = patch_field::<String>(&body, "client")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?
+        .map(|inner| inner.unwrap_or_default());
     match state.auth.update_key_quotas(
         &id,
         client,
@@ -2324,6 +2348,103 @@ mod integration_tests {
             headers.get("x-request-id").and_then(|v| v.to_str().ok()),
             Some("mock-call-1"),
             "the body came from the second call, so its headers must too"
+        );
+    }
+
+    /// A malformed `PATCH` must be rejected, never silently interpreted as
+    /// "remove this restriction".
+    ///
+    /// The handler built `Option<Option<T>>` with `body.get(..).map(Value::as_*)`,
+    /// so a value of the wrong JSON type produced `Some(None)`, and
+    /// `update_key_quotas` assigns that inner `None` -- clearing the field --
+    /// while the handler answers `200 {"updated": true}`. So
+    /// `{"monthly_budget_usd": "10.00"}` (a stringified number, which is what a
+    /// shell-quoted curl or a client that stringifies numerics sends) silently
+    /// deleted the spend cap, and `{"rate_limit_rpm": "60"}` deleted the rate
+    /// limit. `{"allowed_tiers": "hard"}` became an empty allowlist, which
+    /// `completions_inner` reads as "all tiers allowed". Every one of these
+    /// removed a cost or safety control and reported success.
+    #[tokio::test]
+    async fn update_key_rejects_wrongly_typed_restrictions() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let state = test_state_with_upstream("secret-admin", upstream.base_url.clone());
+        let (id, _) = state
+            .auth
+            .create_key_full("typed", "-", vec![], Some(60), Some(10.0), None)
+            .unwrap();
+        let app = build_router(state);
+
+        for (field, bad_value) in [
+            ("monthly_budget_usd", json!("10.00")),
+            ("rate_limit_rpm", json!("60")),
+            ("allowed_tiers", json!("hard")),
+        ] {
+            let (status, _, body) = send_raw(
+                app.clone(),
+                "PATCH",
+                &format!("/admin/keys/{id}"),
+                Some("secret-admin"),
+                Some(json!({ field: bad_value })),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{field} = {bad_value} must be rejected, got: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        // Nothing was silently dropped along the way.
+        let (status, _, body) = send_raw(
+            app,
+            "GET",
+            &format!("/admin/keys/{id}"),
+            Some("secret-admin"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let key: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            key["monthly_budget_usd"],
+            json!(10.0),
+            "the spend cap must survive a rejected PATCH"
+        );
+        assert_eq!(
+            key["rate_limit_rpm"],
+            json!(60),
+            "the rate limit must survive a rejected PATCH"
+        );
+    }
+
+    /// An out-of-range `rate_limit_rpm` must be rejected too, not truncated.
+    /// `4294967396 as u32` is `100`, so a typo silently produced a 100 rpm cap.
+    #[tokio::test]
+    async fn update_key_rejects_out_of_range_rate_limit() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let state = test_state_with_upstream("secret-admin", upstream.base_url.clone());
+        let (id, _) = state
+            .auth
+            .create_key_full("range", "-", vec![], None, None, None)
+            .unwrap();
+        let app = build_router(state);
+
+        let (status, _, body) = send_raw(
+            app,
+            "PATCH",
+            &format!("/admin/keys/{id}"),
+            Some("secret-admin"),
+            Some(json!({"rate_limit_rpm": 4_294_967_396u64})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an rpm above u32::MAX must be rejected, not truncated: {}",
+            String::from_utf8_lossy(&body)
         );
     }
 
