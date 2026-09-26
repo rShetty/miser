@@ -589,8 +589,17 @@ async fn completions_inner(
         .classify(&request)
         .await
         .map_err(internal)?;
+    // Session continuity is scoped to the authenticated API key: the session
+    // key is built from client-supplied data, so without the tenant prefix two
+    // keys sharing a `user` (or a first message) would share a session, and
+    // since a session only ever moves up in tier, one tenant's expensive
+    // conversation would drag the other onto that tier.
+    let session_tenant = authenticated_key
+        .as_ref()
+        .map(|key| key.id.as_str())
+        .unwrap_or("-");
     if state.config.session.enabled {
-        if let Some(key) = session::session_key(&request) {
+        if let Some(key) = session::session_key(&request, session_tenant) {
             if let Some(session_tier) = state.session.get(&key) {
                 if session_tier > classification.tier {
                     classification.tier = session_tier;
@@ -642,7 +651,7 @@ async fn completions_inner(
         }
     }
     if state.config.session.enabled {
-        if let Some(key) = session::session_key(&request) {
+        if let Some(key) = session::session_key(&request, session_tenant) {
             state.session.update(&key, effective_tier);
         }
     }
@@ -2148,6 +2157,75 @@ mod integration_tests {
             upstream.requests().await.len(),
             1,
             "the budget-exhausted request must be rejected before the upstream"
+        );
+    }
+
+    /// A session must not leak across API keys.
+    ///
+    /// The session tracker keeps the *highest* tier a conversation has seen and
+    /// never lowers it, and its key was derived only from client-supplied data
+    /// (`user`, else a hash of the first user message) with no tenant scoping.
+    /// So two different API keys whose clients send the same `user` -- a
+    /// routine thing for OpenAI-compatible clients to hardcode -- shared one
+    /// session, and a cheap request on key B was served by the expensive tier
+    /// key A had already pulled the session up to. That is both a cross-tenant
+    /// cost leak and a way to hit a `403` for a tier key B is not allowed.
+    #[tokio::test]
+    async fn session_tier_does_not_leak_across_api_keys() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state.config.session.enabled = true;
+        let (a_id, key_a) = state
+            .auth
+            .create_key_full("tenant-a", "-", vec![], None, None, None)
+            .unwrap();
+        let (_b_id, key_b) = state
+            .auth
+            .create_key_full("tenant-b", "-", vec![], None, None, None)
+            .unwrap();
+        let app = build_router(state);
+
+        // Tenant A runs an expensive conversation under a shared `user` id.
+        let expensive = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "@route:hard\ndesign a system"}],
+            "user": "shared-client-id"
+        });
+        let (status, headers, body) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&key_a),
+            Some(expensive),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            headers.get("x-miser-tier").and_then(|v| v.to_str().ok()),
+            Some("hard"),
+            "tenant A should have been routed to the hard tier"
+        );
+
+        // Tenant B sends a trivial request under the *same* `user` id.
+        let trivial = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hi"}],
+            "user": "shared-client-id"
+        });
+        let (status, headers, body) = send_raw(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&key_b),
+            Some(trivial),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            headers.get("x-miser-tier").and_then(|v| v.to_str().ok()),
+            Some("trivial"),
+            "tenant B must not inherit tenant A's session tier (key_a={a_id})"
         );
     }
 

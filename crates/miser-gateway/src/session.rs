@@ -48,10 +48,21 @@ impl SessionTracker {
     }
 }
 
-pub fn session_key(request: &ChatCompletionRequest) -> Option<String> {
+/// Identity of the session stream, namespaced by API key.
+///
+/// Both inputs are client-supplied and neither is trustworthy on its own:
+/// `user` is whatever the SDK was configured with (frequently a hardcoded
+/// string, and identical across different customers of the same app), and the
+/// message-hash fallback collides on any shared opening message such as
+/// "hello". Because [`SessionTracker::update`] only ever raises a session's
+/// tier, a shared key let one tenant's expensive conversation pull every other
+/// tenant up to that tier -- a cross-tenant cost leak, and a way to earn a
+/// `403` for a tier the victim's key is not allowed. Prefixing the API key id
+/// keeps the tenancy boundary at the credential the gateway already trusts.
+pub fn session_key(request: &ChatCompletionRequest, tenant: &str) -> Option<String> {
     if let Some(user) = &request.user {
         if !user.is_empty() {
-            return Some(format!("user:{}", user));
+            return Some(format!("{tenant}:user:{user}"));
         }
     }
     request.messages.iter().find(|m| m.role == "user").map(|m| {
@@ -67,7 +78,7 @@ pub fn session_key(request: &ChatCompletionRequest) -> Option<String> {
                 .join(" "),
         };
         let hash = fnv_hash(content.as_bytes());
-        format!("msg:{:x}", hash)
+        format!("{tenant}:msg:{hash:016x}")
     })
 }
 
@@ -108,7 +119,10 @@ mod tests {
             "user": "session-abc"
         }))
         .unwrap();
-        assert_eq!(session_key(&request), Some("user:session-abc".into()));
+        assert_eq!(
+            session_key(&request, "key_a"),
+            Some("key_a:user:session-abc".into())
+        );
     }
 
     #[test]
@@ -118,9 +132,9 @@ mod tests {
             "messages": [{"role":"user","content":"build the project"}]
         }))
         .unwrap();
-        let key = session_key(&request);
+        let key = session_key(&request, "key_a");
         assert!(key.is_some());
-        assert!(key.unwrap().starts_with("msg:"));
+        assert!(key.unwrap().starts_with("key_a:msg:"));
     }
 
     #[test]
@@ -174,9 +188,9 @@ mod tests {
             "user": ""
         }))
         .unwrap();
-        let key = session_key(&empty_user).unwrap();
+        let key = session_key(&empty_user, "key_a").unwrap();
         assert!(
-            key.starts_with("msg:"),
+            key.starts_with("key_a:msg:"),
             "empty user must fall back to message hash: {key}"
         );
 
@@ -196,9 +210,51 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            session_key(&with_parts),
-            session_key(&joined),
+            session_key(&with_parts, "key_a"),
+            session_key(&joined, "key_a"),
             "parts content must hash as the joined text"
+        );
+    }
+
+    #[test]
+    fn session_key_is_scoped_to_its_tenant() {
+        let with_user = |user: &str| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hello"}],
+                "user": user
+            }))
+            .unwrap()
+        };
+        // Two different API keys, same client-supplied `user`. Without tenant
+        // scoping these collide, and because the tracker only ever raises a
+        // session's tier, one tenant's expensive conversation drags the
+        // other onto the same (or a higher) tier.
+        assert_ne!(
+            session_key(&with_user("alice"), "key_a"),
+            session_key(&with_user("alice"), "key_b")
+        );
+        // The same tenant is still stable across turns.
+        assert_eq!(
+            session_key(&with_user("alice"), "key_a"),
+            session_key(&with_user("alice"), "key_a")
+        );
+
+        // The same guarantee for the message-hash fallback, which is what
+        // clients that omit `user` collide on.
+        let no_user: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        assert_ne!(
+            session_key(&no_user, "key_a"),
+            session_key(&no_user, "key_b")
+        );
+        assert!(
+            session_key(&no_user, "key_a")
+                .unwrap()
+                .starts_with("key_a:msg:")
         );
     }
 
@@ -212,12 +268,12 @@ mod tests {
             .unwrap()
         };
         assert_eq!(
-            session_key(&make("build it")),
-            session_key(&make("build it"))
+            session_key(&make("build it"), "key_a"),
+            session_key(&make("build it"), "key_a")
         );
         assert_ne!(
-            session_key(&make("build it")),
-            session_key(&make("ship it"))
+            session_key(&make("build it"), "key_a"),
+            session_key(&make("ship it"), "key_a")
         );
     }
 }
