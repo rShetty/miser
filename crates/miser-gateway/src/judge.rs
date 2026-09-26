@@ -94,25 +94,43 @@ impl QualityJudge {
             .await
             .ok()?;
         let answer = &payload["answers"]["quality"];
-        // TypeSafe direct: explicit score. Gateway contract: per-level
-        // probabilities; weighted mean over the 0-4 level indices.
-        let raw = answer["score"].as_f64().or_else(|| {
+        // Two different contracts land in this payload and they must be
+        // normalized differently.
+        //
+        // - TypeSafe direct returns an explicit `score` whose scale is not
+        //   guaranteed, so it needs the `> 1.0` guess.
+        // - The Gateway contract carries only `probabilities`, keyed by 0-4
+        //   level index. A weighted mean of level indices is therefore
+        //   ALWAYS on the 0-4 scale and must ALWAYS be divided by 4.
+        //
+        // Guessing the scale with `raw > 1.0` is undecidable for the second
+        // contract, and it fails in the worst possible direction: 0.0..=1.0
+        // is exactly the range that means "bad response". A level-1 verdict
+        // ("major errors, missing most required concepts, or significant
+        // tangents") scored a perfect 1.0 and therefore never failed
+        // `minimum_score`, so the quality gate silently stopped escalating
+        // precisely the responses it exists to catch.
+        let score = if let Some(explicit) = answer["score"].as_f64() {
+            if explicit > 1.0 {
+                explicit / 4.0
+            } else {
+                explicit
+            }
+        } else {
             let probs = answer["probabilities"].as_object()?;
             let total: f64 = probs.values().filter_map(|v| v.as_f64()).sum();
             if total <= 0.0 {
                 return None;
             }
-            Some(
-                probs
-                    .iter()
-                    .map(|(level, prob)| {
-                        level.parse::<f64>().unwrap_or(0.0) * prob.as_f64().unwrap_or(0.0)
-                    })
-                    .sum::<f64>()
-                    / total,
-            )
-        })?;
-        Some((if raw > 1.0 { raw / 4.0 } else { raw }).clamp(0.0, 1.0) as f32)
+            let weighted: f64 = probs
+                .iter()
+                .map(|(level, prob)| {
+                    level.parse::<f64>().unwrap_or(0.0) * prob.as_f64().unwrap_or(0.0)
+                })
+                .sum();
+            weighted / total / 4.0
+        };
+        Some(score.clamp(0.0, 1.0) as f32)
     }
 
     /// Jev equivalence validation for the semantic cache: asks whether the
@@ -273,5 +291,102 @@ mod equivalence_tests {
             judge_for("http://127.0.0.1:1").equivalent("a", "b").await,
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod score_scale_tests {
+    use super::*;
+    use miser_types::ClassifierEndpointConfig;
+
+    fn judge_for(base_url: &str) -> QualityJudge {
+        let endpoint = ClassifierEndpointConfig {
+            enabled: true,
+            model: "jev-latest".into(),
+            base_url: base_url.to_owned(),
+            api_key: Some("test-key".into()),
+            path: Some("/evaluate".into()),
+            timeout_ms: 2000,
+            extra: Default::default(),
+        };
+        QualityJudge::new(&endpoint, "test-key".into())
+    }
+
+    /// Mock Jev returning a `score`-question answer with only `probabilities`
+    /// (the Gateway contract), keyed by 0-4 level index.
+    async fn spawn_score_mock(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let mut data = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+                if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+        });
+        format!("http://{}", addr)
+    }
+
+    /// `probabilities` are keyed by 0-4 level index, so the weighted mean is
+    /// ALWAYS on the 0-4 scale and must always be divided by 4. Guessing the
+    /// scale with `if raw > 1.0` silently leaves every raw score in 0..=1.0
+    /// un-normalized, which is exactly the range that means "bad response".
+    #[tokio::test]
+    async fn level_one_probabilities_normalize_to_the_bottom_of_the_scale() {
+        let base = spawn_score_mock(r#"{"answers":{"quality":{"probabilities":{"1":1.0}}}}"#).await;
+        // Level 1 == "Major errors, missing most required concepts" => 1/4.
+        assert_eq!(judge_for(&base).score("p", "r").await, Some(0.25));
+    }
+
+    #[tokio::test]
+    async fn level_one_dominant_mixture_normalizes_to_the_bottom_of_the_scale() {
+        let base =
+            spawn_score_mock(r#"{"answers":{"quality":{"probabilities":{"1":0.8,"0":0.2}}}}"#)
+                .await;
+        // 0.8*1 + 0.2*0 = 0.8 on the 0-4 scale => 0.2 normalized.
+        assert_eq!(judge_for(&base).score("p", "r").await, Some(0.2));
+    }
+
+    /// The levels that already exceed 1.0 were normalized correctly; guard
+    /// against a regression in the other direction.
+    #[tokio::test]
+    async fn higher_levels_still_normalize_by_four() {
+        for (body, expected) in [
+            (
+                r#"{"answers":{"quality":{"probabilities":{"4":1.0}}}}"#,
+                1.0,
+            ),
+            (
+                r#"{"answers":{"quality":{"probabilities":{"3":1.0}}}}"#,
+                0.75,
+            ),
+            (
+                r#"{"answers":{"quality":{"probabilities":{"2":1.0}}}}"#,
+                0.5,
+            ),
+            (
+                r#"{"answers":{"quality":{"probabilities":{"0":1.0}}}}"#,
+                0.0,
+            ),
+        ] {
+            let base = spawn_score_mock(body).await;
+            assert_eq!(judge_for(&base).score("p", "r").await, Some(expected));
+        }
     }
 }
