@@ -1005,7 +1005,27 @@ async fn completions_inner(
     }
     let status = upstream.status();
     let safe_headers = safe_response_headers(upstream.headers());
-    let stream = upstream.bytes_stream();
+    // The stream is observed as it is relayed. Failover used to be decided from
+    // the response headers alone, so a model that answered `200` and then
+    // dropped the connection mid-SSE was recorded as a success every time: it
+    // could never accumulate failures and so never failed over, and clients
+    // kept receiving truncated streams from a model the failover logic was
+    // supposed to have retired. Long generations and provider-side read
+    // timeouts make mid-stream death the common streaming failure, not the rare
+    // one.
+    //
+    // A promotion can only affect the *next* request, since these headers are
+    // already on the wire by the time the body fails. That is the best
+    // available once bytes have been sent.
+    let stream_model = selected_route.model.clone();
+    let report_state = Arc::clone(&state);
+    let report_tier = effective_tier;
+    let stream = futures_util::StreamExt::map(upstream.bytes_stream(), move |chunk| {
+        if chunk.is_err() {
+            report_state.report_upstream_outcome(report_tier, &stream_model, None);
+        }
+        chunk
+    });
     // Streaming: token counts arrive inside the stream, so charge and record
     // the same monotonic estimate the non-streaming path uses. The charge is
     // what makes a monthly budget cap mean anything -- without it a client
@@ -2965,6 +2985,98 @@ mod integration_tests {
             1,
             "it must be attributed somewhere queryable: {:?}",
             summary.by_key
+        );
+    }
+
+    /// A stream that starts healthy and then dies must count as an upstream
+    /// failure.
+    ///
+    /// Failover was decided from the response *headers* alone, so a model that
+    /// reliably answered `200` and then dropped the connection mid-SSE was
+    /// recorded as a success every time. It could never accumulate failures and
+    /// so never failed over: clients kept receiving truncated streams from a
+    /// model the failover logic was supposed to have retired. Long generations
+    /// and provider-side read timeouts make exactly this the common streaming
+    /// failure, not the rare one.
+    ///
+    /// The promotion necessarily lands after the headers are already on the
+    /// wire, so it protects the *next* request rather than rescuing this one --
+    /// which is the best available once bytes have been sent.
+    #[tokio::test]
+    async fn a_stream_that_dies_midway_is_counted_as_a_failure() {
+        // Announce a healthy chunked SSE response, deliver one event, then hang
+        // up without the terminating zero-length chunk. Chunked framing is what
+        // makes that an error rather than a clean end-of-body: without a
+        // `Content-Length`, HTTP treats connection close as a normal end.
+        let event =
+            "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+        let truncated_sse = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}",
+            event.len(),
+            event
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(truncated_sse.as_bytes()).await;
+                let _ = sock.flush().await;
+                // Close without `0\r\n\r\n`.
+            }
+        });
+
+        let state = test_state_with("secret-admin", format!("http://{addr}"), |config| {
+            config.routing.mode = miser_types::RoutingMode::Catalog;
+            config.routing.failover_threshold = 1;
+        });
+        let catalog = Arc::clone(&state.catalog);
+        let app = build_router(state);
+
+        let payload =
+            json!({"model":"auto","stream":true,"messages":[{"role":"user","content":"hi"}]});
+        // Not `send_raw`: it unwraps the collected body, and the whole point of
+        // this test is that collecting the body fails.
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer secret-admin")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "headers arrive before the failure"
+        );
+        // Draining surfaces the error to the client, and by then the failure
+        // must have been counted.
+        let _ = response.into_body().collect().await;
+
+        // The body error surfaces while the client is reading, and by then the
+        // failure must have been counted.
+        let mut counted = false;
+        for _ in 0..50 {
+            if catalog.summary_json()["tiers"]
+                .as_array()
+                .is_some_and(|tiers| {
+                    tiers
+                        .iter()
+                        .any(|tier| tier["consecutive_failures"] != json!(0))
+                })
+            {
+                counted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            counted,
+            "a stream that dies mid-flight must be reported to the failover counter: {}",
+            catalog.summary_json()
         );
     }
 
