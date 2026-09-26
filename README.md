@@ -364,7 +364,7 @@ A verified VPS run on 2026-08-09 used the same 10 coding, reasoning, general, an
 
 ### Quality-first tier table (2026-09-20, Jev judge, local runs)
 
-A Jev-judged model bake-off per tier (`evals/quality_cases.jsonl` + `evals/se_quality_cases.jsonl`) replaced price-picked pins: simple=qwen3-30b-a3b (0.92 vs deepseek-v4-flash 0.86), standard/hard/reasoning=gpt-4.1-mini (glm-5.2 scored 0.0 on every SE reasoning case — disqualified; claude-sonnet-4 trailed mini on hard cases, 2.19 vs 2.70). The Jev quality gate (`[quality.judge]`) now runs for real on every non-streaming response — previously `parse_judge` was dead code and its 5-level score was clamped into 0-1, so escalation could never trigger. Responses below `minimum_score` retry one tier up and the better-scoring answer is returned and cached.
+A Jev-judged model bake-off per tier (`evals/quality_cases.jsonl` + `evals/se_quality_cases.jsonl`) replaced price-picked pins: simple=qwen3-30b-a3b (0.92 vs deepseek-v4-flash 0.86), standard/hard/reasoning=gpt-4.1-mini (glm-5.2 scored 0.0 on every SE reasoning case — disqualified; claude-sonnet-4 trailed mini on hard cases, 2.19 vs 2.70). The Jev quality gate (`[quality.judge]`) now runs for real on every non-streaming response — it was previously dead code, and its 5-level score was normalized with a `score > 1.0` heuristic that could not tell a 0-4 scale from a 0-1 one, so a level-1 verdict ("major errors") scored a perfect 1.0 and escalation could never trigger. Responses below `minimum_score` retry one tier up and the better-scoring answer is returned and cached.
 
 **SE benchmark, 50 cases (evals/se_quality_cases.jsonl, Jev judge):**
 

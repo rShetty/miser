@@ -171,7 +171,11 @@ pub fn effective_tier(&self, request, classification) -> ComplexityTier {
 - Coding task without code blocks and < 80 chars → score 0.3
 - Otherwise → score 0.85 (if ≥ 40 chars) or 0.65
 
-`parse_judge()` parses LLM judge JSON response with score and passed fields.
+`QualityJudge` (`miser-gateway::judge`) asks the Jev `/evaluate` endpoint a typed
+`score` question and normalizes the answer to 0..=1: a weighted mean over the
+0-4 `probabilities` level indices, always divided by 4, or the explicit `score`
+field when the endpoint returns one. Only a body that parses as neither yields
+no score, and the caller then falls back to the deterministic checks above.
 
 ## 5. Gateway handlers
 

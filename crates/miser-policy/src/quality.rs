@@ -1,5 +1,4 @@
 use miser_types::{ChatCompletionRequest, ClassificationResult, QualityConfig, TaskType};
-use serde::Deserialize;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -7,12 +6,6 @@ pub struct QualityScore {
     pub score: f32,
     pub passed: bool,
     pub reason: &'static str,
-}
-
-#[derive(Debug, Deserialize)]
-struct JudgeResult {
-    score: f32,
-    passed: bool,
 }
 
 pub fn deterministic_quality(
@@ -84,25 +77,6 @@ pub fn deterministic_quality(
         passed: score >= config.minimum_score,
         reason: "deterministic-content-check",
     }
-}
-
-pub fn parse_judge(content: &str, config: &QualityConfig) -> Option<QualityScore> {
-    let json = content
-        .match_indices('{')
-        .next()
-        .map(|(start, _)| &content[start..])?;
-    let result = serde_json::from_str::<JudgeResult>(json).ok()?;
-    // Jev's typed score question returns a probability-weighted level index
-    // on a 0-4 scale; judges emitting 0-1 pass through unchanged. Without
-    // the normalization every Jev score >= 1 clamps to 1.0 and never fails
-    // the threshold.
-    let raw = result.score;
-    let score = (if raw > 1.0 { raw / 4.0 } else { raw }).clamp(0.0, 1.0);
-    Some(QualityScore {
-        score,
-        passed: result.passed && score >= config.minimum_score,
-        reason: "llm-judge",
-    })
 }
 
 #[cfg(test)]
@@ -191,29 +165,6 @@ mod tests {
         );
         assert!(!empty_calls.passed);
         assert_eq!(empty_calls.reason, "empty-content");
-    }
-
-    #[test]
-    fn jev_five_level_scores_are_normalized() {
-        // A level-2 response (0-4 scale) must normalize to 0.5, not clamp
-        // to 1.0 and pass every threshold.
-        let score = parse_judge(r#"{"score": 2.17, "passed": false}"#, &config(0.65)).unwrap();
-        assert!((score.score - 2.17 / 4.0).abs() < 1e-6);
-        assert!(!score.passed);
-    }
-
-    #[test]
-    fn zero_one_scores_pass_through_unscaled() {
-        let score = parse_judge(r#"{"score": 0.5, "passed": true}"#, &config(0.65)).unwrap();
-        assert!((score.score - 0.5).abs() < 1e-6);
-        assert!(!score.passed);
-    }
-
-    #[test]
-    fn strong_jev_scores_pass() {
-        let score = parse_judge(r#"{"score": 4.0, "passed": true}"#, &config(0.65)).unwrap();
-        assert!((score.score - 1.0).abs() < 1e-6);
-        assert!(score.passed);
     }
 
     #[test]
@@ -323,35 +274,5 @@ mod tests {
         );
         assert_eq!(long.score, 0.85);
         assert!(long.passed);
-    }
-
-    #[test]
-    fn parse_judge_rejects_non_json_and_missing_fields() {
-        let config = config(0.7);
-        assert!(parse_judge("no verdict here", &config).is_none());
-        assert!(parse_judge("{truncated", &config).is_none());
-        assert!(parse_judge(r#"{"passed": true}"#, &config).is_none());
-    }
-
-    #[test]
-    fn parse_judge_finds_json_embedded_in_prose() {
-        let score =
-            parse_judge("verdict: {\"score\": 3.0, \"passed\": true}", &config(0.7)).unwrap();
-        assert!((score.score - 0.75).abs() < 1e-6);
-        assert!(score.passed);
-    }
-
-    #[test]
-    fn judge_pass_requires_both_the_flag_and_the_threshold() {
-        let config = config(0.7);
-        // A judge "passed" flag alone is not enough below the threshold.
-        let low = parse_judge(r#"{"score": 0.5, "passed": true}"#, &config).unwrap();
-        assert!(!low.passed);
-        // The flag is mandatory even at a perfect score.
-        let unflagged = parse_judge(r#"{"score": 1.0, "passed": false}"#, &config).unwrap();
-        assert!(!unflagged.passed);
-        // The threshold itself is inclusive.
-        let exact = parse_judge(r#"{"score": 0.7, "passed": true}"#, &config).unwrap();
-        assert!(exact.passed);
     }
 }
