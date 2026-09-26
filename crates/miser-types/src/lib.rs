@@ -752,13 +752,15 @@ mod tests {
         let request: ChatCompletionRequest =
             serde_json::from_value(raw).expect("null content must decode");
         assert_eq!(request.messages.len(), 3);
-        assert_eq!(request.messages[1].content, MessageContent::Text(String::new()));
+        assert_eq!(
+            request.messages[1].content,
+            MessageContent::Text(String::new())
+        );
         assert!(request.messages[1].tool_calls.is_some());
         assert_eq!(request.messages[2].role, "tool");
 
         // An absent content key is equally valid.
-        let absent: ChatMessage =
-            serde_json::from_value(json!({"role": "assistant"})).unwrap();
+        let absent: ChatMessage = serde_json::from_value(json!({"role": "assistant"})).unwrap();
         assert_eq!(absent.content, MessageContent::Text(String::new()));
     }
 
