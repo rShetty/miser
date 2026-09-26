@@ -102,7 +102,10 @@ fn max_tier(left: ComplexityTier, right: ComplexityTier) -> ComplexityTier {
     left.max(right)
 }
 
-fn has_tool_history(request: &ChatCompletionRequest) -> bool {
+/// True when the transcript shows tool use, even if the request declares no
+/// `tools` array. A client resuming an agentic loop commonly replays the
+/// history without re-declaring its tools.
+pub fn has_tool_history(request: &ChatCompletionRequest) -> bool {
     request
         .messages
         .iter()

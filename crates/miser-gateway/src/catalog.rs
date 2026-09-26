@@ -38,6 +38,17 @@ pub struct CatalogRouter {
     path: PathBuf,
     enabled: bool,
     state: Mutex<CatalogState>,
+    /// Serialises refreshes against each other.
+    ///
+    /// `state` is not enough: `commit` must persist *before* taking it, so that
+    /// a failed write leaves routing untouched. Two refreshes could therefore
+    /// both reach `persist` and write the same sibling `.tmp` file -- each
+    /// truncating it and writing from offset 0, so the first to rename
+    /// published a byte-level mix of both snapshots. The startup refresh task
+    /// and the admin endpoint both refresh, so this is reachable. Held across
+    /// the whole fetch-then-commit sequence, never across an `.await` that
+    /// needs another lock.
+    refresh_lock: Mutex<()>,
 }
 
 struct CatalogState {
@@ -86,6 +97,7 @@ impl CatalogRouter {
         Self {
             path,
             enabled,
+            refresh_lock: Mutex::new(()),
             state: Mutex::new(CatalogState {
                 snapshot,
                 active,
@@ -209,6 +221,19 @@ impl CatalogRouter {
             .list_models()
             .await
             .map_err(|error| format!("catalog fetch failed: {error}"))?;
+        // Taken *after* the fetch, so the guard is never held across an await
+        // (which would make the handler future non-`Send`). Concurrent refreshes
+        // therefore fetch in parallel and serialise only on the write, which is
+        // where the hazard is: `commit` has to persist before taking `state`, so
+        // that a failed write leaves routing untouched, and without this lock
+        // two refreshes would write the same sibling `.tmp` -- each truncating
+        // it and writing from offset 0, so the first to rename published a
+        // byte-level mix of both snapshots. The startup refresh task and the
+        // admin endpoint both refresh, so this is reachable.
+        let _refresh = self
+            .refresh_lock
+            .lock()
+            .map_err(|_| "catalog refresh lock poisoned".to_owned())?;
         let models = parse_catalog(&data);
         if models.is_empty() {
             // A 2xx body with no usable `data` array would otherwise persist a
@@ -797,6 +822,7 @@ mod tests {
         let router = CatalogRouter {
             path: PathBuf::from("/tmp/miser-catalog-test/never-written.json"),
             enabled: true,
+            refresh_lock: Mutex::new(()),
             state: Mutex::new(CatalogState {
                 snapshot,
                 active: BTreeMap::from([(ComplexityTier::Simple, "pin/model".to_owned())]),
@@ -855,6 +881,7 @@ mod tests {
         CatalogRouter {
             path: PathBuf::from("/tmp/miser-catalog-unit-tests/never-written.json"),
             enabled: true,
+            refresh_lock: Mutex::new(()),
             state: Mutex::new(CatalogState {
                 snapshot: CatalogSnapshot {
                     source: "test".to_owned(),
@@ -1159,6 +1186,66 @@ mod tests {
             Some("s/b"),
             "b must not be promoted by failures that belonged to a"
         );
+    }
+
+    /// Concurrent refreshes must not be able to interleave their writes.
+    ///
+    /// `commit` persists *before* taking the state lock so that a failed write
+    /// leaves live routing untouched, which means the state lock does not cover
+    /// the write. The temp file is a single fixed sibling, so without a
+    /// separate lock two refreshes would each `File::create` it -- truncating
+    /// the other's bytes -- write from offset 0, and the first to rename would
+    /// publish a byte-level mix of the two snapshots. The startup refresh task
+    /// and the admin endpoint both refresh, so this is reachable in production.
+    ///
+    /// Exercised through `commit`, which is the part that touches the disk; the
+    /// lock is taken in `refresh` around the same region.
+    #[test]
+    fn commit_is_serialised_against_other_commits() {
+        use std::sync::Arc as StdArc;
+
+        let path = temp_snapshot_path("concurrent_commit");
+        let mut base = router_with_pins(BTreeMap::new());
+        base.path = path.clone();
+        let router = StdArc::new(base);
+
+        // Take the same lock `refresh` takes, so the test exercises the real
+        // exclusion rather than a private copy of it.
+        let _guard = router.refresh_lock.lock().expect("refresh lock");
+
+        let snapshot_for = |tag: &str| CatalogSnapshot {
+            source: "test".to_owned(),
+            pins: BTreeMap::from([(
+                ComplexityTier::Simple,
+                TierPin {
+                    model: format!("s/{tag}"),
+                    candidates: vec![format!("s/{tag}")],
+                },
+            )]),
+            ..Default::default()
+        };
+
+        // A second refresh arriving now must block rather than race the write.
+        let other = StdArc::clone(&router);
+        let blocker = std::thread::spawn(move || {
+            let _held = other.refresh_lock.lock().expect("refresh lock");
+        });
+        // Give the contender a chance to reach the lock.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        router
+            .commit(&snapshot_for("first"))
+            .expect("commit succeeds");
+
+        drop(_guard);
+        blocker.join().expect("contender thread");
+
+        // The file on disk must be one whole snapshot, not a mixture.
+        let text = std::fs::read_to_string(&path).expect("snapshot written");
+        let reloaded: CatalogSnapshot =
+            serde_json::from_str(&text).expect("the snapshot must not be torn");
+        assert_eq!(reloaded.pins[&ComplexityTier::Simple].model, "s/first");
+        assert!(!temp_sibling(&path).exists(), "no temp file may survive");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A 2xx catalog response with no `data` array must not be persisted: it

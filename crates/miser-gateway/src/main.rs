@@ -584,13 +584,22 @@ async fn completions_inner(
     // before classification, the tool-capable tier floor in `effective_tier`
     // is skipped too, so the cheap model would have served it anyway.
     //
+    // Tool *history* counts too, not just a declared `tools` array: a client
+    // resuming an agentic loop commonly replays the transcript without
+    // re-declaring its tools, and `has_tool_history` treats exactly that as
+    // agentic and floors the tier to Hard. Folding the tool-result text into
+    // the embedding makes those look similar, so without this the same bug
+    // reaches us one axis over.
+    //
     // The exact-match cache still covers these requests -- `request_hash`
-    // keeps `tools` in the key -- so only genuinely different prompts miss.
+    // keeps `tools` and the full transcript in the key -- so only genuinely
+    // different prompts miss.
     if state.config.cache.enabled
         && state.config.cache.semantic_enabled
         && request.response_format.is_none()
         && request.tools.as_ref().is_none_or(Vec::is_empty)
         && request.tool_choice.is_none()
+        && !miser_policy::has_tool_history(&request)
         && !stream_requested
     {
         let embedding_text = semantic_cache::request_text_for_embedding(&body);
@@ -1030,8 +1039,19 @@ async fn completions_inner(
     // the same monotonic estimate the non-streaming path uses. The charge is
     // what makes a monthly budget cap mean anything -- without it a client
     // could set `stream: true` and spend without limit.
+    //
+    // Guarded on a successful status, because this block is also the
+    // non-streaming *error* path: a plain request whose upstream answered 4xx
+    // or 5xx falls straight through to here. Charging those would let a client
+    // drain its own monthly budget with requests the provider rejected, and
+    // would keep a key 402'd for the rest of the month after a transient
+    // upstream incident had already recovered.
+    if status.is_success() {
+        if let Some(key) = &authenticated_key {
+            charge_budget(&state, key, estimated_call_tokens(&request));
+        }
+    }
     if let Some(key) = &authenticated_key {
-        charge_budget(&state, key, estimated_call_tokens(&request));
         record_usage(
             &state,
             Some(key),
@@ -1517,9 +1537,12 @@ async fn usage_summary(
         ));
     }
     let since = window_since(params.get("window").map(String::as_str));
+    // The one endpoint most in need of the blocking hop: with no `key_id`
+    // filter it can aggregate the entire never-rotated ledger.
     let summary = state
         .usage
-        .summarize(since, None, params.get("client").map(String::as_str));
+        .summarize_blocking(since, None, params.get("client").map(|c| c.to_owned()))
+        .await;
     Ok(Json(serde_json::to_value(summary).unwrap_or(Value::Null)))
 }
 
@@ -3077,6 +3100,113 @@ mod integration_tests {
             counted,
             "a stream that dies mid-flight must be reported to the failover counter: {}",
             catalog.summary_json()
+        );
+    }
+
+    /// A rejected upstream call must not be billed to the key's budget.
+    ///
+    /// The non-streaming error path falls through to the same block that
+    /// charges for streaming, so the charge introduced there also fired for
+    /// 4xx/5xx responses. A client could drain its own monthly cap with requests
+    /// the provider refused, and a transient upstream incident would leave the
+    /// key hard-`402` for the rest of the month long after the provider
+    /// recovered -- which is the opposite of what a budget cap is for.
+    #[tokio::test]
+    async fn a_rejected_upstream_call_is_not_charged() {
+        let upstream = spawn_mock_upstream_failing_after(0, "application/json", None).await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state
+            .config
+            .extra
+            .insert("price_per_1k_usd".into(), json!(0.001));
+        let (_id, raw) = state
+            .auth
+            .create_key_full("rejected", "-", vec![], None, Some(0.0001), None)
+            .unwrap();
+        let quotas = Arc::clone(&state.quotas);
+        let app = build_router(state);
+
+        for _ in 0..3 {
+            let (status, body) = send(
+                app.clone(),
+                "POST",
+                "/v1/chat/completions",
+                Some(&raw),
+                Some(json!({"model":"auto","messages":[{"role":"user","content":"hi"}]})),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the upstream error must still pass through: {body}"
+            );
+        }
+        assert!(
+            quotas.check_budget(&_id, 0.0001),
+            "requests the provider rejected must not count against the budget"
+        );
+    }
+
+    /// Tool *history* must exclude a request from the semantic cache too, not
+    /// just a declared `tools` array.
+    ///
+    /// A client resuming an agentic loop commonly replays the transcript
+    /// without re-declaring its tools, so the guard on `request.tools` alone let
+    /// the original bug through one axis over: the tool-result text is folded
+    /// into the embedding, making the turn look similar, while
+    /// `QualityJudge::equivalent` still only compares the two last user
+    /// messages. The client would get a prose answer with no `tool_calls` on a
+    /// turn it expects a call from -- and `has_tool_history`'s Hard floor would
+    /// be skipped too, since the cache answers before `effective_tier`.
+    #[tokio::test]
+    async fn tool_history_is_not_served_from_the_semantic_cache() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state.config.cache.semantic_enabled = true;
+        let app = build_router(state);
+
+        // Turn 1: a plain question, no tools at all.
+        let plain = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "what is the weather in Paris"}]
+        });
+        let (status, _, body) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            None,
+            Some(plain),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        // Turn 2: the agentic loop resumes, replaying the transcript. Note the
+        // absence of a `tools` array -- only the history marks it agentic.
+        let resumed = json!({
+            "model": "auto",
+            "messages": [
+                {"role": "user", "content": "what is the weather in Paris"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp_c\":21}"}
+            ]
+        });
+        let (status, headers, body) =
+            send_raw(app, "POST", "/v1/chat/completions", None, Some(resumed)).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            headers.get("x-miser-cache").and_then(|v| v.to_str().ok()),
+            Some("miss"),
+            "a turn carrying tool history must not be answered from the semantic cache"
+        );
+        assert_eq!(
+            upstream.requests().await.len(),
+            2,
+            "the agentic turn must reach the upstream, not the cache"
         );
     }
 
