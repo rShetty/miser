@@ -165,11 +165,12 @@ impl CatalogRouter {
         }
         let current = state.active.get(&tier).cloned()?;
         let pin = state.snapshot.pins.get(&tier)?;
-        let position = pin
-            .candidates
-            .iter()
-            .position(|model| model == &current)
-            .unwrap_or(usize::MAX);
+        // `None` when the active model is absent from its own candidate list
+        // rather than a `usize::MAX` sentinel that the increment below would
+        // overflow. A panic here would be raised while the state mutex is held,
+        // poisoning it: `active_model` would return `None` forever and catalog
+        // routing would be silently dead for the life of the process.
+        let position = pin.candidates.iter().position(|model| model == &current)?;
         let next = pin.candidates.get(position + 1)?.clone();
         state.active.insert(tier, next.clone());
         state.failures.insert(tier, 0);
@@ -444,13 +445,28 @@ pub fn partition(
         };
         let mut candidates: Vec<String> = Vec::with_capacity(MAX_CANDIDATES);
         candidates.push(chosen.id.clone());
+        // A reasoning-tier failover target must itself be reasoning-capable.
+        // `pin_choice` returns the cheapest *reasoning-capable* model, which is
+        // generally not the cheapest in the band -- every cheaper model is
+        // non-reasoning by construction -- so building the list from the whole
+        // price-sorted pool made `candidates[1]` guaranteed non-reasoning. The
+        // tier meant for reasoning traffic would degrade on the first upstream
+        // failure streak. When the pool holds no other reasoning model, the
+        // list is left as just the pin, which keeps "a success never demotes"
+        // and means failover simply does not fire rather than firing onto
+        // something that cannot reason.
         for model in pool {
             if candidates.len() >= MAX_CANDIDATES {
                 break;
             }
-            if model.id != chosen.id {
-                candidates.push(model.id.clone());
+            if model.id == chosen.id {
+                continue;
             }
+            if tier == ComplexityTier::Reasoning && filters.prefer_reasoning_pin && !model.reasoning
+            {
+                continue;
+            }
+            candidates.push(model.id.clone());
         }
         pins.insert(
             tier,
@@ -525,6 +541,13 @@ fn parse_model(entry: &Value) -> Option<CatalogModel> {
             .and_then(Value::as_str)
             .and_then(|raw| raw.parse::<f64>().ok())
             .map(|per_token| per_token * 1_000_000.0)
+            // `is_finite` matters as much as the parse: "NaN", "inf" and "1e400"
+            // all parse successfully, and every band comparison is false for
+            // NaN, so such a model fell through to `Hard` -- the most expensive
+            // band -- and became a legal failover target. If one was ever a pin,
+            // the hysteresis test `best <= current * (1 - ratio)` is false
+            // forever and it stayed pinned permanently.
+            .filter(|per_million| per_million.is_finite())
             .unwrap_or(0.0)
     };
     let context_length = entry
@@ -915,6 +938,115 @@ mod tests {
             "a failed write must not change what traffic is routed to"
         );
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A snapshot whose active model is not among its own candidates must not
+    /// panic.
+    ///
+    /// `position` fell back to `usize::MAX` and was then incremented, which
+    /// overflows -- a panic in debug, a wrap to 0 in release. Worse, the panic
+    /// happens while the state mutex is held, so it poisons the lock: every
+    /// later `active_model` returns `None` and catalog routing is silently dead
+    /// for the life of the process, and `refresh` can never recover it.
+    /// `load_or_seed` accepts a snapshot verbatim, so a hand-edited or
+    /// foreign-schema file reaches this path.
+    #[test]
+    fn failover_with_an_unknown_active_model_does_not_panic() {
+        let router = router_with_pins(BTreeMap::from([(
+            ComplexityTier::Simple,
+            TierPin {
+                model: "s/pinned".to_owned(),
+                candidates: vec!["s/pinned".to_owned(), "s/next".to_owned()],
+            },
+        )]));
+        // Simulate a snapshot whose active model is not in its candidate list.
+        {
+            let mut state = router.state.lock().unwrap();
+            state
+                .active
+                .insert(ComplexityTier::Simple, "s/ghost".to_owned());
+        }
+        // Must return cleanly rather than overflowing, and the router must stay
+        // usable afterwards.
+        let promoted = router.report_failure(ComplexityTier::Simple, 1);
+        assert!(
+            promoted.is_none(),
+            "there is no successor to an unknown active model, got {promoted:?}"
+        );
+        assert!(
+            router.active_model(ComplexityTier::Simple).is_some(),
+            "the router must remain usable"
+        );
+        assert!(
+            router.summary_json().get("error").is_none(),
+            "the state lock must not be poisoned: {}",
+            router.summary_json()
+        );
+    }
+
+    /// Non-finite prices must be rejected, not banded.
+    ///
+    /// `"NaN".parse::<f64>()` is `Ok(NaN)`, and so are `"inf"` and `"1e400"`.
+    /// Every band comparison is false for NaN, so such a model fell through to
+    /// `Hard` -- the most expensive band -- and became a legal failover target.
+    /// If one was ever a previous pin, the hysteresis test
+    /// `best.price <= current_price * (1 - ratio)` is `x <= NaN`, i.e. false
+    /// forever, so the garbage model was pinned permanently.
+    #[test]
+    fn non_finite_prices_are_rejected() {
+        for raw in ["NaN", "nan", "inf", "-inf", "Infinity", "1e400"] {
+            let payload = json!({"data": [{
+                "id": "x/bad",
+                "pricing": {"prompt": raw, "completion": "0"},
+                "context_length": 200000
+            }]});
+            let parsed = parse_catalog(&payload);
+            assert!(
+                parsed.iter().all(|m| m.input_price_per_m.is_finite()),
+                "{raw} must not become a price, got {:?}",
+                parsed
+                    .iter()
+                    .map(|m| m.input_price_per_m)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The Reasoning tier's failover targets must themselves be
+    /// reasoning-capable.
+    ///
+    /// `pin_choice` returns the cheapest *reasoning-capable* model, which is
+    /// generally not the cheapest model in the band -- every cheaper model is
+    /// non-reasoning by construction. The candidate list was then built from
+    /// the whole price-sorted pool, so `candidates[1]`, the first failover
+    /// target, was guaranteed to be a non-reasoning model. The tier meant for
+    /// reasoning traffic silently degraded on the first upstream failure streak.
+    #[test]
+    fn reasoning_tier_failover_targets_are_reasoning_capable() {
+        // All three land in the Reasoning band, which is
+        // `standard_max < price <= reasoning_max` (0.36 < p <= 1.4).
+        let mut models: Vec<CatalogModel> = vec![
+            model("cheap/no-reason", 0.40),
+            model("mid/no-reason", 0.50),
+            model("thinker", 1.00),
+        ];
+        for candidate in &mut models {
+            if candidate.id == "thinker" {
+                candidate.reasoning = true;
+            }
+        }
+        let snapshot = partition(&models, &routing(), &BTreeMap::new());
+        let pin = snapshot
+            .pins
+            .get(&ComplexityTier::Reasoning)
+            .expect("reasoning tier must be pinned");
+        assert_eq!(pin.model, "thinker", "cheapest reasoning model is pinned");
+        for candidate in &pin.candidates {
+            assert_eq!(
+                candidate, &"thinker",
+                "a non-reasoning model became a reasoning failover target: {pin:?}"
+            );
+        }
     }
 
     /// A 2xx catalog response with no `data` array must not be persisted: it
