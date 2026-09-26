@@ -515,9 +515,26 @@ async fn completions_inner(
     // never serves an answer. Structured-output requests are excluded:
     // a cached response built for a different response_format contract
     // could break the client's parser.
+    //
+    // Tool-bearing requests are excluded for the same reason, and the
+    // exclusion has to be explicit because neither stage of the pipeline can
+    // see a tool contract: `request_text_for_embedding` hashes only
+    // `messages[].content`, and `QualityJudge::equivalent` compares only the
+    // two last user messages. So a tool-less prompt and the identical prompt
+    // with a tool attached are indistinguishable -- same embedding, and the
+    // judge is asked the same question about the same text. Serving the
+    // cached response then hands the client a body with no `tool_calls`, so
+    // its agentic loop has nothing to dispatch. Because the cache answers
+    // before classification, the tool-capable tier floor in `effective_tier`
+    // is skipped too, so the cheap model would have served it anyway.
+    //
+    // The exact-match cache still covers these requests -- `request_hash`
+    // keeps `tools` in the key -- so only genuinely different prompts miss.
     if state.config.cache.enabled
         && state.config.cache.semantic_enabled
         && request.response_format.is_none()
+        && request.tools.as_ref().is_none_or(Vec::is_empty)
+        && request.tool_choice.is_none()
         && !stream_requested
     {
         let embedding_text = semantic_cache::request_text_for_embedding(&body);
@@ -1741,6 +1758,137 @@ mod integration_tests {
             requests[0].get("model").and_then(Value::as_str),
             Some(served_model.as_str()),
             "upstream must receive the tier model, never 'auto'"
+        );
+    }
+
+    /// A request that carries `tools` must never be answered from the
+    /// semantic cache.
+    ///
+    /// The cache embeds only `messages[].content` and its equivalence judge
+    /// compares only the last user message, so neither can see that two
+    /// requests carry different tool contracts. A tool-less response holds no
+    /// `tool_calls`, so serving it to an agentic request leaves the client's
+    /// loop with nothing to dispatch -- and because the cache answers before
+    /// classification, the tool-capable tier floor in `effective_tier` is
+    /// never consulted either.
+    #[tokio::test]
+    async fn tool_bearing_request_is_not_served_from_the_semantic_cache() {
+        let upstream = spawn_mock_upstream(
+            Duration::from_millis(0),
+            StatusCode::OK,
+            "application/json",
+            None,
+        )
+        .await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state.config.cache.semantic_enabled = true;
+        let app = build_router(state);
+
+        // Warm the semantic cache with a tool-less request.
+        let tool_less = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "what is the weather in Paris"}]
+        });
+        let (status, _, body) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            None,
+            Some(tool_less),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        // Byte-identical prompt text, but the client now offers a tool it
+        // expects the model to call.
+        let with_tool = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "what is the weather in Paris"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}}
+                    }
+                }
+            }]
+        });
+        let (status, headers, body) =
+            send_raw(app, "POST", "/v1/chat/completions", None, Some(with_tool)).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        assert_eq!(
+            headers.get("x-miser-cache").and_then(|v| v.to_str().ok()),
+            Some("miss"),
+            "a tool-bearing request must not be answered from the semantic cache"
+        );
+
+        let requests = upstream.requests().await;
+        assert_eq!(
+            requests.len(),
+            2,
+            "the tool-bearing request must reach the upstream, not the cache"
+        );
+        assert!(
+            requests[1].get("tools").is_some(),
+            "the tool schema must be forwarded upstream"
+        );
+    }
+
+    /// The mirror of the test above: excluding tool-bearing requests must not
+    /// disable the semantic cache. This path had no end-to-end coverage at
+    /// all, so it could have been broken -- or excluded wholesale by a
+    /// regression -- without any test noticing.
+    ///
+    /// The two bodies differ only in whitespace, so `request_hash` (which
+    /// keeps `messages` in the key) misses the exact-match cache, while
+    /// `embed_prompt` normalizes the token bag and lands on cosine 1.0.
+    #[tokio::test]
+    async fn tool_less_rewrite_is_served_from_the_semantic_cache() {
+        let upstream = spawn_mock_upstream(
+            Duration::from_millis(0),
+            StatusCode::OK,
+            "application/json",
+            None,
+        )
+        .await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state.config.cache.semantic_enabled = true;
+        let app = build_router(state);
+
+        let original = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "what is the weather in paris"}]
+        });
+        let (status, _, body) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            None,
+            Some(original),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let rewritten = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "what  is  the  weather  in  paris"}]
+        });
+        let (status, headers, body) =
+            send_raw(app, "POST", "/v1/chat/completions", None, Some(rewritten)).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        assert_eq!(
+            headers.get("x-miser-cache").and_then(|v| v.to_str().ok()),
+            Some("hit-semantic"),
+            "an equivalent tool-less rewrite must still be served from the cache"
+        );
+        assert_eq!(
+            upstream.requests().await.len(),
+            1,
+            "the rewrite must not have reached the upstream"
         );
     }
 
