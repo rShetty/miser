@@ -122,16 +122,18 @@ model = "openai/gpt-4.1-mini"
 max_tokens = 1536
 
 [tiers.hard]
-# Was gpt-4.1-mini, chosen by a 2026-09-20 Jev bake-off on *static* SE
-# prompts. That corpus does not measure multi-step tool use, and in
-# practice the model produced no-op edits on real agentic tasks. Hard
-# tier is where coding-agent traffic lands, so quality wins here.
-model = "anthropic/claude-sonnet-5"
+# claude-sonnet-5 was pinned here on 2026-09-26 after gpt-4.1-mini produced
+# no-op edits on real agentic tasks. It worked, but at $2.00/$10.00 it is the
+# single most expensive line in this config. A tool-use bake-off against
+# z-ai/glm-5.3 (3 multi-step Python bugs, hidden verification suite, Jev
+# judge) scored 3/3 vs 3/3 with identical Jev quality, at 4.2x lower cost.
+model = "z-ai/glm-5.3"
 max_tokens = 8192
 
 [tiers.reasoning]
-# glm-5.2 scored 0.0 on every SE reasoning case (Jev judge) — disqualified.
-# A stale catalog snapshot also pinned this tier to a "flash" model until
-# the escalation path learned to respect `fixed` mode.
-model = "anthropic/claude-sonnet-5"
+# glm-5.2 scored 0.0 on every SE reasoning case (Jev judge) and was
+# disqualified. 5.3 is a different model and clears the agentic bake-off
+# above, so that verdict does not carry over. Re-run
+# scripts/classifier_benchmark.sh if a static SE corpus is wanted.
+model = "z-ai/glm-5.3"
 max_tokens = 8192
