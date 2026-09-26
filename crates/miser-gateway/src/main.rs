@@ -1293,13 +1293,26 @@ async fn update_key(
     let client = patch_field::<String>(&body, "client")
         .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?
         .map(|inner| inner.unwrap_or_default());
-    match state.auth.update_key_quotas(
-        &id,
-        client,
-        allowed_tiers,
-        rate_limit_rpm,
-        monthly_budget_usd,
-    ) {
+    // `active` and `expires_at` used to be ignored here while the API still
+    // answered `{"updated": true}`, so revoking a key or setting an expiry
+    // after creation was impossible without deleting the record -- which also
+    // discards the key's usage history.
+    let active = patch_field::<bool>(&body, "active")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?
+        .flatten();
+    let expires_at = patch_field::<u64>(&body, "expires_at")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?;
+    let outcome = state
+        .auth
+        .update_key_quotas(
+            &id,
+            client,
+            allowed_tiers,
+            rate_limit_rpm,
+            monthly_budget_usd,
+        )
+        .and_then(|()| state.auth.update_key_status(&id, active, expires_at));
+    match outcome {
         Ok(()) => Ok(Json(json!({"id": id, "updated": true}))),
         Err(auth::AuthError::NotFound) => {
             Err(auth::json_error("key not found", StatusCode::NOT_FOUND))
@@ -2446,6 +2459,95 @@ mod integration_tests {
             "an rpm above u32::MAX must be rejected, not truncated: {}",
             String::from_utf8_lossy(&body)
         );
+    }
+
+    /// `PATCH` must be able to revoke a key and set an expiry. Both fields used
+    /// to be ignored while the API answered `{"updated": true}`, so the only
+    /// way to neutralise a leaked key was `DELETE` -- which discards the
+    /// record along with the key's usage history.
+    #[tokio::test]
+    async fn update_key_can_revoke_and_set_expiry() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let state = test_state_with_upstream("secret-admin", upstream.base_url.clone());
+        let (id, raw) = state
+            .auth
+            .create_key_full("owner", "-", vec![], None, None, None)
+            .unwrap();
+        let app = build_router(state);
+
+        let completions = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(completions.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // Revoke: the key must be refused, and distinctly so.
+        let (status, _, body) = send_raw(
+            app.clone(),
+            "PATCH",
+            &format!("/admin/keys/{id}"),
+            Some("secret-admin"),
+            Some(json!({"active": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(completions.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a revoked key must be refused: {body}"
+        );
+
+        // Expiry, in the past so it is immediately effective.
+        let (status, _, body) = send_raw(
+            app.clone(),
+            "PATCH",
+            &format!("/admin/keys/{id}"),
+            Some("secret-admin"),
+            Some(json!({"expires_at": 1u64})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(completions),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an expired key must be refused: {body}"
+        );
+
+        // Still revoked: expiry did not quietly restore it.
+        let (status, _, body) = send_raw(
+            app,
+            "GET",
+            &format!("/admin/keys/{id}"),
+            Some("secret-admin"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let key: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(key["active"], json!(false), "still revoked");
+        assert_eq!(key["expires_at"], json!(1), "expiry was recorded");
     }
 
     /// A configured `request_timeout_ms` must still bound the request and

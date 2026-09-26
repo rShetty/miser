@@ -39,7 +39,7 @@ pub struct AuthManager {
     path: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum AuthError {
     InvalidKey,
@@ -101,14 +101,22 @@ impl AuthManager {
         let hash = sha256_hex(key);
         let store = self.store.lock().map_err(|_| AuthError::StoreError)?;
         for api_key in &store.keys {
-            if api_key.active && constant_time_eq(&api_key.key_hash, &hash) {
-                if let Some(expires_at) = api_key.expires_at {
-                    if unix_now() >= expires_at {
-                        return Err(AuthError::Expired);
-                    }
-                }
-                return Ok(api_key.clone());
+            if !constant_time_eq(&api_key.key_hash, &hash) {
+                continue;
             }
+            // A matching hash that is switched off is a *revoked* key, not an
+            // unknown one. Reporting it as such keeps the completions handler's
+            // `Inactive` arm (403) reachable, so a client can tell "you were
+            // revoked" from "that key never existed" (401).
+            if !api_key.active {
+                return Err(AuthError::Inactive);
+            }
+            if let Some(expires_at) = api_key.expires_at {
+                if unix_now() >= expires_at {
+                    return Err(AuthError::Expired);
+                }
+            }
+            return Ok(api_key.clone());
         }
         Err(AuthError::InvalidKey)
     }
@@ -185,9 +193,39 @@ impl AuthManager {
             .find(|k| k.id == id)
             .ok_or(AuthError::NotFound)?;
         key.key_hash = hash;
-        key.active = true;
+        // Deliberately leaves `active` alone. Force-enabling it here made
+        // rotation resurrect a key an operator had revoked, so the incident
+        // response undid itself. Re-enable explicitly via `update_key_status`.
         self.persist(&store)?;
         Ok(raw_key)
+    }
+
+    /// Revoke/restore a key, and set or clear its expiry.
+    ///
+    /// `active`: `None` leaves it alone. `expires_at`: `None` leaves it alone,
+    /// `Some(None)` clears it. This is the non-destructive counterpart to
+    /// `delete_key`, which drops the owner, quotas, tier allowlist and expiry
+    /// along with the secret -- and with them the key's usage history, which
+    /// `summarize` keys on `key_id`.
+    pub fn update_key_status(
+        &self,
+        id: &str,
+        active: Option<bool>,
+        expires_at: Option<Option<u64>>,
+    ) -> Result<(), AuthError> {
+        let mut store = self.store.lock().map_err(|_| AuthError::StoreError)?;
+        let key = store
+            .keys
+            .iter_mut()
+            .find(|k| k.id == id)
+            .ok_or(AuthError::NotFound)?;
+        if let Some(active) = active {
+            key.active = active;
+        }
+        if let Some(expires_at) = expires_at {
+            key.expires_at = expires_at;
+        }
+        self.persist(&store)
     }
 
     /// Update quota fields on an existing key.
@@ -230,18 +268,6 @@ impl AuthManager {
                 ..k.clone()
             })
             .collect())
-    }
-
-    #[allow(dead_code)]
-    pub fn revoke_key(&self, id: &str) -> Result<(), AuthError> {
-        let mut store = self.store.lock().map_err(|_| AuthError::StoreError)?;
-        let key = store
-            .keys
-            .iter_mut()
-            .find(|k| k.id == id)
-            .ok_or(AuthError::NotFound)?;
-        key.active = false;
-        self.persist(&store)
     }
 
     pub fn delete_key(&self, id: &str) -> Result<(), AuthError> {
@@ -539,6 +565,68 @@ mod tests {
             Ok(threads * per_thread),
             "concurrent appends must not fork the hash chain"
         );
+    }
+
+    /// A revoked key must stay revoked when its secret is rotated, and must
+    /// report *why* it was refused.
+    ///
+    /// `rotate_key` forced `active = true`, so rotating a key an operator had
+    /// deliberately disabled silently resurrected it -- turning the intended
+    /// incident-response tool into the mechanism that undid the response. And
+    /// because `validate` skipped inactive keys entirely, a revoked key came
+    /// back as `InvalidKey` (401) rather than `Inactive` (403), so the
+    /// `AuthError::Inactive` arm in the completions handler was unreachable and
+    /// clients could not distinguish "revoked" from "never existed".
+    #[test]
+    fn rotation_does_not_resurrect_a_revoked_key() {
+        let manager = AuthManager::new(temp_store("rotate_revoked")).unwrap();
+        let (id, raw) = manager
+            .create_key_full("owner", "-", vec![], None, None, None)
+            .unwrap();
+        assert!(manager.validate(&raw).is_ok());
+
+        // Revoke.
+        manager.update_key_status(&id, Some(false), None).unwrap();
+        assert_eq!(manager.validate(&raw).unwrap_err(), AuthError::Inactive);
+        assert_eq!(
+            manager.validate(&raw).unwrap_err().to_string(),
+            "API key inactive",
+            "a revoked key must be distinguishable from an unknown one"
+        );
+
+        // Rotating the secret must not undo the revocation.
+        let rotated = manager.rotate_key(&id).unwrap();
+        assert_eq!(
+            manager.validate(&rotated).unwrap_err(),
+            AuthError::Inactive,
+            "rotation must not reactivate a revoked key"
+        );
+
+        // Re-enabling restores access, without needing to delete the record.
+        manager.update_key_status(&id, Some(true), None).unwrap();
+        assert!(manager.validate(&rotated).is_ok());
+    }
+
+    /// Expiry must be settable after creation. It used to be accepted only at
+    /// creation time, so `PATCH {"expires_at": ...}` was ignored while the API
+    /// answered `{"updated": true}`.
+    #[test]
+    fn expiry_can_be_set_and_cleared_after_creation() {
+        let manager = AuthManager::new(temp_store("expiry_update")).unwrap();
+        let (id, raw) = manager
+            .create_key_full("owner", "-", vec![], None, None, None)
+            .unwrap();
+        assert!(manager.validate(&raw).is_ok(), "no expiry yet");
+
+        let past = unix_now() - 10;
+        manager
+            .update_key_status(&id, None, Some(Some(past)))
+            .unwrap();
+        assert_eq!(manager.validate(&raw).unwrap_err(), AuthError::Expired);
+
+        // null clears it again.
+        manager.update_key_status(&id, None, Some(None)).unwrap();
+        assert!(manager.validate(&raw).is_ok());
     }
 
     #[test]
