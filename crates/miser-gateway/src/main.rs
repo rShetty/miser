@@ -70,6 +70,40 @@ struct AppState {
     admin_key: String,
 }
 
+/// The gateway's per-request deadline, from `request_timeout_ms` or the
+/// checked-in default.
+///
+/// Single source of truth: the axum `TimeoutLayer` and the provider HTTP client
+/// both derive from this, so the transport gives up at the same point the
+/// request layer does. Previously the client had no timeout at all, leaving
+/// callers outside the request stack -- notably the spawned startup catalog
+/// refresh -- able to wait on a hung upstream indefinitely.
+fn request_timeout(config: &GatewayConfig) -> Duration {
+    Duration::from_millis(
+        config
+            .extra
+            .get("request_timeout_ms")
+            .and_then(Value::as_u64)
+            .filter(|timeout| *timeout > 0)
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS),
+    )
+}
+
+/// Build the upstream provider's config, including the transport timeout.
+///
+/// `provider_preferences` is applied by the caller, which can propagate a
+/// serialisation failure.
+fn provider_client_config(config: &GatewayConfig, api_key: &str) -> ProviderConfig {
+    ProviderConfig {
+        base_url: config.provider.base_url.clone(),
+        api_key: Some(api_key.to_owned()),
+        // Rounded up, and never zero: `as_secs` would floor a sub-second
+        // deadline to 0, which reqwest reads as "time out immediately".
+        timeout_seconds: Some(request_timeout(config).as_secs().max(1)),
+        ..Default::default()
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let json_logs = std::env::var("RUST_LOG_FORMAT").as_deref() == Ok("json");
@@ -95,11 +129,7 @@ async fn main() -> anyhow::Result<()> {
     if api_key.is_empty() {
         anyhow::bail!("provider API key is required");
     }
-    let mut provider_config = ProviderConfig {
-        base_url: config.provider.base_url.clone(),
-        api_key: Some(api_key),
-        ..Default::default()
-    };
+    let mut provider_config = provider_client_config(&config, &api_key);
     provider_config.provider_preferences = config
         .provider
         .provider_preferences
@@ -320,15 +350,7 @@ fn build_router(state: AppState) -> Router {
         .and_then(Value::as_u64)
         .filter(|limit| *limit > 0)
         .unwrap_or(DEFAULT_CONCURRENCY_LIMIT as u64) as usize;
-    let request_timeout = Duration::from_millis(
-        state
-            .config
-            .extra
-            .get("request_timeout_ms")
-            .and_then(Value::as_u64)
-            .filter(|timeout| *timeout > 0)
-            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS),
-    );
+    let request_timeout = request_timeout(&state.config);
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
@@ -2707,6 +2729,50 @@ mod integration_tests {
             simple["consecutive_failures"],
             json!(1),
             "the escalated call's 503 must be counted against the escalated tier: {simple}"
+        );
+    }
+
+    /// The provider HTTP client must have a timeout.
+    ///
+    /// `ProviderConfig` was built with only `base_url` and `api_key`, so
+    /// `timeout_seconds` stayed `None` and reqwest was constructed with *no*
+    /// timeout at all. Every upstream call was then bounded only by the axum
+    /// `TimeoutLayer` -- which does not cover every caller: the startup catalog
+    /// refresh is a spawned task outside the request stack, so a hung
+    /// `/models` response could keep it waiting indefinitely, and an admin
+    /// refresh held a concurrency permit until the 300s layer fired.
+    #[test]
+    fn provider_client_gets_a_timeout() {
+        let base: GatewayConfig =
+            toml::from_str(include_str!("../../../config/miser.toml")).unwrap();
+
+        let default_config = provider_client_config(&base, "sk-test");
+        assert_eq!(
+            default_config.timeout_seconds,
+            Some(DEFAULT_REQUEST_TIMEOUT_MS.div_ceil(1000)),
+            "the provider must fall back to the gateway's request deadline"
+        );
+
+        // An explicit ceiling is honoured, and reaches the transport.
+        let mut tuned = base.clone();
+        tuned
+            .extra
+            .insert("request_timeout_ms".into(), json!(45_000u64));
+        assert_eq!(
+            provider_client_config(&tuned, "sk-test").timeout_seconds,
+            Some(45)
+        );
+
+        // A nonsense value must not produce a zero timeout, which reqwest
+        // treats as "give up immediately".
+        let mut broken = base.clone();
+        broken
+            .extra
+            .insert("request_timeout_ms".into(), json!(0u64));
+        assert_eq!(
+            provider_client_config(&broken, "sk-test").timeout_seconds,
+            Some(DEFAULT_REQUEST_TIMEOUT_MS.div_ceil(1000)),
+            "a zero/negative ceiling must fall back, not fail every request instantly"
         );
     }
 
