@@ -499,6 +499,48 @@ mod tests {
         );
     }
 
+    /// The hash chain must survive concurrent appends.
+    ///
+    /// `append_outcome` read the tail with `last_hash()` and then appended in a
+    /// separate syscall, with no lock, and callers reach it *after* releasing
+    /// the key-store mutex. Two admin requests running in parallel on the
+    /// multi-threaded runtime could both read the same tail and both chain from
+    /// it, leaving two entries with the same `prev_hash`. `verify_chain` then
+    /// fails at the second of them -- and because every later append takes its
+    /// `prev_hash` from the last line, the fork is permanent. The only remedy
+    /// was to stop reading the log, silently disarming the system's sole
+    /// tamper-evidence control.
+    #[test]
+    fn concurrent_appends_keep_the_chain_verifiable() {
+        let log = std::sync::Arc::new(AuditLog::new(temp_store("audit_chain")));
+        let threads = 8;
+        let per_thread = 25;
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let log = std::sync::Arc::clone(&log);
+                std::thread::spawn(move || {
+                    for i in 0..per_thread {
+                        log.append_outcome(
+                            "admin",
+                            "create_key",
+                            &format!("key_{t}_{i}"),
+                            "success",
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("audit append thread");
+        }
+        assert_eq!(
+            log.verify_chain(),
+            Ok(threads * per_thread),
+            "concurrent appends must not fork the hash chain"
+        );
+    }
+
     #[test]
     fn expired_key_is_rejected_by_validate() {
         let manager = AuthManager::new(temp_store("expired")).unwrap();
@@ -706,6 +748,14 @@ mod quota_tests {
 /// [`AuditLog::verify_chain`].
 pub struct AuditLog {
     path: PathBuf,
+    /// Serialises the read-tail-then-append sequence.
+    ///
+    /// Both halves must be atomic together. Without this, two admin requests
+    /// running in parallel could read the same tail and chain from it, forking
+    /// the hash chain permanently, and their `writeln!` calls could interleave
+    /// mid-line and corrupt an entry outright. The key-store mutex does not
+    /// cover this: `append_outcome` runs after it has been released.
+    append_lock: Mutex<()>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -724,7 +774,10 @@ impl AuditLog {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        Self { path }
+        Self {
+            path,
+            append_lock: Mutex::new(()),
+        }
     }
 
     fn compute_row_hash(entry: &AuditEntry) -> String {
@@ -761,6 +814,8 @@ impl AuditLog {
         target: &str,
         outcome: &str,
     ) -> Result<(), AuthError> {
+        // Held across both the tail read and the append: see `append_lock`.
+        let _guard = self.append_lock.lock().map_err(|_| AuthError::StoreError)?;
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
