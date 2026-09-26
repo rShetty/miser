@@ -1134,13 +1134,25 @@ fn charge_budget(state: &AppState, key: &auth::ApiKey, tokens: f64) {
 
 /// Parse a reporting window query value ("24h" | "7d" | "30d" | "all")
 /// into a lower-bound unix timestamp; `None` means no lower bound.
+///
+/// Only an explicit `all` returns `None`. Anything unrecognised used to fall
+/// into the same arm, so a typo like `window=90d` silently became a full scan of
+/// an append-only ledger that is never rotated -- the one input most likely to
+/// hurt. Unknown values now fall back to the 30-day default and say so.
 fn window_since(window: Option<&str>) -> Option<u64> {
     let now = unix_now();
     match window.unwrap_or("30d") {
-        "24h" => Some(now.saturating_sub(86_400)),
+        "24h" => Some(now.saturating_sub(24 * 3_600)),
         "7d" => Some(now.saturating_sub(7 * 86_400)),
         "30d" => Some(now.saturating_sub(30 * 86_400)),
-        _ => None,
+        "all" => None,
+        other => {
+            tracing::warn!(
+                window = other,
+                "unrecognised usage window; falling back to 30d (`all` means no lower bound)"
+            );
+            Some(now.saturating_sub(30 * 86_400))
+        }
     }
 }
 fn internal<E: std::fmt::Display>(error: E) -> (StatusCode, Json<Value>) {
@@ -1222,7 +1234,10 @@ async fn list_keys(
         Ok(keys) => {
             // Attach a 30-day usage rollup per key (OpenRouter-style).
             let since = unix_now().saturating_sub(30 * 86_400);
-            let rollups = state.usage.summarize(Some(since), None, None);
+            let rollups = state
+                .usage
+                .summarize_blocking(Some(since), None, None)
+                .await;
             let enriched: Vec<Value> = keys
                 .iter()
                 .map(|k| {
@@ -1479,7 +1494,10 @@ async fn usage_key_detail(
         return Err(auth::json_error("key not found", StatusCode::NOT_FOUND));
     }
     let since = window_since(params.get("window").map(String::as_str));
-    let summary = state.usage.summarize(since, Some(&id), None);
+    let summary = state
+        .usage
+        .summarize_blocking(since, Some(id.clone()), None)
+        .await;
     Ok(Json(serde_json::to_value(summary).unwrap_or(Value::Null)))
 }
 
@@ -1496,7 +1514,7 @@ async fn usage_clients(
         ));
     }
     let since = window_since(params.get("window").map(String::as_str));
-    let summary = state.usage.summarize(since, None, None);
+    let summary = state.usage.summarize_blocking(since, None, None).await;
     let clients: Vec<Value> = summary
         .by_client
         .iter()
@@ -2774,6 +2792,38 @@ mod integration_tests {
             Some(DEFAULT_REQUEST_TIMEOUT_MS.div_ceil(1000)),
             "a zero/negative ceiling must fall back, not fail every request instantly"
         );
+    }
+
+    /// An unrecognised `window` must not silently mean "no lower bound".
+    ///
+    /// `window_since` mapped every unknown value to `None`, so `window=90d` --
+    /// or any typo -- became a full scan of an append-only ledger that is never
+    /// rotated. Only an explicit `all` may do that.
+    #[test]
+    fn unknown_usage_window_falls_back_to_a_bounded_one() {
+        let now = unix_now();
+        assert_eq!(window_since(Some("24h")), Some(now.saturating_sub(86_400)));
+        assert_eq!(window_since(Some("7d")), Some(now.saturating_sub(604_800)));
+        assert_eq!(
+            window_since(Some("30d")),
+            Some(now.saturating_sub(2_592_000))
+        );
+        assert_eq!(
+            window_since(None),
+            Some(now.saturating_sub(2_592_000)),
+            "the default must be bounded"
+        );
+        assert_eq!(
+            window_since(Some("all")),
+            None,
+            "only an explicit `all` may scan the whole ledger"
+        );
+        for unknown in ["90d", "forever", "", "30D", "-1"] {
+            assert!(
+                window_since(Some(unknown)).is_some(),
+                "window={unknown:?} must fall back to a bounded window"
+            );
+        }
     }
 
     /// A configured `request_timeout_ms` must still bound the request and

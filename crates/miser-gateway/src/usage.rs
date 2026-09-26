@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead as _, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -115,6 +115,26 @@ impl UsageLedger {
         }
     }
 
+    /// [`Self::summarize`] off the async runtime.
+    ///
+    /// `summarize` is synchronous blocking IO with no await point, so calling it
+    /// straight from an async handler blocked a runtime worker for the whole
+    /// scan and the surrounding `TimeoutLayer` could not interrupt it -- the
+    /// work ran to completion (or to OOM) regardless of the deadline.
+    pub async fn summarize_blocking(
+        self: &std::sync::Arc<Self>,
+        since_ts: Option<u64>,
+        key_id: Option<String>,
+        client: Option<String>,
+    ) -> UsageSummary {
+        let ledger = std::sync::Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            ledger.summarize(since_ts, key_id.as_deref(), client.as_deref())
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// Aggregate every recorded request in the window defined by the
     /// optional filters. `since_ts` filters by time; the other two filter
     /// by attribution.
@@ -125,11 +145,24 @@ impl UsageLedger {
         client: Option<&str>,
     ) -> UsageSummary {
         let mut summary = UsageSummary::default();
-        let Ok(text) = fs::read_to_string(&self.path) else {
+        // Streamed line by line rather than `read_to_string`. This ledger is
+        // append-only and never rotated, so slurping it meant the whole file
+        // was resident before a single record was filtered -- and since the
+        // window filter runs per record *after* the read, asking for 24h gave no
+        // memory relief at all. Every admin dashboard load held the entire file
+        // as a `String` on top of the aggregation maps.
+        let Ok(file) = fs::File::open(&self.path) else {
             return summary;
         };
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let Ok(record) = serde_json::from_str::<UsageRecord>(line) else {
+        for line in std::io::BufReader::new(file).lines() {
+            let Ok(line) = line else {
+                // A torn tail from a crash should not blank the rollup.
+                continue;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<UsageRecord>(&line) else {
                 continue;
             };
             if let Some(since) = since_ts {
@@ -391,5 +424,85 @@ mod tests {
         assert_eq!(summary.by_day["2026-01-01"].requests, 2);
         assert!((summary.by_day["2026-01-01"].cost_usd - 0.5).abs() < 1e-9);
         assert_eq!(summary.by_day["2026-01-02"].requests, 1);
+    }
+
+    /// Aggregation must stream the ledger, not slurp it.
+    ///
+    /// `summarize` did `fs::read_to_string`, so the entire file was resident
+    /// before a single record was filtered. The ledger is append-only and never
+    /// rotated, so at a modest 1M requests/day it reaches tens of megabytes in
+    /// weeks and hundreds within a quarter -- and because the window filter is
+    /// applied per record *after* the read, asking for 24h gave no memory relief
+    /// whatsoever. Every admin dashboard load held the whole file as a `String`
+    /// on top of the aggregation maps, and being synchronous with no await
+    /// point, the `TimeoutLayer` could not interrupt it.
+    ///
+    /// The rewrite reads line by line, so the window filter now bounds the work
+    /// as well as the result. This pins that the streaming rewrite still
+    /// aggregates exactly.
+    #[test]
+    fn summarize_streams_and_filters_by_window() {
+        let path = temp_path("stream");
+        let ledger = UsageLedger::new(path.clone());
+        // 5_000 out-of-window records, then 3 inside it.
+        for i in 0..5_000u64 {
+            ledger.record(&record(1_000 + i, "key_old", "-", "m/one", "simple", 1.0));
+        }
+        for i in 0..3u64 {
+            ledger.record(&record(9_000 + i, "key_new", "-", "m/one", "simple", 2.0));
+        }
+        let size = std::fs::metadata(&path).expect("ledger written").len();
+        assert!(size > 100_000, "fixture must be large to be meaningful");
+
+        let summary = ledger.summarize(Some(9_000), None, None);
+        assert_eq!(summary.requests, 3, "only in-window records may be counted");
+        assert!(
+            (summary.cost_usd - 6.0).abs() < 1e-9,
+            "in-window cost must be the 3 in-window records only, got {}",
+            summary.cost_usd
+        );
+
+        // An unbounded window still counts everything.
+        assert_eq!(ledger.summarize(None, None, None).requests, 5_003);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A final line written without a trailing newline must still be counted.
+    #[test]
+    fn summarize_counts_a_final_line_without_a_trailing_newline() {
+        let path = temp_path("no_newline");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}",
+                serde_json::to_string(&record(1, "k", "-", "m/one", "simple", 1.0)).unwrap(),
+                serde_json::to_string(&record(2, "k", "-", "m/one", "simple", 1.0)).unwrap()
+            ),
+        )
+        .unwrap();
+        let ledger = UsageLedger::new(path.clone());
+        assert_eq!(ledger.summarize(None, None, None).requests, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A malformed line must be skipped, not abort the whole rollup -- a
+    /// half-written tail from a crash should not blank the dashboard.
+    #[test]
+    fn summarize_skips_malformed_lines() {
+        let path = temp_path("malformed");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\nnot json at all\n{{\"partial\":\n{}\n",
+                serde_json::to_string(&record(1, "k", "-", "m/one", "simple", 1.0)).unwrap(),
+                serde_json::to_string(&record(2, "k", "-", "m/one", "simple", 3.0)).unwrap(),
+            ),
+        )
+        .unwrap();
+        let ledger = UsageLedger::new(path.clone());
+        let summary = ledger.summarize(None, None, None);
+        assert_eq!(summary.requests, 2, "good records must survive");
+        assert!((summary.cost_usd - 4.0).abs() < 1e-9);
+        let _ = std::fs::remove_file(&path);
     }
 }
