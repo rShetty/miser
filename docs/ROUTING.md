@@ -139,6 +139,13 @@ Measured by driving the running gateway on `:8787` with real prompts and reading
 back the model that served each one. Tiers are not abstract: they resolve to a
 monotonically more capable — and more expensive — model per step.
 
+> **The tier-to-model mapping below is stable** — it comes from
+> `config/miser.toml`, not from classifier code. The *classification decisions*
+> observed while probing were made by a **stale binary**: the running gateway
+> predates the current classifier work and its `target/release` artefact no
+> longer exists on disk. Re-run the probe against a freshly built gateway before
+> quoting any per-prompt decision from it.
+
 | tier | model | example prompt |
 |---|---|---|
 | trivial | `mistralai/mistral-nemo` | `Hello` |
@@ -146,6 +153,7 @@ monotonically more capable — and more expensive — model per step.
 | standard | `openai/gpt-4.1-mini` | `add request validation to the auth endpoints` |
 | hard | `z-ai/glm-5.3` | `Write a threat model for the payment processing service` |
 | reasoning | `z-ai/glm-5.3` | `Prove that a distributed counter with CRDT merge converges` |
+
 
 Two things this end-to-end probe showed that the unit tests cannot:
 
