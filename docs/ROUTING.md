@@ -133,6 +133,36 @@ fails on **either** side. Observed 0.5246 vs 0.5246 expected on the curated set;
 0.2057 vs 0.2029 on the large one. A router that sent everything to the top tier
 would read 1.0; one that never escalated would read 0.0.
 
+## The live model ladder
+
+Measured by driving the running gateway on `:8787` with real prompts and reading
+back the model that served each one. Tiers are not abstract: they resolve to a
+monotonically more capable — and more expensive — model per step.
+
+| tier | model | example prompt |
+|---|---|---|
+| trivial | `mistralai/mistral-nemo` | `Hello` |
+| simple | `qwen/qwen3-30b-a3b-instruct-2507` | `Explain how DNS resolution works` |
+| standard | `openai/gpt-4.1-mini` | `add request validation to the auth endpoints` |
+| hard | `z-ai/glm-5.3` | `Write a threat model for the payment processing service` |
+| reasoning | `z-ai/glm-5.3` | `Prove that a distributed counter with CRDT merge converges` |
+
+Two things this end-to-end probe showed that the unit tests cannot:
+
+* **The over-routing in [#51](https://github.com/rShetty/miser/issues/51) is a
+  fallback-only problem.** `hello! no need to do anything with kubernetes today,
+  just checking` routes to the *cheapest* model under Jev, even though the
+  heuristic mis-tiers it. The heuristic bug is real but only reachable when the
+  Jev path is unavailable.
+* **`@route:` works end to end.** `@route:hard` on the prompt `hello` serves
+  `z-ai/glm-5.3`, and `@ROUTE:HARD` does the same, so both the override and its
+  case-insensitivity hold in the live path.
+
+  One open question: `@route:trivial` on a long technical prompt served the
+  *simple* model, not the trivial one. That is consistent with a policy floor in
+  `miser-policy` deliberately raising the tier, but it was **not verified** and
+  is worth confirming before anyone relies on `@route:trivial` as a cost lever.
+
 ## Configuration
 
 Both new stages are **opt-in and default off**:
