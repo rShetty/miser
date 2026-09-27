@@ -26,6 +26,28 @@ pub enum ContentPart {
     Other,
 }
 
+impl MessageContent {
+    /// The text of this content, ignoring non-text parts.
+    ///
+    /// Lives here rather than at each call site so a second copy cannot drift
+    /// out of step with the first: the classifier needs this to build its
+    /// request envelope, and the corpus gates need it to name a case in a
+    /// failure message.
+    pub fn to_text(&self) -> String {
+        match self {
+            MessageContent::Text(text) => text.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImageUrl {
     pub url: String,

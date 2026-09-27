@@ -52,7 +52,7 @@ impl Classifier {
                 .build()
                 .expect("client construction"),
             trivial: RegexSet::new([
-                r"(?i)^\s*(hello|hi|hey|thanks|thank you|ok|okay|good morning|bye|please|help|version)\s*[!.]*\s*$",
+                r"(?i)^\s*(hello|hi|hey|thanks|thank you|ok|okay|good morning|bye|please|help|version)\s*(?:there|everyone|all|team|folks)?\s*[!.]*\s*$",
                 r"(?i)\b(git status|git diff|git log|v\d+\.\d+\.\d+)\b",
                 r"(?i)^(what is|what's|how to|how do|how does|where is)\s+(your\s+name|2\s*\+\s*2|the\s+time|the\s+date|my\s+name)\b",
                 r"(?i)\b(rename|uppercase|lowercase|trim|hello world|test input|unit test)\b.*\b(variable|file|string|line)\b",
@@ -477,7 +477,15 @@ impl Classifier {
             .timeout(std::time::Duration::from_millis(endpoint.timeout_ms))
             .json(&body)
             .bearer_auth(endpoint.api_key.as_deref().unwrap_or_default());
-        let payload: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+        // A structured endpoint should return bare JSON, but a gateway or proxy
+        // in front of it can hand back a fenced or prose-wrapped body, and the
+        // LLM path already tolerates that. Two paths reading the same contract
+        // differently is how a fix to one silently misses the other, so recover
+        // the same way here and keep the availability-over-accuracy policy.
+        let raw = req.send().await?.error_for_status()?.text().await?;
+        let payload: serde_json::Value = serde_json::from_str(raw.trim())
+            .or_else(|_| serde_json::from_str(strip_code_fence(&raw).trim()))
+            .map_err(|_| ClassifierError::Format)?;
         let answers = &payload["answers"];
         let tier_str = answers["tier"]["choice"].as_str().unwrap_or_default();
         let tier = match tier_str {
@@ -551,38 +559,30 @@ fn request_text(request: &ChatCompletionRequest) -> String {
         .join("\n")
 }
 
-/// Drop a surrounding Markdown code fence, including its language tag.
+/// Extract the contents of the first Markdown code fence, if there is one.
 ///
-/// Accepts the three-character-backtick form with or without a `json` tag on
-/// the opening line, and returns the input unchanged when there is no fence.
+/// Handles a fence at the start of the text or after a prose preamble, with or
+/// without a language tag on the opening line, and returns the input unchanged
+/// when there is no fence. Matching the *first* closing fence rather than the
+/// last matters when the trailing prose itself contains backticks.
 fn strip_code_fence(content: &str) -> &str {
     let trimmed = content.trim();
-    if !trimmed.starts_with("```") {
+    let Some(open) = trimmed.find("```") else {
         return trimmed;
-    }
-    // Skip the opening fence and an optional language tag on the same line.
-    let after_open = match trimmed.find('\n') {
-        Some(nl) => &trimmed[nl + 1..],
+    };
+    // Skip past the opening fence and any language tag on the same line.
+    let after_open = match trimmed[open..].find('\n') {
+        Some(offset) => &trimmed[open + offset + 1..],
         None => return "",
     };
-    match after_open.rfind("```") {
+    match after_open.find("```") {
         Some(end) => after_open[..end].trim(),
         None => after_open.trim(),
     }
 }
 /// Text of a single message, ignoring non-text parts.
 fn message_text(message: &miser_types::ChatMessage) -> String {
-    match &message.content {
-        MessageContent::Text(text) => text.clone(),
-        MessageContent::Parts(parts) => parts
-            .iter()
-            .filter_map(|part| match part {
-                miser_types::ContentPart::Text { text } => Some(text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
+    message.content.to_text()
 }
 
 fn override_tier(request: &miser_types::ChatCompletionRequest) -> Option<(ComplexityTier, String)> {
