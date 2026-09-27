@@ -615,18 +615,17 @@ fn has_light_agentic(lower: &str) -> bool {
 }
 
 fn has_agentic_tools(request: &ChatCompletionRequest) -> bool {
+    // Word-matched, not substring-matched. `contains("file")` fired on
+    // `get_user_profile` and `contains("search")` on `research_agent`, so a
+    // plain read-only profile lookup put a "hello" on the Hard tier and the
+    // reasoning model.
+    const AGENTIC: [&str; 9] = [
+        "shell", "bash", "execute", "run", "file", "search", "grep", "command", "terminal",
+    ];
     request.tools.as_ref().is_some_and(|tools| {
         tools.iter().any(|tool| {
-            let tool_str = tool.to_string().to_lowercase();
-            tool_str.contains("shell")
-                || tool_str.contains("bash")
-                || tool_str.contains("execute")
-                || tool_str.contains("run")
-                || tool_str.contains("file")
-                || tool_str.contains("search")
-                || tool_str.contains("grep")
-                || tool_str.contains("command")
-                || tool_str.contains("terminal")
+            let lowered = tool.to_string().to_lowercase();
+            AGENTIC.iter().any(|needle| has_word(&lowered, needle))
         })
     })
 }
@@ -1366,5 +1365,40 @@ mod tests {
                 result.reasons
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_names_are_not_agentic() {
+        let with_tool = |name: &str| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "function", "function": {"name": name}}]
+            }))
+            .unwrap()
+        };
+        let classifier = Classifier::new(classifier_config("heuristic")).unwrap();
+
+        let result = classifier
+            .classify(&with_tool("get_user_profile"))
+            .await
+            .unwrap();
+        assert_ne!(
+            result.tier,
+            ComplexityTier::Hard,
+            "a read-only profile lookup must not be agentic"
+        );
+        assert!(
+            !result.reasons.iter().any(|r| r == "agentic-tools"),
+            "reasons were {:?}",
+            result.reasons
+        );
+
+        // A genuine shell tool still is.
+        let shell = classifier
+            .classify(&with_tool("run_shell"))
+            .await
+            .unwrap();
+        assert!(shell.reasons.iter().any(|r| r == "agentic-tools"));
     }
 }
