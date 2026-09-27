@@ -233,6 +233,70 @@ impl Default for ClassifierSecurityConfig {
     }
 }
 
+/// What to do when verification says the cheap answer was wrong.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CascadeAction {
+    /// Raise the tier so the strongest available model sees it. This is the
+    /// point of the cascade: a caught misroute costs one extra call, a missed
+    /// one costs the whole answer being wrong.
+    #[default]
+    Escalate,
+    /// Trust the cheap answer and record the disagreement. Cheaper, and the
+    /// right setting when escalation is more expensive than the error.
+    Accept,
+}
+
+/// Two-stage classification: decide locally, then pay to check the decision.
+///
+/// The local heuristic is free and instant but is a fixed pattern set, so it
+/// fails in ways that are systematic rather than random -- the same phrasing
+/// always misroutes. Verification asks Jev whether the tier that was chosen is
+/// actually the right one, and escalates when it is not. This is the router
+/// analogue of a verified cascade: the check is only worth paying for where the
+/// cheap answer is unsure, so it is gated on confidence rather than run on
+/// every request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClassifierCascadeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Only verify when the local answer's confidence is at or below this.
+    /// Verifying a decision the heuristic is confident about spends money to
+    /// confirm something the patterns already got right.
+    #[serde(default = "default_verify_below")]
+    pub verify_below: f32,
+    /// A verification failure raises the tier to at least Hard.
+    #[serde(default, skip_serializing_if = "is_default_cascade")]
+    pub on_unverified: CascadeAction,
+    /// Confidence the verifier must reach before its disagreement is believed.
+    /// A verifier that is itself unsure should not be able to escalate traffic.
+    #[serde(default = "default_verify_confidence")]
+    pub verify_confidence: f32,
+}
+
+fn default_verify_below() -> f32 {
+    0.70
+}
+
+fn default_verify_confidence() -> f32 {
+    0.80
+}
+
+fn is_default_cascade(action: &CascadeAction) -> bool {
+    *action == CascadeAction::default()
+}
+
+impl Default for ClassifierCascadeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            verify_below: default_verify_below(),
+            on_unverified: CascadeAction::default(),
+            verify_confidence: default_verify_confidence(),
+        }
+    }
+}
+
 /// Per-million-token prices for the classifier itself, used to turn the
 /// `usage` block into a number.
 ///
@@ -303,6 +367,10 @@ pub struct ClassificationResult {
     /// Local cost of the routing decision in USD, when cost accounting is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classifier_cost_usd: Option<f64>,
+    /// How the tier was arrived at: `local`, `local-verified`, or
+    /// `local-escalated` after a verifier disagreed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<String>,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -359,6 +427,9 @@ pub struct ClassifierConfig {
     /// contract (`POST {base_url}/evaluate`), not chat completions.
     #[serde(default)]
     pub jev: ClassifierEndpointConfig,
+    /// Two-stage classification: decide locally, then verify the decision.
+    #[serde(default)]
+    pub cascade: ClassifierCascadeConfig,
     /// Prompt-injection / secret-extraction screening, asked as a `noul`.
     #[serde(default)]
     pub security: ClassifierSecurityConfig,
@@ -959,6 +1030,7 @@ mod tests {
             security_risk: Some(0.93),
             jev_model: Some("jev-1.13.0".into()),
             classifier_cost_usd: Some(0.000_020),
+            cascade: Some("local-verified".into()),
             extra: Default::default(),
         };
         let raw = serde_json::to_value(&result).unwrap();
@@ -971,6 +1043,7 @@ mod tests {
         assert_eq!(raw["security_risk"].as_f64().unwrap() as f32, 0.93);
         assert_eq!(raw["jev_model"], "jev-1.13.0");
         assert_eq!(raw["classifier_cost_usd"], 0.000_020);
+        assert_eq!(raw["cascade"], "local-verified");
         assert_eq!(
             serde_json::from_value::<ClassificationResult>(raw).unwrap(),
             result

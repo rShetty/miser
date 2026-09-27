@@ -148,6 +148,8 @@ mod tests {
             security_risk: None,
             jev_model: None,
             classifier_cost_usd: None,
+
+            cascade: None,
             extra: Default::default(),
         };
         let config: GatewayConfig =
@@ -179,6 +181,8 @@ mod tests {
             security_risk: None,
             jev_model: None,
             classifier_cost_usd: None,
+
+            cascade: None,
             extra: Default::default(),
         };
         let config: GatewayConfig =
@@ -215,6 +219,8 @@ mod tests {
             security_risk: None,
             jev_model: None,
             classifier_cost_usd: None,
+
+            cascade: None,
             extra: Default::default(),
         };
         let config: GatewayConfig =
