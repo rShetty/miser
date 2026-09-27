@@ -566,9 +566,7 @@ fn message_text(message: &miser_types::ChatMessage) -> String {
     }
 }
 
-fn override_tier(
-    request: &miser_types::ChatCompletionRequest,
-) -> Option<(ComplexityTier, String)> {
+fn override_tier(request: &miser_types::ChatCompletionRequest) -> Option<(ComplexityTier, String)> {
     // The directive belongs to the user, not to whatever happens to open the
     // transcript. Reading it from the joined text meant any request starting
     // with a system prompt -- or a null-content assistant turn, which is every
@@ -594,7 +592,10 @@ fn override_tier(
         _ => {
             // Failing open into the heuristic is the risky direction for an
             // explicit request, so say so rather than dropping it silently.
-            tracing::warn!(directive = tier, "unknown @route: tier; ignoring the override");
+            tracing::warn!(
+                directive = tier,
+                "unknown @route: tier; ignoring the override"
+            );
             return None;
         }
     };
@@ -644,8 +645,17 @@ fn has_word(lower: &str, needle: &str) -> bool {
 
 fn coding_or_reasoning(lower: &str) -> Option<TaskType> {
     const CODING: [&str; 11] = [
-        "code", "implement", "function", "python", "typescript", "debug", "api", "endpoint",
-        "retry", "bug", "rest",
+        "code",
+        "implement",
+        "function",
+        "python",
+        "typescript",
+        "debug",
+        "api",
+        "endpoint",
+        "retry",
+        "bug",
+        "rest",
     ];
     if CODING.iter().any(|needle| has_word(lower, needle)) {
         Some(TaskType::Coding)
@@ -796,7 +806,11 @@ mod tests {
     /// Serve `body` once, for a test that needs the answer, not the request.
     async fn spawn_answer(
         body: serde_json::Value,
-    ) -> (String, Arc<Mutex<Vec<MockRequest>>>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        String,
+        Arc<Mutex<Vec<MockRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         spawn_mock(vec![MockHttpResponse {
             status: 200,
             body,
@@ -1515,10 +1529,7 @@ mod tests {
         );
 
         // A genuine shell tool still is.
-        let shell = classifier
-            .classify(&with_tool("run_shell"))
-            .await
-            .unwrap();
+        let shell = classifier.classify(&with_tool("run_shell")).await.unwrap();
         assert!(shell.reasons.iter().any(|r| r == "agentic-tools"));
     }
 
