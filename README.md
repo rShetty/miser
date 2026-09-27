@@ -12,19 +12,45 @@ Miser is an open-source, Rust-based AI gateway that intelligently routes OpenAI-
 
 Miser uses Jev to classify every prompt into a complexity tier (trivial → simple → standard → hard → reasoning) and routes to the cheapest capable model. The results speak for themselves:
 
-**Held-out benchmark (116 adversarial cases, never used for tuning):**
+**Held-out benchmark (116 adversarial cases in `evals/classifier_cases.jsonl`, never used for tuning):**
 
-| Router | Exact Accuracy | Adjacent Accuracy | Under-route | Over-route | Latency |
+| Router | Exact Accuracy | Adjacent Accuracy | Under-route | Over-route | Latency (p50) |
 |---|---:|---:|---:|---:|---:|
-| **Miser (Jev)** | **90.5%** | **100%** | **6.0%** | **3.4%** | ~340ms |
-| Miser (heuristic) | 74.1% | 90.5% | 9.5% | 16.4% | <1ms |
-| OpenRouter Auto | 52.0% | 84.0% | 32.0% | - | 4.16s |
+| **Miser (Jev)** | **89.7%** | **100%** | **6.9%** | **3.5%** | 338ms |
+| Miser (heuristic) | 83.6% | 94.8% | 4.3% | 12.1% | <1ms |
+| OpenRouter Auto † | 52.0% | 84.0% | 32.0% | - | 4.16s |
+
+Reproduce with:
+
+```bash
+# heuristic (free, offline)
+cargo run -p miser-evals -- --corpus evals/classifier_cases.jsonl --mode heuristic
+
+# Jev (needs JEV_API_KEY; ~116 calls, so it costs a little)
+cargo run -p miser-evals -- --corpus evals/classifier_cases.jsonl \
+    --mode jev --config config/miser.toml --concurrency 8
+```
+
+† the OpenRouter Auto row is a previously published figure and is **not**
+re-measured here; only the two Miser rows are. Jev's probabilities vary slightly
+between runs, so treat its accuracy as ±1%.
 
 **What this means:**
 - **100% adjacent accuracy** — Miser never routes more than 1 tier away from optimal
-- **6% under-routing** — hard work rarely goes to weak models (vs 32% for OpenRouter Auto)
-- **3.4% over-routing** — trivial prompts don't waste money on frontier models (vs 16.4% heuristic)
-- **5× less over-routing** than regex heuristics
+- **6.9% under-routing** — hard work rarely goes to weak models (vs 32% for OpenRouter Auto)
+- **3.5% over-routing** — trivial prompts don't waste money on frontier models (vs 12.1% heuristic)
+- **3.5× less over-routing** than the regex heuristic
+
+### Other corpora
+
+| Corpus | Cases | Mode | Exact | Under | Over |
+|---|---:|---|---:|---:|---:|
+| `cases.jsonl` (curated) | 61 | heuristic | **100.0%** | 0.0% | 0.0% |
+| `classifier_cases_large.jsonl` | 2100 | heuristic | 93.1% | 2.6% | 4.3% |
+
+`cases.jsonl` is hand-curated and is held at 100% by CI. The other two are
+generated (the large one is 83.5% duplicate rows behind 347 unique prompts) and
+are held at committed accuracy floors instead — see [docs/EVALUATION.md](docs/EVALUATION.md).
 
 ### Best Quality Outputs
 
