@@ -972,7 +972,25 @@ async fn completions_inner(
         );
         // Semantic cache gets the final (quality-gated, possibly escalated)
         // response so near-duplicate requests reuse the best answer.
-        if state.config.cache.enabled && state.config.cache.semantic_enabled {
+        //
+        // Skipped when this response contains `tool_calls`. The lookup guard
+        // already refuses to serve tool-bearing *requests*, but the mirror of
+        // that mattered too: a tool-calling body stored here can be replayed to
+        // a plain, tool-free turn, and the client would act on a `tool_calls`
+        // entry for tools it never declared. A response that cannot be served
+        // to anything is not worth caching.
+        let response_has_tool_calls = serde_json::from_slice::<Value>(&payload)
+            .ok()
+            .and_then(|body| {
+                body["choices"][0]["message"]["tool_calls"]
+                    .as_array()
+                    .map(|calls| !calls.is_empty())
+            })
+            .unwrap_or(false);
+        if state.config.cache.enabled
+            && state.config.cache.semantic_enabled
+            && !response_has_tool_calls
+        {
             let embedding_text = semantic_cache::request_text_for_embedding(&body);
             state.semantic_cache.store(
                 semantic_cache::embed_prompt(&embedding_text),
@@ -3268,6 +3286,109 @@ mod integration_tests {
             upstream.requests().await.len(),
             2,
             "the agentic turn must reach the upstream, not the cache"
+        );
+    }
+
+    /// A tool-calling response must not be stored in the semantic cache.
+    ///
+    /// The lookup guard refuses to serve tool-bearing *requests*, but the store
+    /// was unconditional. So a response carrying `tool_calls` was written and
+    /// could later be replayed to a plain, tool-free turn — the mirror of the
+    /// bug the guard fixed. The client would receive a `tool_calls` entry naming
+    /// tools it never declared, and no tool result would ever arrive to
+    /// continue the turn.
+    #[tokio::test]
+    async fn a_tool_calling_response_is_not_stored_in_the_semantic_cache() {
+        // The mock has to vary its answer by request, or the second turn gets
+        // the same body straight from upstream and the test proves nothing
+        // about the cache. A tool-bearing request gets a `tool_calls` reply; a
+        // tool-free one gets plain prose.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16 * 1024];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if request.contains("\"tools\"") {
+                    json!({
+                        "id": "mock-completion", "object": "chat.completion",
+                        "model": "test/trivial",
+                        "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                            "role": "assistant", "content": Value::Null,
+                            "tool_calls": [{"id": "call_1", "type": "function",
+                                "function": {"name": "get_weather", "arguments": "{}"}}]
+                        }}]
+                    })
+                } else {
+                    json!({
+                        "id": "mock-completion", "object": "chat.completion",
+                        "model": "test/trivial",
+                        "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                            "role": "assistant", "content": "It is 21C in Paris."
+                        }}]
+                    })
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let mut state = test_state_with_upstream("", format!("http://{addr}"));
+        state.config.cache.semantic_enabled = true;
+        let app = build_router(state);
+
+        // A tool-bearing request: the lookup guard lets it through to the
+        // upstream, and the upstream answers with a tool call.
+        let asking = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "what is the weather in Paris"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}}
+            }]
+        });
+        let (status, _, body) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            None,
+            Some(asking),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let served: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            served["choices"][0]["message"]["tool_calls"].is_array(),
+            "the upstream's tool call should have been relayed"
+        );
+
+        // A later tool-free turn with the same text. The embedding is built from
+        // message content only, so this turn and the one above are *identical*
+        // to the cache -- cosine 1.0, well past any threshold. Without the store
+        // guard it is served the tool call.
+        let plain = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "what is the weather in Paris"}]
+        });
+        let (status, headers, body) =
+            send_raw(app, "POST", "/v1/chat/completions", None, Some(plain)).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_ne!(
+            headers.get("x-miser-cache").and_then(|v| v.to_str().ok()),
+            Some("hit-semantic"),
+            "a tool-free turn must not be served a cached tool call"
+        );
+        let served: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            served["choices"][0]["message"]["tool_calls"].is_null(),
+            "a tool-free turn must never receive tool_calls"
         );
     }
 
