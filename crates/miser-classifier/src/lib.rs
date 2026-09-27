@@ -132,7 +132,8 @@ impl Classifier {
                 // Bare git plumbing with no target: a lookup, not a task.
                 r"(?i)^\s*git\s+(remote|stash|branch|show|log|status|diff)\b\s*(-\S+\s*)*$",
                 r"(?i)^\s*no questions?\b.*\b(there|needed)\b\s*$",
-                r"(?i)\b(port|ip address|hostname|help|support)\b",
+                r"(?i)\b(ip address|hostname|help|support)\b",
+                r"(?i)^\s*(what|which)\b[^?]{0,40}\bport\b",
             ])?,
             simple: RegexSet::new([
                 r"(?i)\b(explain|summarize|compare|convert|translate|format|describe|tell\s+me|demo|example|snippet|shell command|powershell)\b",
@@ -169,8 +170,8 @@ impl Classifier {
                 r"(?i)\b(memoiz|snapshot|batch|dataload|connection pool)\b",
             ])?,
             hard: RegexSet::new([
-                r"(?i)\b(architect|distributed|production incident|threat-model|zero-downtime|multi-region|multi-region)\b",
-                r"(?i)\b(security|concurrency|race condition|migration|rollout|failover)\b.*\b(design|analy[sz]e|plan|fix)\b",
+                r"(?i)\b(architect|distributed|production incident|threat[- ]model|zero[- ]downtime|multi[- ]region)\b",
+                r"(?i)\b(security|concurrency|race condition|migration|rollout|failover)\b.*\b(design|analy[sz]e|analy[sz]ing|plan|planning|fix|investigate|investigating|debug|review)\b",
                 r"(?i)\b(one million|80-file|across (all|every|five))\b",
                 // Scale, counted rather than enumerated: "40 services" never
                 // matched "200 microservices".
@@ -192,7 +193,8 @@ impl Classifier {
                 r"(?i)\b(prove|derive|counterexample|formal|satisfiable|optimality|correctness)\b",
                 r"(?i)\b(algorithm|recurrence|serialization graph|posterior|inference|theorem|amortized|asymptotic|complexity)\b.*\b(analysis|design|prove|derive|bound|analy[sz]e|complexity)\b",
                 r"(?i)\b(analy[sz]e|compute|derive|work out)\b[^.]{0,40}\b(complexity|amortized|asymptotic|recurrence|theorem|serialization graph|proof|correctness)\b",
-                r"(?i)\b(amortized|invariant|converge|distributed counter)\b.*\b(prove|derive|analysis|analy[sz]e|complexity)\b",
+                r"(?i)\b(prove|derive|proof)\b[^.]{0,60}\b(amortized|invariant|converge|distributed counter|complexity|correctness|crdt)\b",
+                r"(?i)\b(amortized|invariant|converge|distributed counter|complexity|crdt)\b[^.]{0,60}\b(prove|derive|proof|analy[sz]e)\b",
                 r"(?i)\b(halting problem|undecidable|diagonal)\b",
                 r"(?i)\b(reduction|3.sat|polynomial.time|complexity class)\b",
                 r"(?i)\b(bayesian|posterior|conjugate|likelihood)\b.*\b(derive|prove|estimate)\b",
