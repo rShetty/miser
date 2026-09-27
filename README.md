@@ -43,21 +43,43 @@ between runs, so treat its accuracy as ±1%.
 
 ### Head-to-head vs `typesafe/jev-router`
 
-83 paired comparisons on held-out prompts stratified across all five tiers, both
+90 paired comparisons on held-out prompts stratified across all five tiers, both
 routers answering the same ones, each answer scored 1–5 by `openai/gpt-4.1`
 (a model neither router selected, so it is not judging its own output).
+
+**Variant B — jev-router constrained off the free tier.** This is the fair
+comparison, and the one to quote.
+
+| | quality (1–5) | cost | better / worse / tied |
+|---|---:|---:|---:|
+| **Miser** | **3.80** | **$0.0255** | 39 / 14 / 37 |
+| `typesafe/jev-router` (paid only) | 3.20 | $0.0299 | — |
+
+**+0.60 quality at comparable cost** (1.17× cheaper), winning 39 to 14.
+
+**Variant A — jev-router as shipped, default config.**
 
 | | quality (1–5) | cost | better / worse / tied |
 |---|---:|---:|---:|
 | **Miser** | **3.75** | **$0.0254** | 31 / 10 / 42 |
-| `typesafe/jev-router` | 3.16 | $0.3441 | — |
+| `typesafe/jev-router` (default) | 3.16 | $0.3441 | — |
 
-**13.5× cheaper and +0.59 quality.** The quality gap opens up on the harder tiers:
-jev-router held `stealth/space-bunny-alpha` for 60 of 83 prompts including the
-proof and architecture tasks, while Miser escalated those to `z-ai/glm-5.3`.
+**The 13.5× cost figure in earlier revisions of this table was misleading.** It
+was an artifact of the opponent selecting `stealth/space-bunny-alpha`, a $0
+model, for 60 of 83 prompts — including *Write a threat model for the payment
+processing service* (8/8 trials). Force it off free models and it reaches for
+frontier models (`openai/gpt-6-luna` 41, `gpt-6-sol` 13), and the cost gap
+collapses from 13.5× to 1.17×. We are still ahead on quality (+0.59 here, +0.60
+there) but we are **not** dramatically cheaper, and claiming otherwise would be
+reading a competitor's pricing decision as a routing win.
 
-Reproduce with `scripts/head-to-head.py` (needs `OPENROUTER_API_KEY` and a
-running gateway on `:8787`).
+Reproduce both with `scripts/head-to-head.py` and `scripts/head-to-head-paid.py`
+(needs `OPENROUTER_API_KEY` and a running gateway on `:8787`).
+
+Neither variant can be steered away from free models by the caller: a
+`models` allow-list excluding `space-bunny` is **ignored**, and only
+`provider.only` shifts the outcome. Variant B is therefore a *different
+configuration*, not a neutral one, and the two numbers must not be merged.
 
 ### Is jev-router's concentration just an artifact of our account settings?
 
