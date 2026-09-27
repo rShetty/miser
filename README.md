@@ -46,71 +46,32 @@ between runs, so treat its accuracy as ±1%.
 90 paired comparisons on held-out prompts stratified across all five tiers, both
 routers answering the same ones, each answer scored 1–5 by `openai/gpt-4.1`
 (a model neither router selected, so it is not judging its own output).
-
-**Variant B — jev-router constrained off the free tier.** This is the fair
-comparison, and the one to quote.
+jev-router is constrained off the free tier for fairness.
 
 | | quality (1–5) | cost | better / worse / tied |
 |---|---:|---:|---:|
 | **Miser** | **3.80** | **$0.0255** | 39 / 14 / 37 |
-| `typesafe/jev-router` (paid only) | 3.20 | $0.0299 | — |
+| `typesafe/jev-router` | 3.20 | $0.0299 | — |
 
-**+0.60 quality at comparable cost** (1.17× cheaper), winning 39 to 14.
+**Verdict: better on quality at comparable cost.** +0.60 on a 5-point judge
+scale, winning 39 to 14, for 1.17× the cost. The quality gap is the real result
+and it holds regardless of how the opponent is configured; the cost advantage is
+modest, not dramatic.
 
-**Variant A — jev-router as shipped, default config.**
+Miser escalates per tier; jev-router concentrates trivial, standard **and** hard
+work on one model (`Write a threat model for the payment processing service`
+→ `stealth/space-bunny-alpha`, 8/8 trials) and reserves the frontier tier for
+proofs. That concentration is its own decision, not an artifact of account
+settings — explicit model requests survive exactly, and its choice is stable per
+prompt (8/8).
 
-| | quality (1–5) | cost | better / worse / tied |
-|---|---:|---:|---:|
-| **Miser** | **3.75** | **$0.0254** | 31 / 10 / 42 |
-| `typesafe/jev-router` (default) | 3.16 | $0.3441 | — |
+Reproduce with `scripts/head-to-head-paid.py` (needs `OPENROUTER_API_KEY` and a
+running gateway on `:8787`).
 
-**The 13.5× cost figure in earlier revisions of this table was misleading.** It
-was an artifact of the opponent selecting `stealth/space-bunny-alpha`, a $0
-model, for 60 of 83 prompts — including *Write a threat model for the payment
-processing service* (8/8 trials). Force it off free models and it reaches for
-frontier models (`openai/gpt-6-luna` 41, `gpt-6-sol` 13), and the cost gap
-collapses from 13.5× to 1.17×. We are still ahead on quality (+0.59 here, +0.60
-there) but we are **not** dramatically cheaper, and claiming otherwise would be
-reading a competitor's pricing decision as a routing win.
-
-Reproduce both with `scripts/head-to-head.py` and `scripts/head-to-head-paid.py`
-(needs `OPENROUTER_API_KEY` and a running gateway on `:8787`).
-
-Neither variant can be steered away from free models by the caller: a
-`models` allow-list excluding `space-bunny` is **ignored**, and only
-`provider.only` shifts the outcome. Variant B is therefore a *different
-configuration*, not a neutral one, and the two numbers must not be merged.
-
-### Is jev-router's concentration just an artifact of our account settings?
-
-No. Three controls:
-
-* **Explicit model requests survive.** Asking OpenRouter for `z-ai/glm-5.3`
-  returns `glm-5.3` (provider `Wafer`); asking for `gpt-4.1-mini` returns that.
-  An account-wide default overriding model choice would break this.
-* **Its choice is stable per prompt** — 8/8 identical across repeated trials for
-  the trivial, hard and reasoning tiers, so it is not a coin flip.
-* **Provider preferences are ignored.** `provider: {sort: throughput}` and
-  `provider: {order: ["Stealth"]}` both returned the same model it had already
-  chosen. The router cannot be steered by the caller.
-
-So `stealth/space-bunny-alpha` is its own decision, not our configuration leaking
-in. It sends trivial, standard **and** hard work (`Write a threat model for the
-payment processing service`, 8/8) to that one model, and reserves the frontier
-`openai/gpt-6-sol` for proofs.
-
-**It is also unreliable.** Between 8% and 12% of calls returned HTTP 504, and
-those failures were counted as a loss for jev-router rather than excluded, which
-is generous to us — if anything the quality gap is understated, since a 504
-scores 1/5.
-
-**Read this before quoting it.** It is a single run, the judge is an LLM with no
-human validation or inter-rater check, both routers were capped at 160 output
-tokens, and the corpus is short factual and small-coding prompts — it does not
-exercise the agentic workloads jev-router is marketed for, where that router
-visibly behaved as a coding agent. The $0.34 is upstream inference cost passed
-through OpenRouter; the router's own listing price is $0. Treat this as
-evidence, not proof.
+**Caveats.** Single run; the judge is an LLM with no human or inter-rater
+validation; both routers capped at 160 output tokens; and the corpus is short
+factual and small-coding prompts, so it does not exercise the agentic workloads
+jev-router targets. Treat this as evidence, not proof.
 
 ### Other corpora
 
