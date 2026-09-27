@@ -527,19 +527,30 @@ fn task(text: &str) -> Option<TaskType> {
     coding_or_reasoning(&lower)
 }
 
+/// Whether `text` contains `needle` as a *word*.
+///
+/// These are unanchored substring checks because they look at words, and
+/// substring matching on words silently matches other words that contain them:
+/// `contains("code")` fires on "unicode" and "barcode", `contains("api")` on
+/// "capital", `contains("rest")` on "interest" and "restaurant". Each false
+/// positive mints a `Coding` task, which then earns the +10 bonus below and can
+/// outvote a genuine Hard or Reasoning match -- so "The capital of France" was
+/// classified as a coding task and escalated.
+fn has_word(lower: &str, needle: &str) -> bool {
+    lower.match_indices(needle).any(|(at, _)| {
+        let before = lower[..at].chars().next_back();
+        let after = lower[at + needle.len()..].chars().next();
+        let boundary = |c: Option<char>| !c.is_some_and(char::is_alphanumeric);
+        boundary(before) && boundary(after)
+    })
+}
+
 fn coding_or_reasoning(lower: &str) -> Option<TaskType> {
-    if lower.contains("code")
-        || lower.contains("implement")
-        || lower.contains("function")
-        || lower.contains("python")
-        || lower.contains("typescript")
-        || lower.contains("debug")
-        || lower.contains("api")
-        || lower.contains("endpoint")
-        || lower.contains("retry")
-        || lower.contains("bug")
-        || lower.contains("rest")
-    {
+    const CODING: [&str; 11] = [
+        "code", "implement", "function", "python", "typescript", "debug", "api", "endpoint",
+        "retry", "bug", "rest",
+    ];
+    if CODING.iter().any(|needle| has_word(lower, needle)) {
         Some(TaskType::Coding)
     } else if lower.contains("prove") || lower.contains("derive") || lower.contains("algorithm") {
         Some(TaskType::Reasoning)
@@ -661,6 +672,19 @@ fn result(
 mod tests {
     use super::*;
     use miser_types::ChatCompletionRequest;
+
+    /// A config that never calls out, for the tier rules themselves.
+    fn classifier_config(mode: &str) -> ClassifierConfig {
+        let mode = match mode {
+            "heuristic" => ClassifierMode::Heuristic,
+            "local_llm" => ClassifierMode::LocalLlm,
+            other => panic!("no such classifier mode: {other:?}"),
+        };
+        let mut config: ClassifierConfig = serde_json::from_str("{}").unwrap();
+        config.mode = mode;
+        config.confidence_threshold = 0.65;
+        config
+    }
 
     fn request(text: &str) -> ChatCompletionRequest {
         serde_json::from_value(json!({"model":"auto","messages":[{"role":"user","content":text}]}))
@@ -1307,5 +1331,40 @@ mod tests {
         );
         assert_eq!(result.tier, ComplexityTier::Standard);
         server.await.unwrap();
+    }
+
+    /// Word matching, not substring matching, for the keyword sets.
+    #[test]
+    fn keyword_matching_is_word_anchored() {
+        assert!(has_word("implement a cache", "implement"));
+        assert!(has_word("an api client", "api"));
+        assert!(has_word("multi-step intent", "step"), "'-' is a boundary");
+        assert!(has_word("code.", "code"), "punctuation is a boundary");
+        assert!(!has_word("the capital of france", "api"));
+        assert!(!has_word("unicode normalization", "code"));
+        assert!(!has_word("interest rate", "rest"));
+        assert!(!has_word("decode the payload", "code"));
+    }
+
+    #[tokio::test]
+    async fn prose_is_not_typed_as_a_coding_task() {
+        let classifier = Classifier::new(classifier_config("heuristic")).unwrap();
+        for prompt in [
+            "What is the capital of France",
+            "Explain unicode normalization",
+            "Recommend a restaurant in Berlin",
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": prompt}]
+            }))
+            .unwrap();
+            let result = classifier.classify(&request).await.unwrap();
+            assert!(
+                !result.reasons.iter().any(|r| r == "coding-task"),
+                "{prompt:?} was typed as a coding task: {:?}",
+                result.reasons
+            );
+        }
     }
 }
