@@ -350,7 +350,14 @@ impl Classifier {
         let content = payload["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or_default();
+        // The prompt asks for JSON, but models wrap it in a ```json fence often
+        // enough that ignoring the fence means silently discarding a good
+        // answer. `trim_matches('`')` only stripped backticks from the very
+        // ends, so the common form became `json\n{...}\n` and both attempts
+        // failed. Strip a leading fence line and its language tag, and the
+        // trailing fence, then parse.
         let parsed: LlmResult = serde_json::from_str(content)
+            .or_else(|_| serde_json::from_str(strip_code_fence(content).trim()))
             .or_else(|_| serde_json::from_str(content.trim_matches('`').trim()))?;
         Ok(result(
             parsed.tier,
@@ -525,6 +532,25 @@ fn request_text(request: &ChatCompletionRequest) -> String {
         .join("\n")
 }
 
+/// Drop a surrounding Markdown code fence, including its language tag.
+///
+/// Accepts the three-character-backtick form with or without a `json` tag on
+/// the opening line, and returns the input unchanged when there is no fence.
+fn strip_code_fence(content: &str) -> &str {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed;
+    }
+    // Skip the opening fence and an optional language tag on the same line.
+    let after_open = match trimmed.find('\n') {
+        Some(nl) => &trimmed[nl + 1..],
+        None => return "",
+    };
+    match after_open.rfind("```") {
+        Some(end) => after_open[..end].trim(),
+        None => after_open.trim(),
+    }
+}
 /// Text of a single message, ignoring non-text parts.
 fn message_text(message: &miser_types::ChatMessage) -> String {
     match &message.content {
@@ -1670,5 +1696,26 @@ mod tests {
                 "{body} must not be accepted as a confident Jev answer"
             );
         }
+    }
+
+    /// A fenced JSON answer must be usable, not silently discarded.
+    #[tokio::test]
+    async fn a_fenced_json_answer_is_not_discarded() {
+        let base = spawn_answer(serde_json::json!({
+            "choices": [{"message": {"content":
+                "```json\n{\"tier\":\"hard\",\"confidence\":0.9}\n```"
+            }}]
+        }))
+        .await
+        .0;
+        let classifier = Classifier::new(llm_config(&base)).unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "design a resilient multi-region migration"}]
+        }))
+        .unwrap();
+        let result = classifier.classify(&request).await.unwrap();
+        assert_eq!(result.classifier, "local_llm");
+        assert_eq!(result.tier, ComplexityTier::Hard);
     }
 }
