@@ -59,13 +59,36 @@ proof and architecture tasks, while Miser escalated those to `z-ai/glm-5.3`.
 Reproduce with `scripts/head-to-head.py` (needs `OPENROUTER_API_KEY` and a
 running gateway on `:8787`).
 
+### Is jev-router's concentration just an artifact of our account settings?
+
+No. Three controls:
+
+* **Explicit model requests survive.** Asking OpenRouter for `z-ai/glm-5.3`
+  returns `glm-5.3` (provider `Wafer`); asking for `gpt-4.1-mini` returns that.
+  An account-wide default overriding model choice would break this.
+* **Its choice is stable per prompt** — 8/8 identical across repeated trials for
+  the trivial, hard and reasoning tiers, so it is not a coin flip.
+* **Provider preferences are ignored.** `provider: {sort: throughput}` and
+  `provider: {order: ["Stealth"]}` both returned the same model it had already
+  chosen. The router cannot be steered by the caller.
+
+So `stealth/space-bunny-alpha` is its own decision, not our configuration leaking
+in. It sends trivial, standard **and** hard work (`Write a threat model for the
+payment processing service`, 8/8) to that one model, and reserves the frontier
+`openai/gpt-6-sol` for proofs.
+
+**It is also unreliable.** Between 8% and 12% of calls returned HTTP 504, and
+those failures were counted as a loss for jev-router rather than excluded, which
+is generous to us — if anything the quality gap is understated, since a 504
+scores 1/5.
+
 **Read this before quoting it.** It is a single run, the judge is an LLM with no
-human validation or inter-rater check, 7 of 90 pairs failed outright, both
-routers were capped at 160 output tokens, and the corpus is short factual and
-small-coding prompts — it does not exercise the agentic workloads jev-router is
-marketed for, where that router visibly behaved as a coding agent. The $0.34 is
-upstream inference cost passed through OpenRouter; the router's own listing
-price is $0. Treat this as evidence, not proof.
+human validation or inter-rater check, both routers were capped at 160 output
+tokens, and the corpus is short factual and small-coding prompts — it does not
+exercise the agentic workloads jev-router is marketed for, where that router
+visibly behaved as a coding agent. The $0.34 is upstream inference cost passed
+through OpenRouter; the router's own listing price is $0. Treat this as
+evidence, not proof.
 
 ### Other corpora
 
