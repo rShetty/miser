@@ -269,7 +269,20 @@ impl Classifier {
             scores[1].1 += 5;
             reasons.push("explanatory-context".into());
         }
-        if classification_task == Some(TaskType::Coding) && scores[1].1 <= 1 {
+        // A detected coding task is a strong signal, but it must not outrank a
+        // tier the *text itself* matched. The bonus is 10 while a single
+        // Hard pattern is 6 and a single Reasoning pattern 7, so
+        // "Prove correctness of the CRDT implementation" scored Reasoning 7 and
+        // then lost to Standard 11 -- a formal-correctness proof served by the
+        // mid-tier model. The floor at Standard is kept; the bonus is only
+        // withheld when a higher tier already has a pattern match, which is
+        // exactly the "when two tiers are plausible choose the higher one"
+        // rule the Jev prompt states.
+        if classification_task == Some(TaskType::Coding)
+            && scores[1].1 <= 1
+            && scores[3].1 == 0
+            && scores[4].1 == 0
+        {
             scores[2].1 += 10;
             reasons.push("coding-task".into());
         }
@@ -1400,5 +1413,41 @@ mod tests {
             .await
             .unwrap();
         assert!(shell.reasons.iter().any(|r| r == "agentic-tools"));
+    }
+
+    /// A formal-correctness request must reach the Reasoning tier.
+    ///
+    /// The prompt has to trip exactly one Reasoning pattern or the guard is
+    /// never exercised: "Prove correctness of the CRDT implementation" matches
+    /// both `prove` and `correctness` in one regex, so Reasoning scores 14 and
+    /// wins at 14 > 10 with or without the guard -- it passes for the wrong
+    /// reason. `audit the correctness of the retry logic` matches
+    /// `correctness` alone (7) while `retry` still makes it a Coding task (+10).
+    #[tokio::test]
+    async fn a_coding_task_does_not_outrank_a_matched_reasoning_pattern() {
+        let classifier = Classifier::new(classifier_config("heuristic")).unwrap();
+        for prompt in [
+            "audit the correctness of the retry logic",
+            "Prove correctness of the CRDT implementation",
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": prompt}]
+            }))
+            .unwrap();
+            let result = classifier.classify(&request).await.unwrap();
+            assert_eq!(
+                result.tier,
+                ComplexityTier::Reasoning,
+                "{prompt:?} is a correctness question, got {:?} ({:?})",
+                result.tier,
+                result.reasons
+            );
+            assert!(
+                !result.reasons.iter().any(|r| r == "coding-task"),
+                "{prompt:?} must not be billed as a coding task: {:?}",
+                result.reasons
+            );
+        }
     }
 }
