@@ -535,7 +535,16 @@ fn task(text: &str) -> Option<TaskType> {
         return Some(TaskType::Agentic);
     }
     if has_light_agentic(&lower) {
-        return Some(TaskType::Coding);
+        // Deliberately *not* a Coding task. This overlaps the Trivial tier
+        // table -- `git status`, `git diff`, `git log` are listed there -- so
+        // returning `Coding` earned the +10 `coding-task` bonus and overrode the
+        // Trivial pattern that had just matched, putting every one-liner
+        // `git status` in a session on the mid-tier model. A status check is a
+        // lookup, not a coding task. Note this set is broader than the Trivial
+        // table (it also matches prose like "print the version"), so returning
+        // `None` leaves those to the tier patterns alone rather than demoting
+        // them.
+        return None;
     }
     coding_or_reasoning(&lower)
 }
@@ -1446,6 +1455,56 @@ mod tests {
             assert!(
                 !result.reasons.iter().any(|r| r == "coding-task"),
                 "{prompt:?} must not be billed as a coding task: {:?}",
+                result.reasons
+            );
+        }
+    }
+
+    /// A one-line lookup must not be promoted by a "coding task".
+    ///
+    /// Only prompts the Trivial *tier table* lists may assert a Trivial tier.
+    /// `has_light_agentic` is a task-type signal, not a tier signal: it also
+    /// matches prose like "print the version", which the table does not list, so
+    /// that one is correctly a Simple lookup. What must hold for all of them is
+    /// that none is treated as a coding task.
+    #[tokio::test]
+    async fn light_agentic_lookups_stay_trivial() {
+        let classifier = Classifier::new(classifier_config("heuristic")).unwrap();
+        for prompt in ["git status", "git diff"] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": prompt}]
+            }))
+            .unwrap();
+            let result = classifier.classify(&request).await.unwrap();
+            assert_eq!(
+                result.tier,
+                ComplexityTier::Trivial,
+                "{prompt:?} is a one-line lookup, got {:?} ({:?})",
+                result.tier,
+                result.reasons
+            );
+        }
+
+        // A light lookup the Trivial table does not list still must not be
+        // charged as a coding task -- that is the regression being pinned.
+        for prompt in ["Print the version string", "show the config"] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": prompt}]
+            }))
+            .unwrap();
+            let result = classifier.classify(&request).await.unwrap();
+            assert!(
+                !result.reasons.iter().any(|r| r == "coding-task"),
+                "{prompt:?} was billed as a coding task: {:?}",
+                result.reasons
+            );
+            assert_ne!(
+                result.tier,
+                ComplexityTier::Standard,
+                "{prompt:?} is a one-line lookup, got {:?} ({:?})",
+                result.tier,
                 result.reasons
             );
         }
