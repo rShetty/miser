@@ -3245,7 +3245,15 @@ mod integration_tests {
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{}"}
                 }]},
-                {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp_c\":21}"}
+                // Empty content on purpose. The embedding is a bag of word
+                // tokens over the joined message text, so a tool result
+                // carrying real words adds tokens the first turn does not have
+                // and drags the cosine below `similarity_threshold` -- at which
+                // point this test would pass with the `has_tool_history` guard
+                // deleted, and verify nothing. An empty result keeps the two
+                // embeddings identical, so without the guard this turn really
+                // would be served from the cache.
+                {"role": "tool", "tool_call_id": "call_1", "content": ""}
             ]
         });
         let (status, headers, body) =

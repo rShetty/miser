@@ -1240,63 +1240,85 @@ mod tests {
         );
     }
 
-    /// Concurrent refreshes must not be able to interleave their writes.
+    /// `refresh` must actually hold `refresh_lock` while it writes.
     ///
-    /// `commit` persists *before* taking the state lock so that a failed write
-    /// leaves live routing untouched, which means the state lock does not cover
-    /// the write. The temp file is a single fixed sibling, so without a
-    /// separate lock two refreshes would each `File::create` it -- truncating
-    /// the other's bytes -- write from offset 0, and the first to rename would
-    /// publish a byte-level mix of the two snapshots. The startup refresh task
-    /// and the admin endpoint both refresh, so this is reachable in production.
-    ///
-    /// Exercised through `commit`, which is the part that touches the disk; the
-    /// lock is taken in `refresh` around the same region.
+    /// The previous version of this test took the lock on the *test's own*
+    /// thread and then called `commit` directly, so it exercised a file with
+    /// exactly one writer and passed unchanged if the guard in `refresh` were
+    /// deleted -- the same defect as the tautological catalog test fixed in
+    /// 8d4adfd. This drives `refresh` itself, from a second thread that must
+    /// park while the lock is held elsewhere.
     #[test]
-    fn commit_is_serialised_against_other_commits() {
-        use std::sync::Arc as StdArc;
+    fn refresh_blocks_while_the_refresh_lock_is_held() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener as StdListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
-        let path = temp_snapshot_path("concurrent_commit");
+        // A blocking loopback `/models` server, so no runtime is needed for the
+        // mock side and only the refresher has to be async.
+        let body = r#"{"data":[{"id":"s/only","pricing":{"prompt":"0.001","completion":"0.002"},"context_length":200000}]}"#;
+        let listener = StdListener::bind("127.0.0.1:0").expect("bind mock /models");
+        let addr = listener.local_addr().expect("mock addr");
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let provider = miser_provider::Provider::new(miser_provider::ProviderConfig {
+            base_url: format!("http://{addr}"),
+            api_key: Some("test".to_owned()),
+            ..Default::default()
+        })
+        .expect("provider builds");
+
+        let path = temp_snapshot_path("refresh_lock");
         let mut base = router_with_pins(BTreeMap::new());
         base.path = path.clone();
-        let router = StdArc::new(base);
+        let router = std::sync::Arc::new(base);
 
-        // Take the same lock `refresh` takes, so the test exercises the real
-        // exclusion rather than a private copy of it.
-        let _guard = router.refresh_lock.lock().expect("refresh lock");
+        // Hold the lock on another thread long enough to observe the refresher
+        // parking on it.
+        let held = std::sync::Arc::clone(&router);
+        let holder = std::thread::spawn(move || {
+            let _guard = held.refresh_lock.lock().expect("refresh lock");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
 
-        let snapshot_for = |tag: &str| CatalogSnapshot {
-            source: "test".to_owned(),
-            pins: BTreeMap::from([(
-                ComplexityTier::Simple,
-                TierPin {
-                    model: format!("s/{tag}"),
-                    candidates: vec![format!("s/{tag}")],
-                },
-            )]),
-            ..Default::default()
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let refresher = {
+            let router = std::sync::Arc::clone(&router);
+            let finished = std::sync::Arc::clone(&finished);
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                let _ = rt.block_on(router.refresh(&provider, &routing()));
+                finished.store(true, Ordering::SeqCst);
+            })
         };
 
-        // A second refresh arriving now must block rather than race the write.
-        let other = StdArc::clone(&router);
-        let blocker = std::thread::spawn(move || {
-            let _held = other.refresh_lock.lock().expect("refresh lock");
-        });
-        // Give the contender a chance to reach the lock.
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        router
-            .commit(&snapshot_for("first"))
-            .expect("commit succeeds");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "refresh must not complete while another caller holds the refresh lock"
+        );
 
-        drop(_guard);
-        blocker.join().expect("contender thread");
-
-        // The file on disk must be one whole snapshot, not a mixture.
-        let text = std::fs::read_to_string(&path).expect("snapshot written");
-        let reloaded: CatalogSnapshot =
-            serde_json::from_str(&text).expect("the snapshot must not be torn");
-        assert_eq!(reloaded.pins[&ComplexityTier::Simple].model, "s/first");
-        assert!(!temp_sibling(&path).exists(), "no temp file may survive");
+        holder.join().expect("lock holder");
+        refresher.join().expect("refresher");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "refresh must complete once the lock is released"
+        );
+        drop(server);
         let _ = std::fs::remove_file(&path);
     }
 
