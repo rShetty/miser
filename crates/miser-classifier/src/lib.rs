@@ -464,15 +464,28 @@ impl Classifier {
         };
         // TypeSafe direct returns a per-answer `confidence`; the Gateway
         // contract only carries `probabilities`. Prefer the explicit field.
-        let confidence = answers["tier"]["confidence"]
-            .as_f64()
-            .or_else(|| {
-                answers["tier"]["probabilities"]
-                    .get(tier_str)
-                    .and_then(Value::as_f64)
-            })
-            .map(|p| (p as f32).clamp(0.0, 0.99))
-            .unwrap_or(default_confidence());
+        // TypeSafe direct returns a per-answer `confidence`; the Gateway
+        // contract only carries `probabilities`. Prefer the explicit field.
+        //
+        // A response carrying *neither* is not a confident answer, and must not
+        // be laundered into one. This previously fell back to
+        // `default_confidence()` = 0.70, which is above the 0.65 threshold in
+        // the shipped config, and `ClassifierMode::Jev` applies no threshold of
+        // its own -- so a payload with a bare `{"choice":"hard"}`, a `null`
+        // confidence, a stringified `"0.95"`, or a `probabilities` map missing
+        // the chosen key all came back as a confident Hard. The point of
+        // separating the choice from its probability is lost, and the heuristic
+        // that `classify` would have used as a fallback never gets a look in.
+        // Treated as a format error instead, so the documented
+        // "availability over accuracy" fallback applies.
+        let confidence = match answers["tier"]["confidence"].as_f64().or_else(|| {
+            answers["tier"]["probabilities"]
+                .get(tier_str)
+                .and_then(Value::as_f64)
+        }) {
+            Some(p) => (p as f32).clamp(0.0, 0.99),
+            None => return Err(ClassifierError::Format),
+        };
         let task_type = answers["task"]["choice"]
             .as_str()
             .and_then(|s| serde_json::from_value::<TaskType>(json!(s)).ok());
@@ -741,6 +754,29 @@ mod tests {
         config.mode = mode;
         config.confidence_threshold = 0.65;
         config
+    }
+
+    /// A chat-completions endpoint pointed at the mock server.
+    fn llm_config(base_url: &str) -> ClassifierConfig {
+        let mut config = classifier_config("local_llm");
+        config.local_llm.enabled = true;
+        config.local_llm.model = "test-model".into();
+        config.local_llm.base_url = base_url.into();
+        config.local_llm.api_key = Some("test-key".into());
+        config.local_llm.timeout_ms = 2000;
+        config
+    }
+
+    /// Serve `body` once, for a test that needs the answer, not the request.
+    async fn spawn_answer(
+        body: serde_json::Value,
+    ) -> (String, Arc<Mutex<Vec<MockRequest>>>, tokio::task::JoinHandle<()>) {
+        spawn_mock(vec![MockHttpResponse {
+            status: 200,
+            body,
+            delay_ms: 0,
+        }])
+        .await
     }
 
     fn request(text: &str) -> ChatCompletionRequest {
@@ -1601,5 +1637,38 @@ mod tests {
             classifier.classify(&bogus).await.unwrap().classifier,
             "override"
         );
+    }
+
+    /// A Jev answer with no confidence signal must not be reported as
+    /// confident.
+    ///
+    /// It fell back to `default_confidence()` = 0.70, which is above the 0.65
+    /// threshold in the shipped config, and `ClassifierMode::Jev` applies no
+    /// threshold of its own -- so a bare `{"choice":"hard"}` came back as a
+    /// confident Hard and the heuristic fallback never got a look in. A Jev
+    /// outage presenting as malformed JSON was therefore indistinguishable from
+    /// Jev working correctly, which is the opposite of the documented
+    /// "availability over accuracy" behaviour.
+    #[tokio::test]
+    async fn jev_without_a_confidence_signal_falls_back() {
+        for body in [
+            r#"{"answers":{"tier":{"choice":"hard"}}}"#,
+            r#"{"answers":{"tier":{"choice":"hard","confidence":null}}}"#,
+            r#"{"answers":{"tier":{"choice":"hard","confidence":"0.95"}}}"#,
+            r#"{"answers":{"tier":{"choice":"hard","probabilities":{"standard":0.9}}}}"#,
+        ] {
+            let base = spawn_answer(serde_json::from_str(body).unwrap()).await.0;
+            let classifier = Classifier::new(jev_config(&base, ClassifierMode::Jev)).unwrap();
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "design a resilient multi-region migration"}]
+            }))
+            .unwrap();
+            let result = classifier.classify(&request).await.unwrap();
+            assert_ne!(
+                result.classifier, "jev",
+                "{body} must not be accepted as a confident Jev answer"
+            );
+        }
     }
 }
