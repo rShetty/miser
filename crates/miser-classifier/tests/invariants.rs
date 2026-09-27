@@ -370,3 +370,73 @@ async fn route_directive_survives_leading_non_user_turns() {
         );
     }
 }
+
+/// A short definitional question is Trivial regardless of what it names.
+///
+/// This is the property #51 broke, and that its first fix broke worse: the tier
+/// tables are keyed on technology nouns, so `crdt` (Hard) promoted "What does
+/// 'CRDT' stand for? One sentence." to the strongest model.
+#[tokio::test]
+async fn a_short_definitional_question_is_trivial() {
+    let classifier = heuristic();
+    for (prompt, label) in [
+        (
+            "What does 'CRDT' stand for? One sentence.",
+            "hard-table noun",
+        ),
+        (
+            "what is a bloom filter? two sentences max",
+            "standard-table noun",
+        ),
+        (
+            "Just say 'distributed consensus' in a sentence so I can quote it",
+            "hard-table noun",
+        ),
+        ("thanks, that worked", "bare acknowledgment"),
+        (
+            "hello! no need to do anything with kubernetes today, just checking",
+            "infra noun in small talk",
+        ),
+        (
+            "just answer yes or no: is Python interpreted?",
+            "binary question",
+        ),
+    ] {
+        let result = classifier.classify(&req(prompt)).await.unwrap();
+        assert_eq!(
+            result.tier,
+            ComplexityTier::Trivial,
+            "{prompt:?} ({label}) got {:?} ({:?})",
+            result.tier,
+            result.reasons
+        );
+    }
+}
+
+/// The other half: the ceiling must NOT fire on real work.
+///
+/// The first attempt capped on any brevity marker anywhere in the text, caught
+/// "explain X in one sentence", and cost 9 points of accuracy. These are the
+/// cases that must keep their tier.
+#[tokio::test]
+async fn real_work_is_not_capped_as_definitional() {
+    let classifier = heuristic();
+    for (prompt, at_least) in [
+        (
+            "Explain DNS resolution in one sentence",
+            ComplexityTier::Simple,
+        ),
+        (
+            "What does the CRDT merge protocol guarantee about convergence under partition?",
+            ComplexityTier::Simple,
+        ),
+    ] {
+        let result = classifier.classify(&req(prompt)).await.unwrap();
+        assert!(
+            rank(result.tier) >= rank(at_least),
+            "{prompt:?} was capped to {:?}, below {at_least:?} ({:?})",
+            result.tier,
+            result.reasons
+        );
+    }
+}

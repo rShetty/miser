@@ -47,6 +47,49 @@ fn tier_key(tier: ComplexityTier) -> &'static str {
     }
 }
 
+/// Whether this request is a *short definitional question* whose tier is fixed
+/// by its form rather than by its subject matter.
+///
+/// The Jev prompt states the rule: "Judge the work and model capability required,
+/// never keywords: technical jargon in a trivial request stays trivial, and
+/// closing or small-talk messages stay trivial regardless of which technologies
+/// they mention." The heuristic broke exactly that, because every tier table is
+/// keyed on technology nouns: `CRDT` is in the Hard table, so "What does 'CRDT'
+/// stand for? One sentence." scored Hard.
+///
+/// Every condition must hold, and they are all anchored at the start of the
+/// request and bounded in length:
+///
+/// * a definitional opener -- what / who / when / where / which
+/// * a brevity constraint, because the ask is a definition *plus a length limit*
+/// * a short request in total
+///
+/// A real piece of work fails one of these. "Explain DNS resolution in one
+/// sentence" has the brevity marker but no definitional opener, and "What does
+/// the CRDT merge protocol guarantee about convergence under partition?" has the
+/// opener but is neither brief nor length-constrained. An earlier version matched
+/// brevity markers anywhere in the text and capped both of those; that regressed
+/// the large corpus from 0.9314 to 0.8400.
+fn is_short_definitional(text: &str) -> bool {
+    static FORM: std::sync::OnceLock<RegexSet> = std::sync::OnceLock::new();
+    let regex = FORM.get_or_init(|| {
+        RegexSet::new([
+            // "what does X stand for, in one sentence?"
+            r"(?i)^\s*(what|who|when|where|which)\b.{0,60}?\b(one|two|three|a few|a couple of)\s+(word|sentence|line)s?\b.{0,30}$",
+            // "just say X in a sentence so I can quote it"
+            r"(?i)^\s*(just\s+)?(say|answer|reply|tell me)\b[^.]{0,60}\b(in a sentence|in one sentence|one sentence)\b[^.]{0,40}$",
+            // An explicitly binary question.
+            r"(?i)^\s*(just\s+)?(answer\s+)?(yes or no|true or false)\b\s*[:,\-]?\s*.{0,60}\?\s*$",
+            // Checking in, with the "no work" signal that makes it small talk.
+            r"(?i)^\s*(hello|hi|hey|thanks|thank you|cheers)\b[^.]{0,50}\b(nothing|no need|no changes|just checking)\b[^.]{0,30}$",
+            // A bare acknowledgment.
+            r"(?i)^\s*(thanks|thank you|cheers|nice|great|perfect|awesome|got it|gotcha)\b[\s,!.]{0,3}(that\s+)?(worked|fixed it|works|all|done|good|great|is|was)?\s*[!.?]*\s*$",
+        ])
+        .expect("short-definitional regex")
+    });
+    regex.is_match(text)
+}
+
 /// Tool names, for the request envelope.
 ///
 /// Part of the envelope rather than the prompt text: without it Jev cannot
@@ -398,6 +441,26 @@ impl Classifier {
         // withheld when a higher tier already has a pattern match, which is
         // exactly the "when two tiers are plausible choose the higher one"
         // rule the Jev prompt states.
+        // A short definitional question cannot be promoted by a technology
+        // noun. Applied as a ceiling, and last, so it holds however the tables
+        // are tuned: the tables are right about how much capability a *subject*
+        // needs, and wrong to decide the tier when the request's *form* has
+        // already decided it.
+        if is_short_definitional(text) {
+            // Decided outright rather than capped. `max_by_key` returns the LAST
+            // maximum, so capping every tier to an equal score would elect
+            // *Reasoning*, not Trivial -- the tie-break is the wrong tool here.
+            // The request's form has already decided the tier; the noun tables
+            // are simply not allowed to overrule it.
+            scores[0].1 = 100;
+            for (index, (_, score)) in scores.iter_mut().enumerate() {
+                if index != 0 {
+                    *score = 0;
+                }
+            }
+            reasons.push("short-definitional".into());
+        }
+
         if has_light_agentic(text) && trivial_matches == 0 {
             // A lookup the Trivial table does not list is an operational query
             // against a live target -- "the deployment", "the database", "the

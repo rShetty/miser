@@ -35,8 +35,8 @@ struct Case {
 /// Minimum exact-match accuracy for the generated corpora. Raise these
 /// deliberately as the classifier improves; never lower them to make a build
 /// pass without first understanding what regressed.
-const FLOOR_CLASSIFIER_CASES: f64 = 0.86;
-const FLOOR_LARGE_CASES: f64 = 0.93;
+const FLOOR_CLASSIFIER_CASES: f64 = 0.91;
+const FLOOR_LARGE_CASES: f64 = 0.95;
 
 fn corpus(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
