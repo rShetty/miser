@@ -113,6 +113,10 @@ mod tests {
             task,
             risk: None,
             privacy: None,
+
+            security_risk: None,
+            jev_model: None,
+            classifier_cost_usd: None,
             extra: Default::default(),
         }
     }

@@ -174,6 +174,93 @@ pub enum RiskLevel {
     Critical,
 }
 
+/// What to do when the security screen fires.
+///
+/// `Tag` is the default because a classifier that silently drops traffic is
+/// worse than one that reports it: the caller asked for routing help, not a
+/// policy decision. `Refuse` exists for callers that have made that decision
+/// themselves and want it enforced at the routing layer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityAction {
+    /// Record the risk, change nothing else.
+    #[default]
+    Tag,
+    /// Record the risk and raise the tier, so the strongest model sees it.
+    Escalate,
+    /// Fail the classification outright.
+    Refuse,
+}
+
+/// Prompt-injection and secret-extraction screening, asked as a Jev `noul`
+/// alongside the tier question in the same request.
+///
+/// The screen is a *signal*, not a filter: the probability is recorded on the
+/// result so the gateway can log, count and alert on it, and
+/// `on_detect` decides what the router itself does about it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClassifierSecurityConfig {
+    /// Ask the screening question at all. Off by default because it costs a
+    /// question's worth of input tokens on every request.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The question asked of Jev. Left empty, the documented default is used.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instructions: String,
+    /// Probability at or above which the screen is considered to have fired.
+    #[serde(default = "default_security_threshold")]
+    pub threshold: f32,
+    #[serde(default, skip_serializing_if = "is_default_action")]
+    pub on_detect: SecurityAction,
+}
+
+fn default_security_threshold() -> f32 {
+    0.5
+}
+
+fn is_default_action(action: &SecurityAction) -> bool {
+    *action == SecurityAction::default()
+}
+
+impl Default for ClassifierSecurityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            instructions: String::new(),
+            threshold: default_security_threshold(),
+            on_detect: SecurityAction::default(),
+        }
+    }
+}
+
+/// Per-million-token prices for the classifier itself, used to turn the
+/// `usage` block into a number.
+///
+/// TypeSafe direct does not return `usage.cost` -- that field is an OpenRouter
+/// billing addition -- so the cost of a routing decision has to be computed
+/// locally or not at all.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClassifierCostConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// USD per 1M input tokens.
+    #[serde(default)]
+    pub price_in: f64,
+    /// USD per 1M output tokens.
+    #[serde(default)]
+    pub price_out: f64,
+}
+
+impl Default for ClassifierCostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            price_in: 0.0,
+            price_out: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivacyLevel {
@@ -204,6 +291,18 @@ pub struct ClassificationResult {
     pub risk: Option<RiskLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub privacy: Option<PrivacyLevel>,
+    /// Probability that the security screen fired, when one was asked. `None`
+    /// means "not screened", which is deliberately distinct from `Some(0.0)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_risk: Option<f32>,
+    /// The dated model snapshot that actually served the decision, e.g.
+    /// `jev-1.13.0`. Recorded because thresholds tuned against one version
+    /// silently stop meaning anything on the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jev_model: Option<String>,
+    /// Local cost of the routing decision in USD, when cost accounting is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_cost_usd: Option<f64>,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -260,6 +359,12 @@ pub struct ClassifierConfig {
     /// contract (`POST {base_url}/evaluate`), not chat completions.
     #[serde(default)]
     pub jev: ClassifierEndpointConfig,
+    /// Prompt-injection / secret-extraction screening, asked as a `noul`.
+    #[serde(default)]
+    pub security: ClassifierSecurityConfig,
+    /// Local cost accounting for the classifier's own calls.
+    #[serde(default)]
+    pub cost: ClassifierCostConfig,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -851,12 +956,21 @@ mod tests {
             task: Some(TaskType::Coding),
             risk: Some(RiskLevel::High),
             privacy: Some(PrivacyLevel::Confidential),
+            security_risk: Some(0.93),
+            jev_model: Some("jev-1.13.0".into()),
+            classifier_cost_usd: Some(0.000_020),
             extra: Default::default(),
         };
         let raw = serde_json::to_value(&result).unwrap();
         assert_eq!(raw["task"], "coding");
         assert_eq!(raw["risk"], "high");
         assert_eq!(raw["privacy"], "confidential");
+        // The screening probability and the serving version both survive the
+        // wire, which is the point of recording them.
+        // f32, so compare as f32 rather than against a literal.
+        assert_eq!(raw["security_risk"].as_f64().unwrap() as f32, 0.93);
+        assert_eq!(raw["jev_model"], "jev-1.13.0");
+        assert_eq!(raw["classifier_cost_usd"], 0.000_020);
         assert_eq!(
             serde_json::from_value::<ClassificationResult>(raw).unwrap(),
             result

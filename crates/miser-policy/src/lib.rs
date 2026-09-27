@@ -144,6 +144,10 @@ mod tests {
             task: None,
             risk: None,
             privacy: None,
+
+            security_risk: None,
+            jev_model: None,
+            classifier_cost_usd: None,
             extra: Default::default(),
         };
         let config: GatewayConfig =
@@ -171,6 +175,10 @@ mod tests {
             task: Some(TaskType::Agentic),
             risk: None,
             privacy: None,
+
+            security_risk: None,
+            jev_model: None,
+            classifier_cost_usd: None,
             extra: Default::default(),
         };
         let config: GatewayConfig =
@@ -203,6 +211,10 @@ mod tests {
             task: None,
             risk: None,
             privacy: None,
+
+            security_risk: None,
+            jev_model: None,
+            classifier_cost_usd: None,
             extra: Default::default(),
         };
         let config: GatewayConfig =
