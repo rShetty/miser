@@ -141,16 +141,7 @@ mod tests {
             reasons: vec![],
             classifier: "test".into(),
             latency_ms: 0,
-            task: None,
-            risk: None,
-            privacy: None,
-
-            security_risk: None,
-            jev_model: None,
-            classifier_cost_usd: None,
-
-            cascade: None,
-            extra: Default::default(),
+            ..Default::default()
         };
         let config: GatewayConfig =
             toml::from_str(include_str!("../../../config/miser.toml")).unwrap();
@@ -212,16 +203,7 @@ mod tests {
             reasons: vec![],
             classifier: "test".into(),
             latency_ms: 0,
-            task: None,
-            risk: None,
-            privacy: None,
-
-            security_risk: None,
-            jev_model: None,
-            classifier_cost_usd: None,
-
-            cascade: None,
-            extra: Default::default(),
+            ..Default::default()
         };
         let config: GatewayConfig =
             toml::from_str(include_str!("../../../config/miser.toml")).unwrap();

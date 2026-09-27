@@ -138,19 +138,25 @@ pub struct ModelCapabilities {
     pub extra: ExtraFields,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ComplexityTier {
     Trivial,
+    /// The safe floor for an unset tier. `Trivial` would be an under-route and
+    /// `Hard` an over-route, so a zeroed struct must not silently pick either.
+    #[default]
     Simple,
     Standard,
     Hard,
     Reasoning,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskType {
+    #[default]
     Chat,
     Coding,
     Agentic,
@@ -342,7 +348,7 @@ pub enum LatencyClass {
     Background,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ClassificationResult {
     pub tier: ComplexityTier,
     pub confidence: f32,
@@ -1013,6 +1019,36 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ComplexityTier::Hard).unwrap(),
             "\"hard\""
+        );
+    }
+
+    /// A zeroed result must not under-route.
+    ///
+    /// `Default` exists so that adding a field does not break every
+    /// construction site, which it did twice in this series. That is only safe
+    /// if the zero value is harmless -- so the default tier is asserted here
+    /// rather than left to whoever derives it next.
+    #[test]
+    fn a_defaulted_result_does_not_under_route() {
+        let result = ClassificationResult::default();
+        assert_eq!(result.tier, ComplexityTier::Simple);
+        assert!(
+            result.tier > ComplexityTier::Trivial,
+            "the default tier must not be the cheapest one"
+        );
+        assert!(
+            result.tier < ComplexityTier::Hard,
+            "nor the most expensive one"
+        );
+        assert!(result.security_risk.is_none());
+        assert!(result.jev_model.is_none());
+        assert!(result.classifier_cost_usd.is_none());
+        assert!(result.cascade.is_none());
+        // And it still round-trips.
+        let raw = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ClassificationResult>(raw).unwrap(),
+            result
         );
     }
 
