@@ -16,3 +16,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 miser-types = { path = "../miser-types" }
+
+[dev-dependencies]
+proptest = "1"
