@@ -169,6 +169,51 @@ async fn generated_corpora_clear_their_floor() {
     }
 }
 
+/// Escalation is the cost side of the trade-off, and it is gated on both sides.
+///
+/// Accuracy alone cannot tell a well-tuned router from one that sends everything
+/// to the strongest model: the first is cheap and correct, the second scores
+/// well and is useless. So the share of traffic landing on Hard or Reasoning is
+/// compared against the share the corpus says genuinely needs it.
+///
+/// One-sided is not enough. Too high wastes money on every request; too low is
+/// under-routing, the dangerous direction, and the one that costs real money
+/// when a hard answer comes back from a cheap model.
+#[tokio::test]
+async fn escalation_rate_tracks_the_workload() {
+    /// How far the observed rate may sit from the expected one. Wide enough for
+    /// labelling noise, tight enough to catch a tier table that shifted.
+    const TOLERANCE: f64 = 0.05;
+
+    for name in ["cases.jsonl", "classifier_cases_large.jsonl"] {
+        let cases = load(name);
+        let classifier = heuristic();
+        let mut escalated = 0usize;
+        let mut expected = 0usize;
+        for case in &cases {
+            let got = classifier.classify(&case.request).await.unwrap();
+            if matches!(got.tier, ComplexityTier::Hard | ComplexityTier::Reasoning) {
+                escalated += 1;
+            }
+            if matches!(
+                case.expected_tier,
+                ComplexityTier::Hard | ComplexityTier::Reasoning
+            ) {
+                expected += 1;
+            }
+        }
+        let n = cases.len() as f64;
+        let (observed_rate, expected_rate) = (escalated as f64 / n, expected as f64 / n);
+        let drift = (observed_rate - expected_rate).abs();
+        assert!(
+            drift <= TOLERANCE,
+            "{name}: escalation rate {observed_rate:.4} is {drift:.4} from the workload's \
+             {expected_rate:.4} (tolerance {TOLERANCE:.4}). A router that sent everything to \
+             the strongest model would read 1.0; one that never escalated would read 0.0."
+        );
+    }
+}
+
 /// Identical requests must classify identically, every time.
 #[tokio::test]
 async fn classification_is_deterministic() {

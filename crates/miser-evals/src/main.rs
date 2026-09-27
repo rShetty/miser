@@ -30,6 +30,13 @@ struct Args {
     /// USD per 1M output tokens for the classifier model (Jev default 0.16).
     #[arg(long, default_value_t = default_price_out())]
     price_out: f64,
+    /// USD per 1M input tokens for the strongest model, used only for the
+    /// counterfactual "what if everything went to the top tier" baseline.
+    #[arg(long, default_value_t = 3.0)]
+    frontier_price_in: f64,
+    /// USD per 1M output tokens for the strongest model (baseline only).
+    #[arg(long, default_value_t = 15.0)]
+    frontier_price_out: f64,
     #[arg(long)]
     quality: Option<String>,
 }
@@ -143,9 +150,23 @@ async fn main() -> anyhow::Result<()> {
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
     let mut matrix: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut escalated = 0usize;
+    let mut cascaded = 0usize;
     for slot in indexed.iter_mut() {
         let (case, output) = slot.take().expect("all results collected");
         latency_ms.push(output.latency_ms);
+        // Escalation is the cost side of the trade-off. Accuracy on its own
+        // cannot distinguish a well-tuned router from one that sends everything
+        // to the strongest model, so the rate is reported next to it.
+        if matches!(
+            output.tier,
+            ComplexityTier::Hard | ComplexityTier::Reasoning
+        ) {
+            escalated += 1;
+        }
+        if output.cascade.is_some() {
+            cascaded += 1;
+        }
         if mode_name != "heuristic" && mode_name != "hybrid" && output.classifier == "heuristic" {
             fallbacks += 1;
         }
@@ -203,6 +224,53 @@ async fn main() -> anyhow::Result<()> {
             "tokens_in={input_tokens} tokens_out={output_tokens} classification_cost_usd={cost:.4} cost_per_1k_classifications_usd={per_1k:.4}"
         );
     }
+    // Latency percentiles. p95 rather than the mean: routing latency is
+    // tail-dominated, and a mean hides the requests that actually stall a user.
+    let mut sorted = latency_ms.clone();
+    sorted.sort_unstable();
+    let pct = |p: usize| -> u64 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let idx = (sorted.len() - 1) * p / 100;
+        sorted[idx]
+    };
+    let n = indexed.len().max(1);
+    let mean_latency: u64 = if sorted.is_empty() {
+        0
+    } else {
+        sorted.iter().sum::<u64>() / sorted.len() as u64
+    };
+    println!(
+        "escalation_rate={:.4} cascaded_rate={:.4} latency_p50_ms={} latency_p95_ms={} latency_mean_ms={} latency_max_ms={}",
+        escalated as f64 / n as f64,
+        cascaded as f64 / n as f64,
+        pct(50),
+        pct(95),
+        mean_latency,
+        sorted.last().copied().unwrap_or(0),
+    );
+
+    // Counterfactual: what the same traffic would have cost had every request
+    // been sent to the strongest model. A *counterfactual estimate*, not an
+    // invoice -- it ignores tokenisation differences, caching and streaming.
+    if input_tokens > 0 || output_tokens > 0 {
+        let routed = input_tokens as f64 / 1_000_000.0 * args.price_in
+            + output_tokens as f64 / 1_000_000.0 * args.price_out;
+        let top_tier = args.frontier_price_in.max(args.price_in);
+        let top_tier_out = args.frontier_price_out.max(args.price_out);
+        let frontier = input_tokens as f64 / 1_000_000.0 * top_tier
+            + output_tokens as f64 / 1_000_000.0 * top_tier_out;
+        if frontier > 0.0 {
+            println!(
+                "classifier_cost_usd={:.8} frontier_cost_usd={:.8} cost_ratio={:.4}",
+                routed,
+                frontier,
+                routed / frontier
+            );
+        }
+    }
+
     println!("confusion={}", serde_json::to_string_pretty(&matrix)?);
     Ok(())
 }
