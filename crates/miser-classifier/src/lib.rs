@@ -127,7 +127,7 @@ impl Classifier {
     ) -> Result<ClassificationResult, ClassifierError> {
         let started = Instant::now();
         let text = request_text(request);
-        if let Some((tier, reason)) = override_tier(&text) {
+        if let Some((tier, reason)) = override_tier(request) {
             return Ok(result(
                 tier,
                 1.0,
@@ -512,16 +512,52 @@ fn request_text(request: &ChatCompletionRequest) -> String {
         .join("\n")
 }
 
-fn override_tier(text: &str) -> Option<(ComplexityTier, String)> {
+/// Text of a single message, ignoring non-text parts.
+fn message_text(message: &miser_types::ChatMessage) -> String {
+    match &message.content {
+        MessageContent::Text(text) => text.clone(),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                miser_types::ContentPart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn override_tier(
+    request: &miser_types::ChatCompletionRequest,
+) -> Option<(ComplexityTier, String)> {
+    // The directive belongs to the user, not to whatever happens to open the
+    // transcript. Reading it from the joined text meant any request starting
+    // with a system prompt -- or a null-content assistant turn, which is every
+    // tool-calling turn -- silently lost the override.
+    let first_user = request.messages.iter().find(|m| m.role == "user")?;
+    let text = message_text(first_user);
     let first = text.lines().next()?.trim();
-    let tier = first.strip_prefix("@route:")?;
-    let parsed = match tier {
+    let directive = first.strip_prefix("@route:").or_else(|| {
+        // Case-insensitive, like every other pattern in this file. Accepting
+        // only exact lowercase meant `@route:Hard` was ignored without a word.
+        if first.len() < 7 || !first[..7].eq_ignore_ascii_case("@route:") {
+            return None;
+        }
+        Some(&first[7..])
+    })?;
+    let tier = directive.trim();
+    let parsed = match tier.to_ascii_lowercase().as_str() {
         "trivial" => ComplexityTier::Trivial,
         "simple" => ComplexityTier::Simple,
         "standard" => ComplexityTier::Standard,
         "hard" => ComplexityTier::Hard,
         "reasoning" => ComplexityTier::Reasoning,
-        _ => return None,
+        _ => {
+            // Failing open into the heuristic is the risky direction for an
+            // explicit request, so say so rather than dropping it silently.
+            tracing::warn!(directive = tier, "unknown @route: tier; ignoring the override");
+            return None;
+        }
     };
     Some((parsed, format!("override:{tier}")))
 }
@@ -1508,5 +1544,62 @@ mod tests {
                 result.reasons
             );
         }
+    }
+
+    /// `@route:` must work whenever the user turn carries it.
+    ///
+    /// It used to be read from the first line of the whole concatenated
+    /// transcript, so it silently stopped applying for any request opening with
+    /// a system prompt or a null-content assistant turn -- which is every
+    /// tool-calling turn. A silently ignored explicit instruction is worse than
+    /// a rejected one, because the caller cannot tell it did not take effect.
+    #[tokio::test]
+    async fn route_override_is_found_behind_a_system_prompt() {
+        let classifier = Classifier::new(classifier_config("heuristic")).unwrap();
+
+        for messages in [
+            json!([
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "@route:hard\ndesign a system"}
+            ]),
+            json!([
+                {"role": "assistant", "content": null},
+                {"role": "user", "content": "@route:hard\ndesign a system"}
+            ]),
+            json!([{"role": "user", "content": "@route:hard\ndesign a system"}]),
+        ] {
+            let request: ChatCompletionRequest =
+                serde_json::from_value(json!({"model": "auto", "messages": messages})).unwrap();
+            let result = classifier.classify(&request).await.unwrap();
+            assert_eq!(
+                result.tier,
+                ComplexityTier::Hard,
+                "override was dropped for {:?}",
+                request.messages
+            );
+            assert_eq!(result.classifier, "override");
+        }
+
+        // Case-insensitive, like every other pattern in the file.
+        let shouted: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "@ROUTE:Hard\ndesign a system"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            classifier.classify(&shouted).await.unwrap().tier,
+            ComplexityTier::Hard
+        );
+
+        // An unknown tier must not be honoured.
+        let bogus: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "@route:banana\nhello"}]
+        }))
+        .unwrap();
+        assert_ne!(
+            classifier.classify(&bogus).await.unwrap().classifier,
+            "override"
+        );
     }
 }
