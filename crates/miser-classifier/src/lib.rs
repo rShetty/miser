@@ -246,9 +246,13 @@ impl Classifier {
             (&self.hard, 3, 6),
             (&self.reasoning, 4, 7),
         ];
+        let mut trivial_matches = 0;
         for (set, index, weight) in sets {
             let matches = set.matches(text).into_iter().count() as i32;
             scores[index].1 += matches * weight;
+            if index == 0 {
+                trivial_matches = matches;
+            }
             if matches > 0 {
                 reasons.push(format!("pattern:{}:{}", index, matches));
             }
@@ -278,6 +282,21 @@ impl Classifier {
         // withheld when a higher tier already has a pattern match, which is
         // exactly the "when two tiers are plausible choose the higher one"
         // rule the Jev prompt states.
+        if has_light_agentic(text) && trivial_matches == 0 {
+            // A lookup the Trivial table does not list is an operational query
+            // against a live target -- "the deployment", "the database", "the
+            // src directory" -- not a bare command. The Trivial table covers the
+            // bare form (`git status`, `git diff`, `git log`) and the tier
+            // patterns settle those on their own.
+            //
+            // This used to ride in on the +10 `coding-task` bonus, which made a
+            // status check look like software engineering. Routing it separately
+            // is what keeps the bare form at Trivial *and* puts the operational
+            // form on the mid tier, instead of trading one mistake for the
+            // other.
+            scores[2].1 += 10;
+            reasons.push("operational-lookup".into());
+        }
         if classification_task == Some(TaskType::Coding)
             && scores[1].1 <= 1
             && scores[3].1 == 0
@@ -1595,8 +1614,10 @@ mod tests {
             );
         }
 
-        // A light lookup the Trivial table does not list still must not be
-        // charged as a coding task -- that is the regression being pinned.
+        // A lookup the Trivial table does *not* list is an operational query
+        // against a live target, and belongs on the mid tier. It must not reach
+        // that tier by being mistaken for software engineering, though: the
+        // reason has to be `operational-lookup`, not `coding-task`.
         for prompt in ["Print the version string", "show the config"] {
             let request: ChatCompletionRequest = serde_json::from_value(json!({
                 "model": "auto",
@@ -1609,10 +1630,15 @@ mod tests {
                 "{prompt:?} was billed as a coding task: {:?}",
                 result.reasons
             );
-            assert_ne!(
+            assert!(
+                result.reasons.iter().any(|r| r == "operational-lookup"),
+                "{prompt:?} should be recorded as an operational lookup: {:?}",
+                result.reasons
+            );
+            assert_eq!(
                 result.tier,
                 ComplexityTier::Standard,
-                "{prompt:?} is a one-line lookup, got {:?} ({:?})",
+                "{prompt:?} is a lookup against live state, got {:?} ({:?})",
                 result.tier,
                 result.reasons
             );
