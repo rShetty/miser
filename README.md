@@ -41,6 +41,32 @@ between runs, so treat its accuracy as ±1%.
 - **3.5% over-routing** — trivial prompts don't waste money on frontier models (vs 12.1% heuristic)
 - **3.5× less over-routing** than the regex heuristic
 
+### Head-to-head vs `typesafe/jev-router`
+
+83 paired comparisons on held-out prompts stratified across all five tiers, both
+routers answering the same ones, each answer scored 1–5 by `openai/gpt-4.1`
+(a model neither router selected, so it is not judging its own output).
+
+| | quality (1–5) | cost | better / worse / tied |
+|---|---:|---:|---:|
+| **Miser** | **3.75** | **$0.0254** | 31 / 10 / 42 |
+| `typesafe/jev-router` | 3.16 | $0.3441 | — |
+
+**13.5× cheaper and +0.59 quality.** The quality gap opens up on the harder tiers:
+jev-router held `stealth/space-bunny-alpha` for 60 of 83 prompts including the
+proof and architecture tasks, while Miser escalated those to `z-ai/glm-5.3`.
+
+Reproduce with `scripts/head-to-head.py` (needs `OPENROUTER_API_KEY` and a
+running gateway on `:8787`).
+
+**Read this before quoting it.** It is a single run, the judge is an LLM with no
+human validation or inter-rater check, 7 of 90 pairs failed outright, both
+routers were capped at 160 output tokens, and the corpus is short factual and
+small-coding prompts — it does not exercise the agentic workloads jev-router is
+marketed for, where that router visibly behaved as a coding agent. The $0.34 is
+upstream inference cost passed through OpenRouter; the router's own listing
+price is $0. Treat this as evidence, not proof.
+
 ### Other corpora
 
 | Corpus | Cases | Mode | Exact | Under | Over |
