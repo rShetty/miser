@@ -35,8 +35,8 @@ struct Case {
 /// Minimum exact-match accuracy for the generated corpora. Raise these
 /// deliberately as the classifier improves; never lower them to make a build
 /// pass without first understanding what regressed.
-const FLOOR_CLASSIFIER_CASES: f64 = 0.76;
-const FLOOR_LARGE_CASES: f64 = 0.78;
+const FLOOR_CLASSIFIER_CASES: f64 = 0.83;
+const FLOOR_LARGE_CASES: f64 = 0.92;
 
 fn corpus(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -202,7 +202,7 @@ async fn classification_is_deterministic() {
 /// This is a ratchet, not a target: it may only go down. Tightening the pattern
 /// tables should lower it, and every such commit should lower this number too.
 /// Raising it needs a comment saying what regressed and why.
-const MAX_UNEXPLAINED_RATE: f64 = 0.16;
+const MAX_UNEXPLAINED_RATE: f64 = 0.02;
 
 /// Tier is total: every corpus case yields a tier and never errors, and the
 /// share of tiers nothing explains stays under the ratchet.

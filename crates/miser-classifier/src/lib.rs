@@ -54,28 +54,48 @@ impl Classifier {
             trivial: RegexSet::new([
                 r"(?i)^\s*(hello|hi|hey|thanks|thank you|ok|okay|good morning|bye|please|help|version)\s*(?:there|everyone|all|team|folks)?\s*[!.]*\s*$",
                 r"(?i)\b(git status|git diff|git log|v\d+\.\d+\.\d+)\b",
-                r"(?i)^(what is|what's|how to|how do|how does|where is)\s+(your\s+name|2\s*\+\s*2|the\s+time|the\s+date|my\s+name)\b",
-                r"(?i)\b(rename|uppercase|lowercase|trim|hello world|test input|unit test)\b.*\b(variable|file|string|line)\b",
-                r"(?i)^\s*(yes|no|true|false)\s*[.!]?\s*$",
+                r"(?i)^\s*(what is|what's|how to|how do|how does|where is)\s+(your\s+name|2\s*\+\s*2|the\s+time|the\s+date|my\s+name)\b",
+                r"(?i)\b(rename|uppercase|lowercase|trim|hello world|test input|unit test)\b.*\b(variable|file|string|line|header|name|value)\b",
+                r"(?i)^\s*(yes|no|true|false|yep|yeah|yup|nope)\s*[.!]?\s*$",
+                // Conversation closers. Deliberately a closed set of tails
+                // rather than "any text after an acknowledgement": "ok the
+                // server is crashing" must not be trivialised, and
+                // under-routing is the expensive direction.
+                r"(?i)^\s*(thanks|thank you|ok|okay|cool|great|perfect|awesome|nice|cheers|bye|goodbye|yep|yeah|yup|nope|gotcha|understood)\b[\s,!.]*(that'?s all (i )?needed.*|that fixed it|that works|sounds good|looks good|it works|all set|done|understood|got it|there|everyone)?\s*[!.?]*\s*$",
+                // Closed-form factual questions: one answer, no concept to
+                // explain, so there is nothing to reason about.
+                r"(?i)^\s*(what year|what version|who (created|wrote|designed|built)|how many|how much|when (was|did|is)|where is)\b[^?]{0,60}\?\s*$",
+                // Explicitly binary questions.
+                r"(?i)^\s*(just\s+)?(answer\s+)?(yes or no|true or false)\b\s*[:,\-–]\s*",
+                // Bare git plumbing with no target: a lookup, not a task.
+                r"(?i)^\s*git\s+(remote|stash|branch|show|log|status|diff)\b\s*(-\S+\s*)*$",
+                r"(?i)^\s*no questions?\b.*\b(there|needed)\b\s*$",
                 r"(?i)\b(port|ip address|hostname|help|support)\b",
             ])?,
             simple: RegexSet::new([
                 r"(?i)\b(explain|summarize|compare|convert|translate|format|describe|tell\s+me|demo|example|snippet|shell command|powershell)\b",
-                r"(?i)\b(write|create)\s+(a|an)\s+(small|simple)?\s*\w*\s*(function|class|regex|script|interface)\b",
+                r"(?i)\b(write|create)\s+(a|an)\s+(small|simple)?\s*\w*\s*(function|class|regex|interface)\b",
                 r"(?i)\b(add|change|fix)\s+(a|the)\s+(comment|null check|format|timeout|max_tokens|default config)\b",
                 r"(?i)\b(dockerfile|docker-compose|readme|migration|docker)\b",
                 r"(?i)\b(sql|query|select|insert|index)\b.*\b(write|create|add|optimize)\b",
+                r"(?i)\b(write|create|generate|give me)\b[^.]{0,30}\b(sql|query|awk|sed|regex|snippet|script|one.line)\b",
                 r"(?i)\b(unit test|snapshot test|test for|powershell|bash)\b",
-                r"(?i)\b(cors|semicolon|trailing|whitespace|quotes|tab|spaces)\b",
+                r"(?i)\b(cors|semicolon|trailing|whitespace|quotes|tab|spaces|braces|parentheses)\b",
                 r"(?i)\b(git command|curl command|shell command)\b",
-                r"(?i)\b(type|interface|schema)\b.*\b(for|with)\b.*\b(id|name|email|field)\b",
+                r"(?i)\b(type|interface|schema)\b.*\b(for|with)\b",
                 r"(?i)\b(dependency|package|install|import)\b.*\b(add|fix|update)\b",
-                r"(?i)^(what is|what's|what are)\s+",
+                r"(?i)^\s*(what is|what's|what are)\s+",
                 r"(?i)\b(npm|yarn|pip|cargo)\b.*\b(what|how|explain|difference)\b",
                 r"(?i)\b(ci.cd|pipeline|workflow)\b.*\b(what|how|explain|about|tell)\b",
             ])?,
             standard: RegexSet::new([
-                r"(?i)\b(implement|build|integrate|debug|refactor|test|endpoint|migration|user management|authentication|database schema|notification)\b",
+                r"(?i)\b(implement|build|integrate|debug|refactor|test|endpoints?|migrations?|user management|authentication|database schema|notifications?)\b",
+                // Leading imperative verbs that imply multi-component work.
+                // "optimize" is here rather than in `simple` so that "optimize
+                // the slow queries" does not get claimed by the one-line rule.
+                r"(?i)^\s*(add|optimi[sz]e|configure|split|upgrade|extract|harden|introduce|wire up|set up)\b",
+                r"(?i)\b(orm|n\+1 quer|nested quer|structured logging|request ids?|trace sampling|reverse proxy|tls termination)\b",
+                r"(?i)\b(nginx|caddy|traefik|haproxy)\b",
                 r"(?i)\b(api|database|authentication|middleware|component|rate limiter|notification)\b.*\b(add|create|implement|design)\b",
                 r"(?i)\b(rate limit|jwt|oauth|redis|queue|webhook|middleware|pagination)\b",
                 r"(?i)\b(kubernetes|terraform|ansible|istio|prometheus|grafana)\b",
@@ -89,19 +109,28 @@ impl Classifier {
             hard: RegexSet::new([
                 r"(?i)\b(architect|distributed|production incident|threat-model|zero-downtime|multi-region|multi-region)\b",
                 r"(?i)\b(security|concurrency|race condition|migration|rollout|failover)\b.*\b(design|analy[sz]e|plan|fix)\b",
-                r"(?i)\b(one million|40 services|80-file|across (all|every|five))\b",
+                r"(?i)\b(one million|80-file|across (all|every|five))\b",
+                // Scale, counted rather than enumerated: "40 services" never
+                // matched "200 microservices".
+                r"(?i)\b\d{2,}\s+(micro)?services\b",
                 r"(?i)\b(service mesh|istio|mtls|saml|sso|graphql resolver)\b",
                 r"(?i)\b(end.to.end encryption|signal protocol|x3dh)\b",
                 r"(?i)\b(event sourcing|consistent hashing|skip list|crdt)\b",
                 r"(?i)\b(chaos engineering|mutation test|deadlock|slo|rto|rpo)\b",
                 r"(?i)\b(design|architect)\b.*\b(url shortener|notification|scheduler|search|payment|chat|gateway)\b",
-                r"(?i)\b(production|incident|outage|postmortem)\b.*\b(analy[sz]e|investigate|debug)\b",
+                r"(?i)\b(production|incident|outage)\b.*\b(analy[sz]e|investigate|debug)\b",
+                // The artefact itself is the signal. "Write the postmortem for
+                // the auth outage" has no analysis verb, and requiring one left
+                // production-incident write-ups on the cheap model.
+                r"(?i)\b(postmortem|incident report|sev[0-9]|failed over|failover|rolling back)\b",
+                r"(?i)\b(observability|tracing strategy|trace sampling|sampling policy)\b",
                 r"(?i)\b(secrets management|vault|pci.dss|field.level encryption)\b",
             ])?,
             reasoning: RegexSet::new([
                 r"(?i)\b(prove|derive|counterexample|formal|satisfiable|optimality|correctness)\b",
-                r"(?i)\b(algorithm|recurrence|serialization graph|posterior|inference)\b.*\b(analysis|design|prove|derive|bound)\b",
-                r"(?i)\b(amortized|invariant|converge|distributed counter)\b.*\b(prove|derive|analysis)\b",
+                r"(?i)\b(algorithm|recurrence|serialization graph|posterior|inference|theorem|amortized|asymptotic|complexity)\b.*\b(analysis|design|prove|derive|bound|analy[sz]e|complexity)\b",
+                r"(?i)\b(analy[sz]e|compute|derive|work out)\b[^.]{0,40}\b(complexity|amortized|asymptotic|recurrence|theorem|serialization graph|proof|correctness)\b",
+                r"(?i)\b(amortized|invariant|converge|distributed counter)\b.*\b(prove|derive|analysis|analy[sz]e|complexity)\b",
                 r"(?i)\b(halting problem|undecidable|diagonal)\b",
                 r"(?i)\b(reduction|3.sat|polynomial.time|complexity class)\b",
                 r"(?i)\b(bayesian|posterior|conjugate|likelihood)\b.*\b(derive|prove|estimate)\b",
@@ -257,7 +286,7 @@ impl Classifier {
                 reasons.push(format!("pattern:{}:{}", index, matches));
             }
         }
-        if request.tools.as_ref().is_some_and(|x| !x.is_empty()) {
+        if request.tools.as_ref().is_some_and(|x| !x.is_empty()) && scores[4].1 == 0 {
             scores[2].1 += 4;
             reasons.push("tools-present".into());
         }
@@ -309,11 +338,18 @@ impl Classifier {
             scores[3].1 += 15;
             reasons.push("agentic-task".into());
         }
-        if has_agentic_tools(request) {
+        // Tool context is strong, but it is a statement about *how* the work
+        // will be done, not about *what* is being asked. A formal-correctness
+        // request that happens to carry tools was scoring Reasoning 7 against
+        // Hard 12 and being served by the strong model instead of the reasoning
+        // one -- the tools quietly downgraded the request. Same rule as the
+        // coding-task bonus: once a higher tier has matched on its own patterns,
+        // a context signal may not outvote it.
+        if has_agentic_tools(request) && scores[4].1 == 0 {
             scores[3].1 += 12;
             reasons.push("agentic-tools".into());
         }
-        if has_tool_history(request) {
+        if has_tool_history(request) && scores[4].1 == 0 {
             scores[3].1 += 20;
             reasons.push("tool-history".into());
         }
@@ -590,8 +626,16 @@ fn override_tier(request: &miser_types::ChatCompletionRequest) -> Option<(Comple
     // transcript. Reading it from the joined text meant any request starting
     // with a system prompt -- or a null-content assistant turn, which is every
     // tool-calling turn -- silently lost the override.
-    let first_user = request.messages.iter().find(|m| m.role == "user")?;
-    let text = message_text(first_user);
+    // Scan newest-first. In a chat request the history comes first and the new
+    // question last, so looking for the *first* user turn meant a directive
+    // typed into the current message was ignored on any multi-turn request --
+    // the common case, not the corner case.
+    let text = request
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(message_text)?;
     let first = text.lines().next()?.trim();
     let directive = first.strip_prefix("@route:").or_else(|| {
         // Case-insensitive, like every other pattern in this file. Accepting
@@ -689,7 +733,7 @@ fn has_explanatory_context(lower: &str) -> bool {
     static EXPLANATORY: std::sync::OnceLock<RegexSet> = std::sync::OnceLock::new();
     let regex = EXPLANATORY.get_or_init(|| {
         RegexSet::new([
-            r"(?i)^(explain|what is|what's|what are|how to|how do|how does|describe|tell me|show me how|why|difference between)\b",
+            r"(?i)^\s*(explain|what is|what's|what are|how to|how do|how does|describe|tell me|show me how|why|difference between)\b",
             r"(?i)\b(explain|describe)\b.*\b(how|what|why)\b",
             r"(?i)\b(what is|what's|what are)\b",
             r"(?i)\b(write|create)\s+(a|an|the)?\s*(unit\s+test|test|snapshot|integration\s+test)\b",
