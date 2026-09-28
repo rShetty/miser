@@ -260,14 +260,17 @@ jobs:
           echo "the pre-fix model still fails, as it must"
 
   mutants:
-    name: Mutation kill rate ${{ matrix.shard }}/4
+    name: Mutation kill rate ${{ matrix.shard }}/4 (of 0-3)
     strategy:
       # Same reasoning as the Kani job: the default cancels siblings on the
       # first failure, which for an hours-long job throws away the shards that
       # were nearly done.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        # 0-indexed: `--shard 4/4` is rejected with "shard k must be less than
+        # n", so a 1-based list fails one leg outright and silently never runs
+        # shard 0. Verified: shards 0-3 yield 80+80+80+78 = 318, the full set.
+        shard: [0, 1, 2, 3]
     runs-on: ubuntu-latest
     # Deliberately NOT `needs: [lint, test]`.
     #
@@ -308,7 +311,13 @@ jobs:
         # into one number, and a shard that fails no longer discards the ones
         # that succeeded. Confirmed against `cargo mutants --help` in 27.1
         # rather than assumed.
-        run: cargo mutants -j 2 --timeout 300 --shard '${{ matrix.shard }}/4'
+        run: |
+          # A shard that dies partway prints no kill rate at all, and three
+          # surviving shards look like a complete run. Echo the shard and the
+          # expected mutant count up front so a partial result is labelled as
+          # one in the log rather than being read as a total.
+          echo "shard ${{ matrix.shard }} of 4; total mutants: $(grep -c . mutants-listed.txt)"
+          cargo mutants -j 2 --timeout 300 --shard '${{ matrix.shard }}/4'
       - name: Upload this shard's report
         if: always()
         uses: actions/upload-artifact@v4
