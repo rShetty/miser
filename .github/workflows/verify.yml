@@ -180,7 +180,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kani-proofs
+          # Unique per matrix leg. With a shared name the two legs race to
+          # upload the same artifact name and one set of proofs is lost -- the
+          # first version of this job did exactly that.
+          name: kani-proofs-${{ matrix.crate }}
           path: |
             target/kani/
             kani-*.log
@@ -229,12 +232,15 @@ jobs:
         # discriminating and the gate above is worthless. So the result is
         # inverted: green here means the harness is broken.
         run: |
-          set +e
-          java -cp tla/tla2tools.jar tlc2.TLC \
-            -config spec/AuthorizationOrderingPrefix.cfg \
-            -workers auto \
-            spec/AuthorizationOrdering.tla
-          if [ $? -eq 0 ]; then
+          # The command sits in the `if` condition, so its non-zero exit is the
+          # expected path rather than an error, and `set -e` does not apply to
+          # it. The previous `set +e` + `if [ $? -eq 0 ]` reached the same place
+          # but disabled error checking for the whole step, and $? is read after
+          # the `if`, where it can already have been clobbered.
+          if java -cp tla/tla2tools.jar tlc2.TLC \
+               -config spec/AuthorizationOrderingPrefix.cfg \
+               -workers auto \
+               spec/AuthorizationOrdering.tla; then
             echo "::error::the pre-fix model PASSED; the authorization model no longer detects the defect class"
             exit 1
           fi

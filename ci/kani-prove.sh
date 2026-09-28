@@ -34,7 +34,13 @@ summary=$(grep -E '[0-9]+ verification harnesses' "$log" | tail -1 || true)
 if [ -z "$summary" ]; then
   # Distinguish the two causes, because they need different fixes and the log
   # is the only place either is visible.
-  if grep -q 'kani-compiler' "$log" && grep -q 'assertion failed' "$log"; then
+  # Match on what Kani actually prints rather than one exact phrasing: an ICE
+  # surfaces as a rustc panic, as "internal compiler error", or as "unexpectedly
+  # panicked", and which one shows up varies with the version and the output
+  # format. Requiring two exact strings meant the first version of this script
+  # mislabelled a real ICE as "proofs may not have run" and sent the reader
+  # looking for a harness bug that was not there.
+  if grep -qE 'internal compiler error|unexpectedly panicked|kani-compiler/src/.*panicked|assertion failed' "$log"; then
     echo "::error title=Kani ICE::$crate: kani-compiler panicked during codegen, so 0 proofs ran. This is an upstream Kani bug, not a harness defect. See $log."
   elif grep -qiE 'no verification harnesses|0 harnesses' "$log"; then
     echo "::error title=No harnesses::$crate has no #[kani::proof] functions, so this proves nothing. Add harnesses or delete the step -- a green row here is a lie."
