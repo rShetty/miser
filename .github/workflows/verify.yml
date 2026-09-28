@@ -217,9 +217,13 @@ jobs:
       - name: Install cargo-mutants
         run: cargo install --locked cargo-mutants
       - name: Mutate the decision core
-        # --min-mutants stops a shrinking examine_globs list from reporting a
-        # flattering percentage from a handful of samples.
-        run: cargo mutants -j 4 --timeout 300 --min-mutants 40
+        # cargo-mutants 27.1 has no minimum-sample flag -- the only `--min*`
+        # option is --minimum-test-timeout, which .cargo/mutants.toml already
+        # sets. The sample-size floor this comment originally claimed does not
+        # exist, so it is not faked: the run is bounded by --timeout instead, and
+        # a shrinking examine_globs list would show up as a suspiciously small
+        # mutant count in the log rather than being guarded against here.
+        run: cargo mutants -j 4 --timeout 300
       - name: Upload the surviving-mutant report
         if: always()
         uses: actions/upload-artifact@v4

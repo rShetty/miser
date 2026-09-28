@@ -40,6 +40,21 @@
 use super::*;
 use kani::any;
 
+/// An arbitrary string, as Kani can represent one.
+///
+/// `[char; N]` rather than `String` or `&str`: `kani::Arbitrary` is only
+/// implemented for types the verifier can represent finitely, so `any::<String>()`
+/// and `any::<&str>()` are compile errors. The first version of this file used
+/// `any::<&str>()` in ten places and had never been compiled, because
+/// `#[cfg(kani)]` strips the module before rustc type-checks it. CI caught it.
+///
+/// 12 chars is enough to reach every byte offset a `@route:` prefix probe could
+/// slice at, which is what these harnesses exist to cover.
+fn arb_text<const N: usize>() -> String {
+    let chars: [char; N] = any();
+    chars.iter().collect()
+}
+
 /// P7. The `@route:` probe never panics on any string.
 ///
 /// This is the harness for the defect that returned HTTP 500 to any request
@@ -51,7 +66,7 @@ use kani::any;
 /// boundaries that a generator has to be *told* about.
 #[kani::proof]
 fn override_tier_never_panics() {
-    let text: &str = any();
+    let text = arb_text::<12>();
     let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
         "model": "auto",
         "messages": [{"role": "user", "content": text}]
@@ -69,7 +84,7 @@ fn override_tier_never_panics() {
 /// strongest tier would be worse than ignoring it.
 #[kani::proof]
 fn a_honoured_override_is_a_real_tier_from_a_literal_directive() {
-    let text: &str = any();
+    let text = arb_text::<12>();
     let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
         "model": "auto",
         "messages": [{"role": "user", "content": text}]
@@ -111,8 +126,8 @@ fn a_honoured_override_is_a_real_tier_from_a_literal_directive() {
 /// `to_lowercase()`, and the callers themselves must not have re-transformed it.
 #[kani::proof]
 fn has_word_never_panics() {
-    let haystack: &str = any();
-    let needle: &str = any();
+    let haystack = arb_text::<12>();
+    let needle = arb_text::<4>();
     let _ = has_word(haystack, needle);
 }
 
@@ -120,8 +135,8 @@ fn has_word_never_panics() {
 /// how the caller capitalised the prompt.
 #[kani::proof]
 fn has_word_is_case_insensitive() {
-    let haystack: &str = any();
-    let needle: &str = any();
+    let haystack = arb_text::<12>();
+    let needle = arb_text::<4>();
     let a = has_word(&haystack.to_lowercase(), &needle.to_lowercase());
     let b = has_word(&haystack.to_ascii_lowercase(), &needle.to_ascii_lowercase());
     assert_eq!(
@@ -133,7 +148,7 @@ fn has_word_is_case_insensitive() {
 /// P7. `is_short_definitional` never panics on any string.
 #[kani::proof]
 fn is_short_definitional_never_panics() {
-    let text: &str = any();
+    let text = arb_text::<12>();
     let _ = is_short_definitional(text);
 }
 
@@ -146,7 +161,7 @@ fn is_short_definitional_never_panics() {
 /// "approved"; `has_word` does not.
 #[kani::proof]
 fn a_reasoning_task_requires_a_reasoning_keyword_as_a_word() {
-    let text: &str = any();
+    let text = arb_text::<12>();
     let lower = text.to_lowercase();
     if let Some(TaskType::Reasoning) = task(text) {
         assert!(
@@ -163,7 +178,7 @@ fn a_reasoning_task_requires_a_reasoning_keyword_as_a_word() {
 /// would be undefined behaviour in a caller that assumed otherwise.
 #[kani::proof]
 fn strip_code_fence_returns_a_subslice_or_the_input() {
-    let content: &str = any();
+    let content = arb_text::<24>();
     let stripped = strip_code_fence(content);
     // Re-attach lifetimes to compare addresses rather than contents.
     let base = content.as_ptr() as usize;
@@ -204,7 +219,7 @@ fn tier_rank_is_strictly_increasing() {
 /// whose `content` is present but structurally odd.
 #[kani::proof]
 fn request_text_never_panics() {
-    let text: &str = any();
+    let text = arb_text::<12>();
     let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
         "model": "auto",
         "messages": [{"role": "user", "content": text}]
