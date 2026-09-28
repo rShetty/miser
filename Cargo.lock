@@ -890,6 +890,7 @@ name = "miser-policy"
 version = "0.1.0"
 dependencies = [
  "miser-types",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

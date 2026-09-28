@@ -361,3 +361,266 @@ fn a_reasoning_task_reaches_the_reasoning_tier() {
         );
     }
 }
+
+/// Escalation actually escalates.
+///
+/// The companion to `escalation_stops_at_the_top_tier`, and the test whose
+/// absence let three mutants survive the previous commit. A test that only
+/// checks the ceiling cannot tell "there is no tier above Reasoning" from
+/// "escalation is silently broken" -- and those are the same mutant from the
+/// suite's point of view.
+#[test]
+fn escalation_raises_the_tier_by_one() {
+    let engine = policy();
+    let req = request(plain());
+    for (from, to) in [
+        (ComplexityTier::Trivial, ComplexityTier::Simple),
+        (ComplexityTier::Simple, ComplexityTier::Standard),
+        (ComplexityTier::Standard, ComplexityTier::Hard),
+        (ComplexityTier::Hard, ComplexityTier::Reasoning),
+    ] {
+        assert_eq!(
+            engine.escalated_tier(&req, &classification(from, 0.99)),
+            Some(to),
+            "{from:?} should escalate to {to:?}"
+        );
+    }
+}
+
+/// `next()` returns the route configured for the *escalated* tier.
+///
+/// Two distinct mutants die here. `next()` returning `Ok(None)` for a tier that
+/// does have a parent disables quality escalation entirely; and `next()`
+/// returning the current tier's route makes escalation a no-op that still costs
+/// a second upstream call.
+///
+/// Compared against what the config says the parent tier routes to, not against
+/// "a different model from the current one". Two tiers are *allowed* to share a
+/// model, and asserting they differ would test the config rather than the code.
+/// Whether sharing a model is a good idea is a separate question -- see the
+/// duplicate-route finding for `[tiers.hard]` and `[tiers.reasoning]`, which
+/// both route to `z-ai/glm-5.3` and so make escalation from Hard a paid no-op.
+#[test]
+fn next_returns_the_configured_route_for_the_escalated_tier() {
+    let config = config();
+    let engine = PolicyEngine::new(config.clone());
+    let req = request(plain());
+
+    for from in [
+        ComplexityTier::Trivial,
+        ComplexityTier::Simple,
+        ComplexityTier::Standard,
+        ComplexityTier::Hard,
+    ] {
+        let parent = match from {
+            ComplexityTier::Trivial => ComplexityTier::Simple,
+            ComplexityTier::Simple => ComplexityTier::Standard,
+            ComplexityTier::Standard => ComplexityTier::Hard,
+            ComplexityTier::Hard => ComplexityTier::Reasoning,
+            ComplexityTier::Reasoning => continue,
+        };
+        let expected = config
+            .tiers
+            .get(&parent)
+            .expect("the shipped config defines every tier")
+            .model
+            .clone();
+
+        let c = classification(from, 0.99);
+        let escalated = engine
+            .next(&req, &c)
+            .expect("no error")
+            .expect("a tier above exists, so next() must not return None");
+
+        assert_eq!(
+            escalated.model, expected,
+            "next() from {from:?} must return the route configured for {parent:?}"
+        );
+    }
+}
+
+/// Escalation must not be a no-op: a parent tier that routes to the *same*
+/// model spends a second upstream call for an identical answer.
+///
+/// Currently `#[ignore]`d because it FAILS: `[tiers.hard]` and
+/// `[tiers.reasoning]` both route to `z-ai/glm-5.3`, so escalating out of Hard
+/// is a second full-price call for an identical answer. Run it with
+/// `cargo test -p miser-policy -- --ignored` to see the current state. The fix
+/// is a stronger reasoning model -- a cost decision -- or refusing to escalate
+/// into a duplicate route. Not a test bug, so not silently made to pass.
+///
+/// Asserted here rather than left implicit so the cost of the current config is
+/// visible: every quality escalation out of the Hard tier is a full-price call
+/// that buys nothing.
+#[test]
+#[ignore = "config defect, not a code defect: [tiers.hard] and [tiers.reasoning] both route to z-ai/glm-5.3. See issue #85. The fix is a stronger reasoning model (a cost decision) or refusing to escalate into a duplicate route; either way it is not a test bug."]
+fn escalation_is_not_a_paid_no_op() {
+    let config = config();
+    let parents = [
+        ComplexityTier::Simple,
+        ComplexityTier::Standard,
+        ComplexityTier::Hard,
+        ComplexityTier::Reasoning,
+    ];
+    let mut duplicates = Vec::new();
+    for parent in parents {
+        let child = match parent {
+            ComplexityTier::Simple => ComplexityTier::Trivial,
+            ComplexityTier::Standard => ComplexityTier::Simple,
+            ComplexityTier::Hard => ComplexityTier::Standard,
+            ComplexityTier::Reasoning => ComplexityTier::Hard,
+            ComplexityTier::Trivial => continue,
+        };
+        // A tier absent from the config has no route to duplicate, so a missing
+        // one is not a finding.
+        let (Some(child_route), Some(parent_route)) =
+            (config.tiers.get(&child), config.tiers.get(&parent))
+        else {
+            continue;
+        };
+        if child_route.model == parent_route.model {
+            duplicates.push(format!(
+                "{child:?} and {parent:?} both route to {:?}",
+                child_route.model
+            ));
+        }
+    }
+    assert!(
+        duplicates.is_empty(),
+        "escalation between these tiers is a paid no-op -- a second upstream call \
+         for the same model: {duplicates:?}"
+    );
+}
+
+// ------------------------------------------------------------ quality gate
+//
+// `deterministic_quality` had 7 surviving mutants, all `||` -> `&&` in one
+// function. Same non-discriminating pattern as the tier floors: the existing
+// test `coding_output_needs_code_markers_or_substance` uses content containing a
+// fence, so all seven operands in the `has_code` chain read true and replacing
+// any single `||` with `&&` changed nothing observable.
+//
+// Seven operands means the gate is *or*-shaped: any one marker is enough. That
+// is the property worth asserting, and it is only checkable by giving each
+// operand a case where it is the only true term.
+
+use miser_policy::quality::{QualityScore, deterministic_quality};
+use miser_types::QualityConfig;
+
+/// A response body with `content` set, as the quality gate reads it.
+fn response_with(content: &str) -> serde_json::Value {
+    json!({"choices": [{"message": {"role": "assistant", "content": content}}]})
+}
+
+fn quality_config() -> QualityConfig {
+    // Annotated: `.quality` alone leaves `from_str`'s type parameter ambiguous.
+    let full: GatewayConfig = toml::from_str(include_str!("../../../config/miser.toml"))
+        .expect("config/miser.toml parses");
+    full.quality
+}
+
+fn score_of(content: &str, task: Option<TaskType>) -> QualityScore {
+    let req = request(plain());
+    let mut c = classification(ComplexityTier::Trivial, 0.99);
+    c.task = task;
+    deterministic_quality(&req, &response_with(content), &c, &quality_config())
+}
+
+/// Below 80 chars, inside the Coding/Agentic branch: without a code marker the
+/// gate returns `insufficient-output`, with one it does not. That difference is
+/// the only observable, so each marker is tested as the sole true operand.
+const SHORT_PROSE: &str = "here is a short answer with no code in it at all";
+
+/// Two of the seven `has_code` operands are *not* in the list below, and their
+/// mutants cannot be killed:
+///
+/// - `content.contains("```shell")` and `content.contains("```bash")` are
+///   subsumed by `content.contains("```")`, which is already an operand.
+///   Anything containing "```shell" necessarily contains "```", so the two add
+///   nothing and removing them is unobservable.
+/// - The fence disjunct on the *outer* condition
+///   (`task == Coding || task == Agentic || content.contains("```")`) is
+///   unobservable for the same reason: entering that branch with a fence makes
+///   `has_code` true, so nothing is rejected, and not entering it scores by
+///   length either way.
+///
+/// These are left in the source deliberately. Removing them is provably
+/// behaviour-preserving *today*, but it couples the operands to "```" remaining
+/// in the chain: drop that one later and the shell/bash checks silently become
+/// live again. Kept, and documented, rather than quietly deleted. Tracked in
+/// issue #85.
+#[test]
+fn each_code_marker_alone_satisfies_the_has_code_gate() {
+    // Every marker, on its own, must be enough. The whole chain is an `or`, so
+    // removing any single `||` makes exactly one of these fail.
+    for marker in [
+        "```",
+        "fn ",
+        "function ",
+        "def ",
+        "tool_call",
+        "```shell",
+        "```bash",
+    ] {
+        let content = format!("x {marker} y");
+        assert!(
+            content.len() < 80,
+            "test case must stay under the 80-char gate: {content:?}"
+        );
+        let got = score_of(&content, Some(TaskType::Coding));
+        assert_ne!(
+            got.reason, "insufficient-output",
+            "marker {marker:?} alone should satisfy the has_code gate, got {got:?}"
+        );
+    }
+}
+
+/// The control: with no marker at all, the gate must reject. Without this, the
+/// test above would also pass if the gate were simply always-accept.
+#[test]
+fn no_code_marker_at_all_is_insufficient_output() {
+    let got = score_of(SHORT_PROSE, Some(TaskType::Coding));
+    assert_eq!(
+        got.reason, "insufficient-output",
+        "prose with no code marker should fail the gate, got {got:?}"
+    );
+}
+
+/// The same disjunction one level up: `task == Coding`, `task == Agentic`, or a
+/// fence in the content. Each must independently reach the has_code gate.
+#[test]
+fn each_branch_of_the_task_or_fence_disjunction_reaches_the_gate() {
+    // Coding via the task
+    assert_eq!(
+        score_of(SHORT_PROSE, Some(TaskType::Coding)).reason,
+        "insufficient-output",
+        "a Coding task with no marker should reach the gate and fail it"
+    );
+    // Agentic via the task
+    assert_eq!(
+        score_of(SHORT_PROSE, Some(TaskType::Agentic)).reason,
+        "insufficient-output",
+        "an Agentic task with no marker should reach the gate and fail it"
+    );
+    // Chat task, but a fence in the content.
+    //
+    // This is where the 57:9 mutant (`||` -> `&&` on the fence disjunct) lives,
+    // and it cannot be killed by any test -- correctly so. The fence disjunct is
+    // unobservable: entering the branch with a fence sets `has_code = true`, so
+    // `!has_code` is false and nothing is rejected, and *not* entering the
+    // branch falls through to the same length-based score. Both paths give
+    // "deterministic-content-check". Asserting anything else here would be
+    // asserting the code does something it does not.
+    assert_eq!(
+        score_of("```\nx\n```", Some(TaskType::Chat)).reason,
+        "deterministic-content-check",
+        "a fence sets has_code, so the gate passes and scoring falls through to length"
+    );
+    // Chat task, no fence, no marker: the branch is not entered at all, so the
+    // gate never runs and the answer is scored by length instead.
+    assert_eq!(
+        score_of(SHORT_PROSE, Some(TaskType::Chat)).reason,
+        "deterministic-content-check",
+        "with no task and no fence the branch is skipped entirely"
+    );
+}
