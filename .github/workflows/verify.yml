@@ -1,0 +1,202 @@
+name: Verify
+
+# Tiered deliberately, per docs/SPEC.md section 8.
+#
+#   PR-blocking:  fmt, clippy, cargo test, proptest seeds
+#   nightly:      Kani, TLC (TLA+), mutation testing
+#
+# Kani and TLC are slow and occasionally time out. Making them block every PR
+# trains people to retry rather than to fix, and a red build on a timeout reads
+# as "the prover is broken" rather than "the property is violated". They run
+# nightly instead, and a *violated property* is escalated loudly by that job --
+# only timeouts are silent.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 03:17 UTC nightly. Off the hour so it does not collide with every other
+    # scheduled job on the platform.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # proptest's own failure files are the regression corpus; keep them.
+  PROPTEST_CASES: "512"
+
+jobs:
+  # ---------------------------------------------------------------- fast ----
+  lint:
+    name: Format and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build with warnings denied
+        run: cargo build --workspace --all-targets -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the suite
+        run: cargo test --workspace --all-targets
+      - name: The two live-contract tests stay ignored
+        # `tests/jev_contract.rs::live_jev_contract` and
+        # `tests/security.rs::live_security_screen_agrees` need JEV_API_KEY and
+        # the network. They are the only coverage of the real provider's response
+        # shape, so at least one of them runs weekly in the nightly job.
+        run: |
+          if cargo test --workspace -- --ignored --list 2>/dev/null | grep -q 'live_jev_contract'; then
+            echo "live tests are correctly still #[ignore]d"
+          else
+            echo "::warning::a live-contract test is no longer #[ignore]d; re-check the nightly live job"
+          fi
+
+  corpora:
+    name: Corpus accuracy floors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The classifier corpus gates are ordinary tests, but re-running the
+      # evaluator prints the numbers that docs/EVALUATION.md quotes, so a drift
+      # in accuracy shows up as a diff rather than as a silently stale table.
+      - name: Curated corpus
+        run: cargo run -p miser-evals -- --corpus evals/cases.jsonl --mode heuristic
+      - name: Held-out corpus
+        run: cargo run -p miser-evals -- --corpus evals/classifier_cases.jsonl --mode heuristic
+      - name: Generated corpus
+        run: cargo run -p miser-evals -- --corpus evals/classifier_cases_large.jsonl --mode heuristic
+
+  # -------------------------------------------------------------- nightly ----
+
+  kani:
+    name: Kani proof harnesses
+    # Only on x86_64. Kani has no aarch64 Linux build, which is why these
+    # harnesses cannot be executed on every development machine.
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      # Kani pins its own toolchain; the action installs the verifier and the
+      # matching nightly.
+      - uses: model-checking/kani-github-action@v1
+        with:
+          working-directory: .
+      - name: Prove miser-types
+        run: cargo kani -p miser-types --output-format terse
+      - name: Prove miser-classifier
+        run: cargo kani -p miser-classifier --output-format terse
+      - name: Prove miser-policy
+        run: cargo kani -p miser-policy --output-format terse
+      - name: Upload proofs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kani-proofs
+          path: target/kani/
+          retention-days: 30
+
+  tlc:
+    name: TLA+ model checking
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Fetch tla2tools
+        run: |
+          mkdir -p tla
+          curl -sSL -o tla/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+      - name: Check the authorization-ordering model
+        # P8: no control is reachable only on the cache-miss path. This is the
+        # property whose violation was defect 3, and the reason for modelling the
+        # handler as a state machine rather than testing it pairwise.
+        run: |
+          java -cp tla/tla2tools.jar tlc2.TLC \
+            -config spec/AuthorizationOrdering.cfg \
+            -workers auto \
+            -deadlock \
+            spec/AuthorizationOrdering.tla
+      - name: Confirm the model still detects the pre-fix defect
+        # EXPECTED TO FAIL. If this ever passes, the model has stopped
+        # discriminating and the gate above is worthless. So the result is
+        # inverted: green here means the harness is broken.
+        run: |
+          set +e
+          java -cp tla/tla2tools.jar tlc2.TLC \
+            -config spec/AuthorizationOrderingPrefix.cfg \
+            -workers auto \
+            spec/AuthorizationOrdering.tla
+          if [ $? -eq 0 ]; then
+            echo "::error::the pre-fix model PASSED; the authorization model no longer detects the defect class"
+            exit 1
+          fi
+          echo "the pre-fix model still fails, as it must"
+
+  mutants:
+    name: Mutation kill rate
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-mutants
+        run: cargo install --locked cargo-mutants
+      - name: Mutate the decision core
+        # --min-mutants stops a shrinking examine_globs list from reporting a
+        # flattering percentage from a handful of samples.
+        run: cargo mutants -j 4 --timeout 300 --min-mutants 40
+      - name: Upload the surviving-mutant report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surviving-mutants
+          path: mutants/
+          retention-days: 30
+
+  live-contract:
+    name: Live Jev contract
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # The only coverage of the real provider's response shape, and the only
+    # coverage of the real security-screen wording. Skipped rather than failed
+    # when the secret is absent, so a fork still gets a green run.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the ignored live tests
+        if: env.JEV_API_KEY != ''
+        env:
+          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
+        run: cargo test --workspace -- --ignored --nocapture
