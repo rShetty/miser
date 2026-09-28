@@ -538,3 +538,59 @@ is an API decision and this pass is about measurement. It is also worth noting
 what this measurement does *not* cover: the six `unviable` mutants and the fact
 that a 47% figure is one shard of four, not the whole program. The combined
 number is still pending.
+
+
+### Mutation testing, shard 2: `miser-policy` has no tests at all
+
+Shard 2 of 4:
+
+```text
+80 mutants tested in 19m: 23 missed, 48 caught, 7 unviable
+```
+
+A 60% kill rate, and unlike shard 3 **none of the 23 survivors is a `default_*`
+constant**. They are mutations of the tier-floor decision itself, and the reason
+is a single structural fact:
+
+```text
+$ grep -rn 'effective_tier\|has_tool_history\|next_tier\|escalated_tier' \
+    crates/ --include=*.rs | grep -E '#\[test\]|proptest'
+(no output)
+
+$ ls crates/miser-policy/tests/
+No such file or directory
+```
+
+**`miser-policy` has no test file, and no other crate tests it.** The crate that
+decides which tier a request is allowed to use -- and therefore what it is
+allowed to spend -- is the one crate in the decision core with zero coverage.
+`PolicyEngine` is referenced only by `main.rs` and by its own definition.
+
+The survivors are exactly what you would predict, and they are the expensive
+kind:
+
+| site | mutation | why it should be caught |
+|---|---|---|
+| `lib.rs:71` | `classification.confidence < threshold` -> `<=`, `>` | the confidence gate deciding whether a low-confidence classification is promoted to Standard |
+| `lib.rs:74-90` | four `max_tier` promotions | the tools / `response_format` / Reasoning / Agentic floors |
+| `lib.rs:90` | `has_tool_history` -> `&&` (twice) | a transcript with tool history must raise the floor to Hard |
+| `lib.rs:30,43` | `select`, `next` -> `Ok(Default::default())` | the policy engine silently returning a default route |
+| `quality.rs:57-65` | 9 mutations in one function | the Coding/Agentic/code-fence quality gate |
+
+A mutation of `confidence_threshold <` to `>` would make *every* request skip
+the Standard promotion, and no test in this workspace notices. That is not a
+hypothetical: it is a measured, reproducible survivor.
+
+The 47% and 60% figures from shards 3 and 2 are **not comparable and not
+averaged here**. Shard 3 is dominated by untested constants, shard 2 by an
+untested crate; the combined number would average two different populations and
+read as a single statement about a program where the interesting part is that
+one crate is invisible. The honest summary is: the decision core is partly
+measured, and the part that decides tier floors has not been tested at all.
+
+The fix is a `crates/miser-policy/tests/` with property tests over
+`effective_tier` -- in particular, that it is *monotone* in confidence, tools,
+`response_format`, task type, and tool history, since every branch is a
+`max_tier` promotion and that is the property the whole function is built on.
+That is the same property already asserted for the price band ladder, and it is
+the natural Kani target once Kani works.
