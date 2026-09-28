@@ -106,13 +106,24 @@ impl CatalogRouter {
         }
     }
 
+    /// `MISER_CATALOG_FILE` overrides `routing.cache_path`.
+    ///
+    /// The environment variable is consulted *first*, because that is what
+    /// "overridable via `MISER_CATALOG_FILE`" means. It used to be the
+    /// fallback, so `cache_path` won whenever it was set — and the shipped
+    /// `config/miser.toml` sets it, which made the documented override inert in
+    /// the shipped deployment and therefore untestable by anyone following the
+    /// docs.
     fn snapshot_path(routing: &RoutingConfig) -> PathBuf {
+        if let Ok(path) = std::env::var("MISER_CATALOG_FILE") {
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
         if let Some(path) = &routing.cache_path {
             return PathBuf::from(shellexpand_home(path));
         }
-        std::env::var("MISER_CATALOG_FILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("catalog/models.json"))
+        PathBuf::from("catalog/models.json")
     }
 
     /// Deterministic first snapshot: pin each tier to its configured model
@@ -283,6 +294,18 @@ impl CatalogRouter {
                         .or_insert_with(|| previous.clone());
                 }
             }
+        }
+        // ...but the *candidate list* it kept was validated against the
+        // catalog this refresh just superseded. Carrying it forward verbatim
+        // let `report_failure` promote a successor that this refresh proved is
+        // not in the catalog at all — a delisted or delisted-by-filter id. And
+        // because a 404 from a delisted model is classed as a *client* error,
+        // `report_failure` is never called again, so the tier stayed wedged on
+        // the stale pin with no route out. Keeping the pin is deliberate; the
+        // stale candidates are not.
+        for pin in snapshot.pins.values_mut() {
+            pin.candidates
+                .retain(|id| snapshot.model_tiers.contains_key(id));
         }
         snapshot.fetched_at = Some(unix_now());
         snapshot.source = "openrouter".to_owned();
@@ -496,21 +519,33 @@ pub fn partition(
             Some(previous) if pool.iter().any(|model| model.id == previous.model) => {
                 // Hysteresis: keep the existing pin unless the cheapest
                 // candidate is meaningfully cheaper.
-                let current_price = pool
+                let kept = pool
                     .iter()
                     .find(|model| model.id == previous.model)
-                    .map(|model| model.input_price_per_m)
-                    .unwrap_or_default();
+                    .unwrap();
+                let current_price = kept.input_price_per_m;
                 let best = pin_choice(pool, tier, filters);
-                if best.id != previous.model
+                // A pin that cannot do the tier's job is not a pin worth
+                // keeping, whatever the price. `prefer_reasoning_pin` is
+                // enforced inside `pin_choice` and in the candidate loop, but
+                // the hysteresis arm used to keep the incumbent purely on
+                // price, so a Reasoning pin left over from before the flag was
+                // set -- or from a pool that had no reasoning model at the
+                // time -- survived refreshes indefinitely: it could never be
+                // migrated away, because hysteresis only ever moves to a
+                // *cheaper* model and a capable one costs more. The tier then
+                // served reasoning traffic with a model that cannot reason,
+                // which is the under-route direction ROUTING.md calls the
+                // expensive one, and the only escape was a three-failure
+                // failover streak.
+                let incumbent_is_disqualified = keeps_reasoning_pin(tier, filters, kept);
+                let migrates = best.id != previous.model
                     && best.input_price_per_m
-                        <= current_price * (1.0 - routing.switch_saving_ratio.max(0.0) as f64)
-                {
+                        <= current_price * (1.0 - routing.switch_saving_ratio.max(0.0) as f64);
+                if incumbent_is_disqualified || migrates {
                     best
                 } else {
-                    pool.iter()
-                        .find(|model| model.id == previous.model)
-                        .unwrap()
+                    kept
                 }
             }
             _ => pin_choice(pool, tier, filters),
@@ -534,8 +569,7 @@ pub fn partition(
             if model.id == chosen.id {
                 continue;
             }
-            if tier == ComplexityTier::Reasoning && filters.prefer_reasoning_pin && !model.reasoning
-            {
+            if keeps_reasoning_pin(tier, filters, model) {
                 continue;
             }
             candidates.push(model.id.clone());
@@ -567,15 +601,34 @@ pub fn band_tier(input_price_per_m: f64, bands: &miser_types::RoutingBands) -> C
         ComplexityTier::Simple
     } else if input_price_per_m <= bands.standard_max {
         ComplexityTier::Standard
+    } else if input_price_per_m <= bands.hard_max {
+        ComplexityTier::Hard
     } else if input_price_per_m <= bands.reasoning_max {
         ComplexityTier::Reasoning
     } else {
-        ComplexityTier::Hard
+        // Above every band: the strongest tier, which is also the only one that
+        // can serve a model priced out of all of them.
+        ComplexityTier::Reasoning
     }
 }
 
 /// The default pin for a candidate pool: cheapest model, except the
 /// reasoning tier prefers a reasoning-capable model when one exists.
+/// Whether `filters` requires the Reasoning tier to use a reasoning-capable
+/// model.
+///
+/// One predicate, shared by the pin choice, the candidate list and the
+/// hysteresis arm. They previously each re-derived it, and the hysteresis arm
+/// omitted it -- which is precisely how a non-reasoning pin could outlive the
+/// condition that made it invalid.
+fn keeps_reasoning_pin(
+    tier: ComplexityTier,
+    filters: &miser_types::RoutingFilters,
+    model: &CatalogModel,
+) -> bool {
+    tier == ComplexityTier::Reasoning && filters.prefer_reasoning_pin && !model.reasoning
+}
+
 fn pin_choice<'a>(
     pool: &[&'a CatalogModel],
     tier: ComplexityTier,
@@ -617,26 +670,47 @@ fn parse_model(entry: &Value) -> Option<CatalogModel> {
     // away because `best <= current * (1 - ratio)` is false forever. An absent
     // price is different and stays lenient at 0.0 -- that is a genuinely free
     // model, already gated by `allow_free`.
+    //
+    // "Present but unreadable" has to mean the same thing whatever JSON type
+    // carried it. The test only covered a *string* that parsed to a non-finite
+    // number, so a JSON number, `null`, `{"usd":0.15}` or `"see pricing page"`
+    // all slipped past and were recorded as $0.00/M -- which, with
+    // `allow_free = true`, made a paid model the cheapest candidate in its
+    // band. One extractor, so the two questions cannot disagree again.
+    let price_per_token = |key: &str| -> Option<f64> {
+        match pricing.get(key)? {
+            Value::String(text) => text.parse::<f64>().ok(),
+            Value::Number(number) => number.as_f64(),
+            _ => None,
+        }
+    };
+    // Finiteness is checked on the *per-million* figure, not the per-token one.
+    // The scaling by 1e6 can itself overflow: a per-token price of -1.797e308
+    // (`f64::MIN`) is perfectly finite, and `f64::MIN * 1e6` is `-inf`. Every
+    // band comparison is then false while `input_price_per_m <= 0.0` is true,
+    // so the model reads as *free*: banded Trivial, and pinned as the cheapest
+    // thing in the catalog. Checking the raw value rather than the scaled one is
+    // how a finite-looking price became the cheapest model.
+    let price_per_million = |key: &str| -> Option<f64> {
+        let scaled = price_per_token(key)? * 1_000_000.0;
+        scaled.is_finite().then_some(scaled)
+    };
     let unpriceable = |key: &str| -> bool {
+        // Absent is a free model, not an unreadable one.
         pricing
             .get(key)
-            .and_then(Value::as_str)
-            .is_some_and(|raw| raw.parse::<f64>().is_ok_and(|v| !v.is_finite()))
+            .is_some_and(|_| price_per_million(key).is_none())
     };
     if unpriceable("prompt") || unpriceable("completion") {
         tracing::warn!(
             model = %id,
-            "dropping catalog entry with a non-finite price"
+            "dropping catalog entry with an unreadable or non-finite price"
         );
         return None;
     }
     let price = |key: &str| -> f64 {
-        pricing
-            .get(key)
-            .and_then(Value::as_str)
-            .and_then(|raw| raw.parse::<f64>().ok())
-            .map(|per_token| per_token * 1_000_000.0)
-            .unwrap_or(0.0)
+        // Unreachable for a present key: `unpriceable` already returned.
+        price_per_million(key).unwrap_or(0.0)
     };
     let context_length = entry
         .get("context_length")
@@ -743,9 +817,17 @@ mod tests {
         assert_eq!(band_tier(0.035, &bands), ComplexityTier::Trivial);
         assert_eq!(band_tier(0.04, &bands), ComplexityTier::Simple);
         assert_eq!(band_tier(0.2, &bands), ComplexityTier::Standard);
-        assert_eq!(band_tier(0.65, &bands), ComplexityTier::Reasoning);
-        assert_eq!(band_tier(1.4, &bands), ComplexityTier::Reasoning);
-        assert_eq!(band_tier(3.0, &bands), ComplexityTier::Hard);
+        // The corrected ladder: Hard sits *below* Reasoning in price, so it is
+        // reached first. It used to be the "above everything" fallthrough, which
+        // put it above Reasoning and so below it in strength -- the inversion
+        // P4b pins.
+        assert_eq!(band_tier(0.65, &bands), ComplexityTier::Hard);
+        assert_eq!(band_tier(1.4, &bands), ComplexityTier::Hard);
+        assert_eq!(band_tier(1.5, &bands), ComplexityTier::Reasoning);
+        assert_eq!(band_tier(3.0, &bands), ComplexityTier::Reasoning);
+        // Above every band there is nothing stronger to promote to, so the top
+        // tier absorbs the overflow rather than a weaker one.
+        assert_eq!(band_tier(500.0, &bands), ComplexityTier::Reasoning);
     }
 
     #[test]
@@ -778,7 +860,7 @@ mod tests {
         small_context.context_length = 8_192;
         let mut image_only = model("vision/model", 0.3);
         image_only.text_output = false;
-        let models = vec![no_tools, small_context, image_only, model("ok/model", 0.5)];
+        let models = vec![no_tools, small_context, image_only, model("ok/model", 1.8)];
         let snapshot = partition(&models, &routing, &BTreeMap::new());
         assert_eq!(snapshot.unranked_models, 3);
         assert_eq!(
@@ -838,9 +920,11 @@ mod tests {
 
     #[test]
     fn reasoning_pin_prefers_reasoning_capable_model() {
-        let mut reasoning_model = model("smart/model", 0.5);
+        // Both models sit in the Reasoning band, which begins above
+        // `hard_max` (1.4) in the corrected ladder.
+        let mut reasoning_model = model("smart/model", 1.8);
         reasoning_model.reasoning = true;
-        let models = vec![model("dumb/model", 0.4), reasoning_model];
+        let models = vec![model("dumb/model", 1.5), reasoning_model];
         let snapshot = partition(&models, &routing(), &BTreeMap::new());
         assert_eq!(
             snapshot.pins.get(&ComplexityTier::Reasoning).unwrap().model,
@@ -1121,6 +1205,123 @@ mod tests {
         );
     }
 
+    /// "Present but unreadable" must mean the same thing whatever JSON type
+    /// carried the price. The non-finite test only covered strings, so a JSON
+    /// number, `null`, an object, or a non-numeric string were all recorded as
+    /// $0.00/M -- and with `allow_free = true` that made a paid model the
+    /// *cheapest* candidate in its band, ahead of a genuinely cheap one.
+    #[test]
+    fn an_unreadable_price_is_dropped_whatever_json_type_carried_it() {
+        for (label, pricing) in [
+            ("null", json!({"prompt": Value::Null, "completion": "0"})),
+            (
+                "object",
+                json!({"prompt": {"usd": 0.15}, "completion": "0"}),
+            ),
+            (
+                "non-numeric string",
+                json!({"prompt": "see pricing page", "completion": "0"}),
+            ),
+            ("array", json!({"prompt": [1, 2], "completion": "0"})),
+            ("boolean", json!({"prompt": true, "completion": "0"})),
+        ] {
+            let payload = json!({"data": [{
+                "id": "x/paid",
+                "pricing": pricing,
+                "context_length": 200000
+            }]});
+            assert!(
+                parse_catalog(&payload).is_empty(),
+                "a price delivered as a {label} is unreadable, not free"
+            );
+        }
+    }
+
+    /// The positive control: a JSON *number* is just as unambiguous as a
+    /// numeric string, so it must be honoured rather than dropped or zeroed.
+    #[test]
+    fn a_numeric_json_price_is_honoured() {
+        let payload = json!({"data": [{
+            "id": "x/numeric",
+            "pricing": {"prompt": 0.0000015, "completion": 0.000006},
+            "context_length": 200000
+        }]});
+        let parsed = parse_catalog(&payload);
+        assert_eq!(parsed.len(), 1, "a numeric price is readable");
+        assert!(
+            (parsed[0].input_price_per_m - 1.5).abs() < 1e-6,
+            "got {}",
+            parsed[0].input_price_per_m
+        );
+        assert!((parsed[0].output_price_per_m - 6.0).abs() < 1e-6);
+    }
+
+    /// Hysteresis must not be able to keep a pin that cannot do the tier's job.
+    /// `prefer_reasoning_pin` is enforced in `pin_choice` and in the candidate
+    /// list, but the "keep the incumbent" arm compared price only -- and since
+    /// hysteresis only ever migrates to a *cheaper* model, and a reasoning-capable
+    /// model costs more, a non-reasoning Reasoning pin could never be replaced
+    /// by any refresh. Reasoning traffic then went to a model that cannot
+    /// reason, and the only escape was a three-failure failover streak.
+    #[test]
+    fn hysteresis_does_not_keep_a_non_reasoning_pin_for_the_reasoning_tier() {
+        // The Reasoning band begins above `hard_max` (1.4) in the corrected
+        // ladder, so every price here is past it.
+        let mut thinker = model("pool/thinker", 2.10);
+        thinker.reasoning = true;
+        let models = vec![model("seeded/non-reasoning", 1.80), thinker, {
+            let mut other = model("pool/thinker-b", 2.20);
+            other.reasoning = true;
+            other
+        }];
+        // An incumbent pin left over from a pool that had no reasoning model.
+        let previous = BTreeMap::from([(
+            ComplexityTier::Reasoning,
+            TierPin {
+                model: "seeded/non-reasoning".to_owned(),
+                candidates: vec!["seeded/non-reasoning".to_owned()],
+            },
+        )]);
+
+        let snapshot = partition(&models, &routing(), &previous);
+        let pin = snapshot.pins.get(&ComplexityTier::Reasoning).unwrap();
+        assert_eq!(
+            pin.model, "pool/thinker",
+            "an incapable incumbent must not survive a refresh"
+        );
+        assert!(
+            !pin.candidates.is_empty() && pin.candidates.iter().all(|id| id.contains("thinker")),
+            "failover targets must be reasoning-capable too: {:?}",
+            pin.candidates
+        );
+    }
+
+    /// The control: hysteresis still does its job on a tier with no capability
+    /// requirement, so the fix above did not disable pin stability everywhere.
+    /// Prices inside the `Hard` band (0.36 < p <= 1.4), which has no
+    /// `prefer_reasoning_pin` constraint.
+    #[test]
+    fn hysteresis_still_keeps_the_incumbent_when_it_is_qualified() {
+        let models = vec![model("pool/incumbent", 1.20), model("pool/cheap", 1.00)];
+        let previous = BTreeMap::from([(
+            ComplexityTier::Hard,
+            TierPin {
+                model: "pool/incumbent".to_owned(),
+                candidates: vec!["pool/incumbent".to_owned()],
+            },
+        )]);
+        let snapshot = partition(&models, &routing(), &previous);
+        assert_eq!(
+            snapshot
+                .pins
+                .get(&ComplexityTier::Hard)
+                .expect("hard tier must be pinned")
+                .model,
+            "pool/incumbent",
+            "1.00 is not 25% cheaper than 1.20, so the pin must stand"
+        );
+    }
+
     /// The Reasoning tier's failover targets must themselves be
     /// reasoning-capable.
     ///
@@ -1132,12 +1333,12 @@ mod tests {
     /// reasoning traffic silently degraded on the first upstream failure streak.
     #[test]
     fn reasoning_tier_failover_targets_are_reasoning_capable() {
-        // All three land in the Reasoning band, which is
-        // `standard_max < price <= reasoning_max` (0.36 < p <= 1.4).
+        // All three land in the Reasoning band, which in the corrected ladder
+        // is `hard_max < price` (1.4 < p).
         let mut models: Vec<CatalogModel> = vec![
-            model("cheap/no-reason", 0.40),
-            model("mid/no-reason", 0.50),
-            model("thinker", 1.00),
+            model("cheap/no-reason", 1.60),
+            model("mid/no-reason", 1.80),
+            model("thinker", 2.20),
         ];
         for candidate in &mut models {
             if candidate.id == "thinker" {
@@ -1431,6 +1632,47 @@ mod tests {
         .expect("test gateway config parses")
     }
 
+    /// `MISER_CATALOG_FILE` is documented as an override of `cache_path`, so it
+    /// has to win. It used to be consulted only as a fallback, which made it
+    /// inert in the shipped deployment -- `config/miser.toml` sets
+    /// `cache_path = "catalog/models.json"`, so an operator following the docs
+    /// would set the variable and see no effect at all.
+    #[test]
+    fn the_catalog_file_env_var_overrides_the_configured_cache_path() {
+        // Serialised: `set_var` is process-global, and the test binary is
+        // multi-threaded.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let routing = RoutingConfig {
+            cache_path: Some("catalog/models.json".into()),
+            ..Default::default()
+        };
+
+        // Safety: guarded by the mutex above, and nothing else in this test
+        // binary reads the variable.
+        unsafe { std::env::set_var("MISER_CATALOG_FILE", "/tmp/from-env.json") };
+        assert_eq!(
+            CatalogRouter::snapshot_path(&routing),
+            PathBuf::from("/tmp/from-env.json"),
+            "the environment variable must win over cache_path"
+        );
+
+        // An empty value is not an override; fall through to the config.
+        unsafe { std::env::set_var("MISER_CATALOG_FILE", "") };
+        assert_eq!(
+            CatalogRouter::snapshot_path(&routing),
+            PathBuf::from("catalog/models.json")
+        );
+
+        unsafe { std::env::remove_var("MISER_CATALOG_FILE") };
+        assert_eq!(
+            CatalogRouter::snapshot_path(&routing),
+            PathBuf::from("catalog/models.json"),
+            "with no variable, cache_path is used"
+        );
+    }
+
     #[test]
     fn success_resets_failure_counter_without_promotion() {
         let router = router_with_pins(BTreeMap::from([(
@@ -1517,6 +1759,7 @@ mod tests {
             band_tier(bands.standard_max, &bands),
             ComplexityTier::Standard
         );
+        assert_eq!(band_tier(bands.hard_max, &bands), ComplexityTier::Hard);
         assert_eq!(
             band_tier(bands.reasoning_max, &bands),
             ComplexityTier::Reasoning
@@ -1531,11 +1774,17 @@ mod tests {
         );
         assert_eq!(
             band_tier(bands.standard_max * 1.01, &bands),
-            ComplexityTier::Reasoning
+            ComplexityTier::Hard
         );
         assert_eq!(
+            band_tier(bands.hard_max * 1.01, &bands),
+            ComplexityTier::Reasoning
+        );
+        // Past the top band the strongest tier absorbs the overflow, so the
+        // ladder stays monotone rather than wrapping back down to a weaker tier.
+        assert_eq!(
             band_tier(bands.reasoning_max * 1.01, &bands),
-            ComplexityTier::Hard
+            ComplexityTier::Reasoning
         );
     }
 
@@ -1720,7 +1969,7 @@ mod tests {
         exact_context.context_length = 8_192;
         let blocked = model("blocked/model", 0.03);
         let free_suffix = model("vendor/alt:free", 0.01);
-        let good = model("good/model", 0.5);
+        let good = model("good/model", 1.8);
         let models = vec![no_tools, exact_context, blocked, free_suffix, good];
 
         let snapshot = partition(&models, &routing, &BTreeMap::new());

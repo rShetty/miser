@@ -747,6 +747,30 @@ impl Default for QuotaEnforcer {
     }
 }
 
+/// `year * 12 + month0` for the UTC calendar month containing `secs`.
+///
+/// Howard Hinnant's `civil_from_days`, so leap years and the 31/30/29-day
+/// months are the calendar's own rather than an average. Returns a value that
+/// is strictly increasing across a month boundary, which is the only property
+/// the budget window actually needs.
+fn calendar_month_index(secs: u64) -> u32 {
+    // Days since 1970-01-01. Truncating to a day is what makes the index
+    // change exactly at midnight UTC and nowhere else.
+    let days = (secs / 86_400) as i64;
+    // Shift the epoch to 0000-03-01 so leap days land at the end of the
+    // 400-year era and the arithmetic below needs no special cases.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year * 12 + (month - 1)) as u32
+}
+
 impl QuotaEnforcer {
     pub fn new() -> Self {
         Self {
@@ -762,13 +786,22 @@ impl QuotaEnforcer {
             .unwrap_or(0)
     }
 
+    /// Index of the current *calendar* month, in UTC.
+    ///
+    /// This used to be `secs / 2_629_800`, an average 30.44-day month. Each
+    /// window then started 10.5 hours later than the last, so boundaries fell
+    /// inside calendar months: 21.5 hours of January 2026 belonged to the
+    /// window that also held most of March, and January 2027 contained two
+    /// boundaries. A key could therefore spend its whole cap inside one
+    /// calendar month, then again after the next boundary, before the month
+    /// actually turned over. `monthly_budget_usd` promises a calendar month
+    /// and the 402 says "monthly", so the index has to be the real thing.
     fn current_month() -> u32 {
-        // Approximate month index from epoch seconds (30.44-day months).
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        (secs / 2_629_800) as u32
+        calendar_month_index(secs)
     }
 
     /// Fixed-window RPM check. Returns `false` when the request should be
@@ -799,13 +832,40 @@ impl QuotaEnforcer {
 
     /// Accumulate estimated cost for a key in the current month.
     pub fn record_spend(&self, key_id: &str, amount_usd: f64) {
-        let month = Self::current_month();
-        let mut spend = self.spend.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = spend.entry(key_id.to_string()).or_insert((month, 0.0));
-        if entry.0 != month {
-            *entry = (month, 0.0);
+        self.adjust_spend(key_id, amount_usd, Self::current_month());
+    }
+
+    /// Add `delta_usd` to a key's spend in the month window `window`.
+    ///
+    /// `delta_usd` is signed so a reservation can be reconciled once the real
+    /// figure is known: a streaming request reserves the `max_tokens`
+    /// estimate up front, because a budget cap has to hold before the answer
+    /// exists, and then subtracts the overestimate when the provider's own
+    /// `usage` frame arrives. Without that the cap was consumed at up to
+    /// `max_tokens / actual_tokens` of the real cost -- 41x on the shipped
+    /// `hard` tier for a 200-token answer.
+    ///
+    /// `window` is passed explicitly rather than re-read from the clock so a
+    /// stream that ends after midnight UTC reconciles against the month it was
+    /// reserved in. The total is floored at zero: a reconciliation must never
+    /// hand a key negative credit, which `check_budget` would then treat as
+    /// headroom.
+    pub fn adjust_spend(&self, key_id: &str, delta_usd: f64, window: u32) {
+        if !delta_usd.is_finite() {
+            return;
         }
-        entry.1 += amount_usd;
+        let mut spend = self.spend.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = spend.entry(key_id.to_string()).or_insert((window, 0.0));
+        if entry.0 != window {
+            *entry = (window, 0.0);
+        }
+        entry.1 = (entry.1 + delta_usd).max(0.0);
+    }
+
+    /// The month window a reservation was recorded in, so it can be reconciled
+    /// later even if the calendar month has turned over by then.
+    pub fn current_window() -> u32 {
+        Self::current_month()
     }
 
     /// Drop all quota state for a key.
@@ -849,6 +909,73 @@ mod quota_tests {
         assert!(q.check_budget("k", 1.0));
         q.record_spend("k", 0.75);
         assert!(!q.check_budget("k", 1.0));
+    }
+
+    /// The month index has to advance at midnight UTC on the first of a month
+    /// and nowhere else. `2026-01-01T00:00:00Z` is 1_767_225_600.
+    #[test]
+    fn the_budget_window_turns_over_exactly_at_the_start_of_a_calendar_month() {
+        let jan = 1_767_225_600u64; // 2026-01-01T00:00:00Z
+        let jan_index = calendar_month_index(jan);
+        assert_eq!(jan_index, 2026 * 12, "January 2026 is month 0 of 2026");
+
+        // Every second of January shares one index...
+        for offset in [0u64, 1, 86_399, 30 * 86_400, 30 * 86_400 + 86_399] {
+            assert_eq!(
+                calendar_month_index(jan + offset),
+                jan_index,
+                "{offset}s into January must still be January"
+            );
+        }
+        // ...and the very next second is a new one, i.e. the last second of
+        // January 23:59:59 and the first of February 00:00:00 differ.
+        let feb = jan + 31 * 86_400;
+        assert_eq!(
+            calendar_month_index(feb),
+            2026 * 12 + 1,
+            "2026-02-01T00:00:00Z is month 1 of 2026"
+        );
+        assert_ne!(
+            calendar_month_index(feb),
+            calendar_month_index(feb - 1),
+            "the boundary must fall on the day boundary"
+        );
+    }
+
+    /// Regression: the old index was `secs / 2_629_800`, an average month, so
+    /// it drifted 10.5 hours per window. The cap could be spent in full more
+    /// than once inside a single calendar month, which is what the field name
+    /// and the `402 monthly budget exhausted` response both deny.
+    #[test]
+    fn a_monthly_cap_cannot_be_respent_within_one_calendar_month() {
+        // Enumerate every hour of January 2026 and count how many distinct
+        // "months" the old arithmetic claimed. A calendar month has exactly one.
+        let jan = 1_767_225_600u64; // 2026-01-01T00:00:00Z
+        let jan_end = jan + 31 * 86_400;
+        let correct: std::collections::BTreeSet<u32> = (0..31)
+            .map(|d| calendar_month_index(jan + d * 86_400 + 43_200))
+            .collect();
+        assert_eq!(correct.len(), 1, "January 2026 must be a single window");
+
+        let legacy: std::collections::BTreeSet<u32> = (0..31)
+            .map(|d| ((jan + d * 86_400 + 43_200) / 2_629_800) as u32)
+            .collect();
+        assert!(
+            legacy.len() > 1,
+            "the old index should have split January, else this proves nothing"
+        );
+        // And the split the old index made is not a month boundary at all: it
+        // fell at 2026-01-31T10:30:00Z, mid-month.
+        let split = jan_end - 10 * 86_400 - 13 * 3_600 - 1_800; // 2026-01-31T10:30:00Z
+        assert_eq!(
+            calendar_month_index(split),
+            correct.iter().next().copied().unwrap()
+        );
+        assert_eq!(
+            ((split) / 2_629_800) as u32,
+            ((split + 1) / 2_629_800) as u32,
+            "sanity: the legacy boundary is elsewhere"
+        );
     }
 }
 

@@ -96,12 +96,19 @@ failover_threshold = 3
 refresh_on_start = false
 
 [routing.bands]
-# Input price bounds (USD per 1M prompt tokens). Defaults are geometric
-# midpoints between the shipped tier anchor models.
+# Input price bounds (USD per 1M prompt tokens), in tier-strength order.
+# Defaults are geometric midpoints between the shipped tier anchor models
+# (qwen3.7-flash $0.03, deepseek-v4-flash $0.04, qwen3-coder-flash $0.20,
+# glm-5.2 $0.65, claude-sonnet-4 $3.00).
+#
+# `hard_max` exists because there was no bound for the Hard band: it was the
+# "above everything" fallthrough, which put it above Reasoning in price and so
+# below it in strength. The top two tiers of the ladder were inverted.
 trivial_max = 0.035
 simple_max = 0.09
 standard_max = 0.36
-reasoning_max = 1.4
+hard_max = 1.4
+reasoning_max = 3.0
 
 [routing.filters]
 require_tools = true

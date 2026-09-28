@@ -65,13 +65,31 @@ pub fn validate_config(config: &GatewayConfig) -> Result<(), String> {
     );
 
     let bands = &config.routing.bands;
-    if bands.trivial_max <= 0.0
+    // Every `<=` and `>=` is false when either side is NaN, and TOML has both a
+    // `nan` and an `inf` float literal, so a single `standard_max = nan` slipped
+    // through all the order comparisons and the gateway started normally. The
+    // band ordering then collapsed silently: with `standard_max` NaN, every
+    // model in the affected price slice failed the `<= NaN` test and fell
+    // through to the next band up, cheap open-weight models included. The
+    // message this function emits asserts a strict ordering, so the check has to
+    // test finiteness too.
+    let bounds = [
+        bands.trivial_max,
+        bands.simple_max,
+        bands.standard_max,
+        bands.hard_max,
+        bands.reasoning_max,
+    ];
+    if bounds.iter().any(|bound| !bound.is_finite())
+        || bands.trivial_max <= 0.0
         || bands.trivial_max >= bands.simple_max
         || bands.simple_max >= bands.standard_max
-        || bands.standard_max >= bands.reasoning_max
+        || bands.standard_max >= bands.hard_max
+        || bands.hard_max >= bands.reasoning_max
     {
         errors.push(
-            "routing.bands must satisfy 0 < trivial_max < simple_max < standard_max < reasoning_max"
+            "routing.bands must be finite and satisfy 0 < trivial_max < simple_max \
+             < standard_max < hard_max < reasoning_max"
                 .to_string(),
         );
     }
@@ -262,6 +280,62 @@ mod tests {
         assert!(
             error.contains("classifier.cloud_llm.base_url must not be empty"),
             "{error}"
+        );
+    }
+
+    /// Every band comparison is false when either side is NaN, and TOML has a
+    /// `nan` float literal that `toml` 0.9 accepts. So `standard_max = nan`
+    /// passed all four order checks and the gateway started normally — then
+    /// `band_tier`'s `<= NaN` tests all failed, so every model in the affected
+    /// price slice fell through to the strongest tier. The message this
+    /// function emits asserts a strict ordering, so finiteness has to be part of
+    /// the check.
+    #[test]
+    fn rejects_non_finite_band_bounds() {
+        for (field, value) in [
+            ("trivial", f64::NAN),
+            ("simple", f64::NAN),
+            ("standard", f64::NAN),
+            ("reasoning", f64::NAN),
+            ("reasoning", f64::INFINITY),
+        ] {
+            let mut config = base_config();
+            match field {
+                "trivial" => config.routing.bands.trivial_max = value,
+                "simple" => config.routing.bands.simple_max = value,
+                "standard" => config.routing.bands.standard_max = value,
+                _ => config.routing.bands.reasoning_max = value,
+            }
+            let error = validate_config(&config)
+                .expect_err("{field} = {value} must be rejected at startup");
+            assert!(
+                error.contains("routing.bands must be finite"),
+                "unhelpful error for {field} = {value}: {error}"
+            );
+        }
+    }
+
+    /// The consequence the check above exists to prevent, recorded directly:
+    /// with a NaN bound, a mid-priced model skips a tier, because every
+    /// `<= NaN` test is false and the comparison falls through to the next band
+    /// down. That is a silent, whole-catalog re-routing to expensive models.
+    #[test]
+    fn a_nan_band_bound_would_shift_every_model_up_a_tier() {
+        let bands = miser_types::RoutingBands {
+            standard_max: f64::NAN,
+            ..Default::default()
+        };
+        // 0.20/M sits between simple_max (0.09) and standard_max (0.36).
+        assert_eq!(
+            crate::catalog::band_tier(0.20, &miser_types::RoutingBands::default()),
+            miser_types::ComplexityTier::Standard,
+            "test premise: with finite bounds 0.20/M is Standard"
+        );
+        assert_eq!(
+            crate::catalog::band_tier(0.20, &bands),
+            miser_types::ComplexityTier::Hard,
+            "with standard_max = NaN the Standard test is false, so 0.20/M falls \
+             through to the next band -- a silent upgrade to a more expensive tier"
         );
     }
 

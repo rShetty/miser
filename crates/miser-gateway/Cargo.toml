@@ -32,5 +32,6 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+proptest = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
