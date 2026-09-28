@@ -59,9 +59,9 @@ jobs:
             -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{"keyType":"auth","description":"srv1542935 reauth (one-off)",
+            -d '{"keyType":"auth","description":"srv1542935 reauth oneoff",
                  "capabilities":{"devices":{"create":{"reusable":true,"ephemeral":false,
-                 "preauthorized":true,"tags":["tag:hostinger"]}},"expirySeconds":86400}}')
+                 "preauthorized":true,"tags":["tag:hostinger"]}}}}')
           echo "auth-key create http=$HTTP"
           if [ "$HTTP" = "200" ]; then
             KEY=$(jq -r '.key' authkey.json)
