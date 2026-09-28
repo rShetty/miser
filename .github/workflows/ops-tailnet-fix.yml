@@ -1,9 +1,18 @@
-# ONE-OFF diagnostic: determine the fastest working fix for the expired VPS
-# tailnet node key. Read-only against the tailnet except for an auth-key
-# creation probe. Delete after use.
+# ONE-OFF: revoke the auth key that leaked into this public repo's Actions log,
+# and mint a replacement delivered ONLY as RSA-encrypted ciphertext (the
+# private key lives on the operator's laptop, never in this repo). Delete
+# after use.
 name: ops-tailnet-fix
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      revoke_key_id:
+        description: "Key id to revoke (the leaked one); empty to skip"
+        required: false
+        default: "kBNLvYrQ4o11CNTRL"
+      pubkey_der_b64:
+        description: "base64 of the operator RSA public key (DER SubjectPublicKeyInfo)"
+        required: true
 
 permissions:
   contents: read
@@ -13,11 +22,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  diagnose:
+  rotate:
     runs-on: ubuntu-latest
     env:
       TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
       TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+      REVOKE_KEY_ID: ${{ github.event.inputs.revoke_key_id }}
+      PUBKEY_DER_B64: ${{ github.event.inputs.pubkey_der_b64 }}
     steps:
       - name: Connect to tailnet
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
@@ -25,36 +36,22 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:hostinger
-          # No `ping`: the VPS node key is expired; a failed ping would abort
-          # the step before the diagnostics below can run.
 
-      - name: Probe Tailscale API capabilities
+      - name: Revoke leaked key, mint replacement (encrypted output only)
         run: |
-          set -uo pipefail
+          set -euo pipefail
           TOKEN=$(curl -s -X POST "https://api.tailscale.com/api/v2/oauth/token" \
             --data-urlencode "client_id=$TS_OAUTH_CLIENT_ID" \
             --data-urlencode "client_secret=$TS_OAUTH_SECRET" | jq -r '.access_token')
           [ "$TOKEN" != "null" ] && [ -n "$TOKEN" ] || { echo "OAuth token fetch failed"; exit 1; }
 
-          echo "=== 1. device states (who is expired / connected) ==="
-          curl -sf -H "Authorization: Bearer $TOKEN" \
-            "https://api.tailscale.com/api/v2/tailnet/-/devices" > devices.json
-          jq -r '.devices[] |
-            [.name, .nodeId, .os,
-             ((.isEphemeral // false) | tostring),
-             ((.connectedToControl // false) | tostring),
-             (.expires // "?"),
-             ((.keyExpiryDisabled // false) | tostring),
-             ((."sshEnabled" // false) | tostring),
-             (.lastSeen // "?")]
-            | @tsv' devices.json
+          if [ -n "$REVOKE_KEY_ID" ]; then
+            HTTP=$(curl -s -o .rev -w '%{http_code}' -X DELETE \
+              "https://api.tailscale.com/api/v2/tailnet/-/keys/$REVOKE_KEY_ID" \
+              -H "Authorization: Bearer $TOKEN")
+            echo "revoke $REVOKE_KEY_ID -> http=$HTTP $(cat .rev 2>/dev/null || true)"
+          fi
 
-          VPS=$(jq -r '[.devices[] | select((.isEphemeral // false) | not)
-                         | select(.os == "linux") | .nodeId] | join(",")' devices.json)
-          echo "VPS nodeId candidates: $VPS"
-
-          echo ""
-          echo "=== 2. can this OAuth client create an AUTH KEY? ==="
           HTTP=$(curl -s -o authkey.json -w '%{http_code}' \
             -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
             -H "Authorization: Bearer $TOKEN" \
@@ -62,42 +59,16 @@ jobs:
             -d '{"keyType":"auth","description":"srv1542935 reauth oneoff",
                  "capabilities":{"devices":{"create":{"reusable":true,"ephemeral":false,
                  "preauthorized":true,"tags":["tag:hostinger"]}}}}')
-          echo "auth-key create http=$HTTP"
-          if [ "$HTTP" = "200" ]; then
-            KEY=$(jq -r '.key' authkey.json)
-            echo ""
-            echo "############################################################"
-            echo "## AUTH KEY WORKS. Paste this ONE command into the        ##"
-            echo "## Hostinger panel -> VPS -> web console (VNC), as root:  ##"
-            echo "############################################################"
-            echo ""
-            echo "  sudo tailscale up --auth-key=$KEY --advertise-tags=tag:hostinger --hostname=srv1542935 --reset"
-            echo ""
-            echo "## (key self-expires in 24h; reusable; preauthorized)     ##"
-            echo "############################################################"
-            # also try to disable expiry on the VPS right now, in case the
-            # tag check passes once we know the client CAN write keys
-            for NODE in ${VPS//,/ }; do
-              H2=$(curl -s -o .b -w '%{http_code}' \
-                -X POST "https://api.tailscale.com/api/v2/device/$NODE/key" \
-                -H "Authorization: Bearer $TOKEN" \
-                -H "Content-Type: application/json" \
-                -d '{"keyExpiryDisabled": true}')
-              echo "keyExpiryDisabled on $NODE -> http=$H2 $(cat .b 2>/dev/null || true)"
-            done
-          else
-            cat authkey.json; echo
-            echo ""
-            echo "############################################################"
-            echo "## AUTH KEY CREATION REFUSED. The ONLY remaining fix is   ##"
-            echo "## a 30-second console action by the tailnet OWNER:       ##"
-            echo "##                                                        ##"
-            echo "## 1. open https://login.tailscale.com/admin/machines     ##"
-            echo "## 2. find srv1542935 (offline, linux)                    ##"
-            echo "## 3. click '...' -> 'Disable key expiry'                 ##"
-            echo "##                                                        ##"
-            echo "## The VPS is still connected to Tailscale control, so    ##"
-            echo "## it recovers the moment this is clicked. Then re-run    ##"
-            echo "## this workflow or the deploy pipeline.                  ##"
-            echo "############################################################"
-          fi
+          [ "$HTTP" = "200" ] || { echo "auth key create failed http=$HTTP"; cat authkey.json; exit 1; }
+
+          # NEVER echo the raw key. Encrypt to the operator's public key and
+          # print only ciphertext.
+          echo "$PUBKEY_DER_B64" | base64 -d > pub.der
+          openssl pkey -pubin -inform DER -in pub.der -out pub.pem
+          CIPHER=$(jq -r '.key' authkey.json | openssl pkeyutl -encrypt -pubin -inkey pub.pem | base64 -w0)
+          KEY_ID=$(jq -r '.id' authkey.json)
+          rm -f authkey.json pub.der pub.pem .rev
+          echo ""
+          echo "NEW_KEY_ID=$KEY_ID"
+          echo "CIPHERTEXT_B64:"
+          echo "$CIPHER"
