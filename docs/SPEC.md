@@ -363,8 +363,8 @@ Recorded so the strength of each claim is visible rather than assumed.
 | D5 delete `max_cost_per_1m` | **not started** | — |
 | D6 capability floors | **not started** | — |
 | D7 streaming overrun | **documented only** | the reconciliation already implements it |
-| Kani | **written, unexecuted** | 12 harnesses; no aarch64 Linux build |
-| `cargo-mutants` | **configured, unexecuted** | 318 mutants; a full run is hours |
+| Kani | **blocked, 0 proofs** | 16 harnesses written; Kani 0.68.0 ICEs compiling `miser-classifier` (see below) |
+| `cargo-mutants` | **running** | 318 mutants; a full run is hours |
 | `miser-core` extraction | **not started** | prerequisite for proving the money path |
 
 ### What the model checker actually established
@@ -428,3 +428,56 @@ earlier pass:
    `Deserialize` so the rule is "an object whose `type` is one of four known
    strings, else verbatim", which makes P15a structural rather than emergent.
    Found by `an_arbitrary_content_part_round_trips_verbatim` on its first run.
+
+
+### Kani: blocked, and the scope-narrowing plan does not work
+
+Status: **zero proofs have been executed.** Sixteen harnesses are written
+(`miser-types` 7, `miser-classifier` 9) and are believed to be correct, but none
+has been run. The obstacle is a compiler bug in Kani 0.68.0:
+
+```text
+thread 'rustc' panicked at kani-compiler/src/intrinsics.rs:243:17:
+  assertion failed: matches!(output.kind(),
+    TyKind::RigidTy(RigidTy::Int(IntTy::I32)))
+error: internal compiler error: Kani unexpectedly panicked
+```
+
+It fires during codegen, so no harness is reached and no property is checked.
+Nothing here is a harness defect: the same ICE occurs on both crates, and it
+occurs while compiling the library rather than in any particular harness.
+
+**The earlier plan to scope the job to `miser-types` is refuted by
+measurement.** The reasoning was that `miser-classifier` is the crate that ICEs,
+so proving `miser-types` alone would at least produce a result. It does not:
+`cargo kani -p miser-types` still compiles `miser-classifier` — the log shows
+`Compiling miser-classifier` inside the `miser-types` job, and the ICE
+`could not compile miser-classifier` from that job. Both matrix legs therefore
+fail identically and neither yields a proof. Scoping by `-p` cannot isolate the
+problem, because the whole workspace is built regardless.
+
+This is the fifth instance of the same failure mode, and the most consequential
+one. A Kani job that reports success while proving nothing is worse than no
+gate, because the harnesses exist and are believed good; the absence of proofs
+is then indistinguishable from their absence as a design decision. So
+`ci/kani-prove.sh` requires Kani's `N verification harnesses` summary line and
+fails if it is absent, distinguishing the three reasons it can be missing (ICE,
+empty harness set, counterexample). A green Kani row now means proofs ran.
+
+**What is left to try**, none of it verified:
+
+1. A different Kani version. Untested, because the version is now pinned and a
+   bump is meant to be a deliberate commit carrying the ICE text.
+2. Splitting the decision logic into `miser-core` (already planned, §D1). This is
+   the principled fix: `miser-classifier` depends on `reqwest` and `tokio`, and
+   a large async dependency graph is a plausible trigger for a codegen ICE in an
+   intrinsic. A crate with no async dependencies is both provable and easier to
+   reason about, which is why the extraction is the prerequisite anyway.
+3. Filing the ICE upstream with the exact command line and the `--allow-escape`
+   log. The job is pinned at 0.68.0 so an upstream fix shows up as a deliberate
+   version bump rather than as a mystery.
+
+Until one of those lands, every property in §"Properties" whose only check is
+Kani is **unverified**, and this document should not be read as claiming
+otherwise. The properties checked by proptest, integration tests, and TLC are
+unaffected and did run.
