@@ -166,6 +166,20 @@ jobs:
           # Bump deliberately, in its own commit, with the ICE text in it.
           kani-version: '0.68.0'
           working-directory: .
+          # The action is not only an installer. It has its own final step,
+          # "Run Kani", which executes `command args` -- so with the default
+          # `command: cargo-kani` and empty `args` it ran `cargo kani` over the
+          # whole workspace the moment it was used, before the harness step
+          # below had run. That is where the ICE was actually happening, which
+          # is why the job failed without `ci/kani-prove.sh` ever being reached
+          # and why no `::error` annotation from it appeared in the log.
+          #
+          # `--list` makes the action's own step a no-op: it enumerates the
+          # harnesses and exits without verifying anything. Verification is then
+          # done by the matrix legs, once per crate, with the assertion that
+          # proofs actually ran.
+          command: cargo
+          args: kani --list
       # One step per crate, each `continue-on-error`, then an explicit gate.
       #
       # Not because a failure should be tolerated -- it is not, the gate below
