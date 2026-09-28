@@ -5,7 +5,7 @@
 //! probability-weighted level index normalized to 0..=1 so the
 //! `minimum_score` threshold compares like with like.
 
-use miser_types::{ClassifierEndpointConfig, ContentPart, MessageContent};
+use miser_types::{ClassifierEndpointConfig, ContentPart, KnownContentPart, MessageContent};
 use serde_json::json;
 
 pub struct QualityJudge {
@@ -189,7 +189,7 @@ pub fn last_user_text(request: &miser_types::ChatCompletionRequest) -> String {
             MessageContent::Parts(parts) => parts
                 .iter()
                 .filter_map(|part| match part {
-                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::Known(KnownContentPart::Text { text }) => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()

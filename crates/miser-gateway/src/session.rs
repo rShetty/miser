@@ -1,4 +1,6 @@
-use miser_types::{ChatCompletionRequest, ComplexityTier, MessageContent};
+use miser_types::{
+    ChatCompletionRequest, ComplexityTier, ContentPart, KnownContentPart, MessageContent,
+};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -71,7 +73,7 @@ pub fn session_key(request: &ChatCompletionRequest, tenant: &str) -> Option<Stri
             MessageContent::Parts(p) => p
                 .iter()
                 .map(|part| match part {
-                    miser_types::ContentPart::Text { text } => text.clone(),
+                    ContentPart::Known(KnownContentPart::Text { text }) => text.clone(),
                     _ => String::new(),
                 })
                 .collect::<Vec<_>>()
