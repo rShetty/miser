@@ -11,6 +11,3 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 
-# `cfg(kani)` is set by the Kani verifier, not by cargo.
-[lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

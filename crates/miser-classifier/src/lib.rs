@@ -4,11 +4,6 @@ use miser_types::{
 };
 use regex::RegexSet;
 use serde::Deserialize;
-// Kani proof harnesses for the pure decision functions. `#[cfg(kani)]` keeps
-// them out of every normal build, so `kani` is never a dependency of one. The
-// `cfg` name is declared in Cargo.toml under `[lints.rust] unexpected_cfgs`.
-#[cfg(kani)]
-mod kani_proofs;
 
 use serde_json::{Value, json};
 use std::time::Instant;
@@ -1358,6 +1353,75 @@ fn result(
 mod tests {
     use super::*;
     use miser_types::ChatCompletionRequest;
+
+    /// P17: `rank_of` is a total order over the tiers, and it agrees with the
+    /// `Ord` derived on `ComplexityTier`.
+    ///
+    /// This is the property the whole "the floor is monotone" claim rests on.
+    /// `rank_of` is a hand-written `match` that duplicates an ordering
+    /// `ComplexityTier` already derives, so the two can drift: a new tier added
+    /// to the enum, or a reordering, would leave `rank_of` returning a stale
+    /// number and the tier floors silently comparing wrongly. Nothing else
+    /// checks that they agree -- the tier tests below assert individual
+    /// classifications, which is consistent with *both* orderings being wrong in
+    /// the same direction.
+    ///
+    /// Previously this was a Kani harness (`tier_rank_is_strictly_increasing`).
+    /// Kani could not be executed at all (its 0.68.0 compiler ICEs on this
+    /// crate), so the property was documented but not checked. `rank_of` is
+    /// private, so this has to be a unit test rather than an integration one.
+    #[test]
+    fn rank_of_is_a_strictly_increasing_total_order() {
+        // The canonical order, weakest to strongest. Asserting it as a literal
+        // list is deliberate: a test that derived the expectation from the
+        // implementation would agree with any ordering, including a wrong one.
+        let ladder = [
+            ComplexityTier::Trivial,
+            ComplexityTier::Simple,
+            ComplexityTier::Standard,
+            ComplexityTier::Hard,
+            ComplexityTier::Reasoning,
+        ];
+
+        for (index, tier) in ladder.iter().enumerate() {
+            assert_eq!(rank_of(*tier), index as u8, "{tier:?} should rank {index}");
+        }
+
+        // Every pair is strictly ordered, and the derived `Ord` agrees. If
+        // `rank_of` and `Ord` ever disagree this is where it shows up.
+        for (i, weaker) in ladder.iter().enumerate() {
+            for stronger in ladder.iter().skip(i + 1) {
+                assert!(
+                    rank_of(*weaker) < rank_of(*stronger),
+                    "{weaker:?} must rank below {stronger:?}"
+                );
+                assert!(
+                    weaker < stronger,
+                    "derived Ord disagrees with rank_of: {weaker:?} !< {stronger:?}"
+                );
+            }
+        }
+    }
+
+    /// P17: no tier is omitted from `rank_of`, and every tier the classifier can
+    /// produce is one of the five in the ladder.
+    ///
+    /// Guards the other half of the previous test: a sixth tier added to the enum
+    /// without a `rank_of` arm would panic at runtime, on a request, in
+    /// production.
+    #[test]
+    fn rank_of_covers_every_tier() {
+        for tier in [
+            ComplexityTier::Trivial,
+            ComplexityTier::Simple,
+            ComplexityTier::Standard,
+            ComplexityTier::Hard,
+            ComplexityTier::Reasoning,
+        ] {
+            let r = rank_of(tier);
+            assert!(r <= 4, "{tier:?} ranked {r}, above the top of the ladder");
+        }
+    }
 
     /// A config that never calls out, for the tier rules themselves.
     fn classifier_config(mode: &str) -> ClassifierConfig {

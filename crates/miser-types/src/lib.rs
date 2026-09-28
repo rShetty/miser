@@ -1,9 +1,3 @@
-// Kani proof harnesses for the wire types -- the gateway's trust boundary.
-// `#[cfg(kani)]` keeps them out of normal builds; the cfg name is declared in
-// Cargo.toml under `[lints.rust] unexpected_cfgs`.
-#[cfg(kani)]
-mod kani_proofs;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;

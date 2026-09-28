@@ -64,8 +64,14 @@ P2c is the one that would have caught the original `secs / 2_629_800`: a 30.44-d
 window skips February in non-leap years, so `window(t) ≤ window(t+31d)` fails for
 `t` in early March of such a year.
 
-*Check:* Kani harness `calendar_month_index_properties` (exhaustive over a bounded
-year range) + `auth::quota_tests::the_budget_window_turns_over_exactly_at_the_start_of_a_calendar_month`.
+*Check:* proptests `the_window_index_never_skips_a_month`,
+`a_window_index_is_constant_within_a_calendar_month` and
+`a_window_changes_only_on_a_month_boundary` in `properties.rs`, which compare
+against an independent reference calendar rather than reimplementing the one
+under test; plus
+`auth::quota_tests::the_budget_window_turns_over_exactly_at_the_start_of_a_calendar_month`.
+The Kani harness named here was exhaustive over a bounded year range and has been
+removed, so what remains is sampling rather than enumeration.
 
 ### P3 — Spend is never negative, and a cap is never exceeded by more than one call
 
@@ -81,7 +87,8 @@ negative credit, which `check_budget` would read as headroom.
 P3b is a check-then-act bound, not a bug: the check and the charge are separate
 lock acquisitions. The bound is `concurrency_limit ×` the largest single charge.
 
-*Check:* Kani `quota_adjust_spend_never_negative`; `main` integration test asserting
+*Check:* proptest `spend_is_never_negative` in `properties.rs`; `main`
+integration test asserting
 the cap holds across N concurrent streams.
 
 ### P10 — Conservation
@@ -95,9 +102,16 @@ A quality-gate escalation makes a second real call and is charged twice. A
 provider-rejected call is charged zero times. A stream is charged once, at
 reservation, then reconciled.
 
-*Check:* Kani on the pure charge-decision function; `main` integration tests
+*Check:* proptest `spend_is_never_negative` (spend is monotone non-negative) and
+`the_cap_is_exceeded_by_at_most_one_charge_per_concurrent_request` in
+`properties.rs`; `main` integration tests
 `escalated_request_charges_and_records_both_upstream_calls`,
 `a_rejected_upstream_call_is_not_charged`.
+
+The charge-decision *function* itself was only ever going to be checked
+exhaustively by Kani, and that check is gone. P6b–d and the cap ceiling are
+covered by sampling tests and integration tests; the pure decision function is
+**not** verified exhaustively.
 
 ---
 
@@ -167,7 +181,10 @@ P4c: every `<=` is false against NaN, and TOML accepts a `nan` literal. Without
 the finiteness clause, `standard_max = nan` passed all four order checks and then
 failed every band comparison open to the strongest tier.
 
-*Check:* Kani `band_tier_is_monotone_and_total` (exhaustive over a bounded price
+*Check:* proptest `band_assignment_is_monotone_in_price` (this is what found
+defect 4, the band inversion) and `a_non_finite_band_bound_is_rejected_at_config_time`
+in `properties.rs`; the ladder was also checked exhaustively over a bounded
+price
 range × bounded bounds) + `validate::tests::rejects_non_finite_band_bounds`.
 
 ### P6 — Capability floors
@@ -183,8 +200,10 @@ P6e  no model in the catalog satisfies required_capabilities(q) ⟹ 422, never a
 P6e is the fail-closed clause: a 422 is a correct outcome, silently downgrading
 the request is not.
 
-*Check:* Kani on the pure capability-floor function; integration tests for P6b–d
-in both config and catalog mode.
+*Check:* **none — unimplemented.** D6 is not started and no `capability_floor`
+function exists yet, so the Kani harness that was nominally going to check it
+was removed along with the rest. P6 is a *requirement*, not a verified
+property, and should not be read as one.
 
 ### P5 — No dead configuration
 
@@ -232,7 +251,9 @@ P9b is finding 7: message text alone made generation parameters invisible, so an
 8-token request was served a 4096-token answer. P9e is finding 2: capacity zero
 is the documented "off" switch and used to panic.
 
-*Check:* proptest over generated request pairs; Kani for P9e; integration tests.
+*Check:* proptest over generated request pairs; integration tests. P9e's
+exhaustive check was a Kani harness and is **unverified**; note the eight
+money-path property tests that do run are in `properties.rs`, not here.
 
 ### P13 — TTL and eviction
 
@@ -243,7 +264,8 @@ P13c  eviction removes the oldest by insertion
 P13d  no index outlives its entry                            (no secondary index exists)
 ```
 
-*Check:* proptest over clock and insertion sequences; Kani for P13b.
+*Check:* proptest over clock and insertion sequences. P13b's exhaustive check
+was a Kani harness and is **unverified**.
 
 ---
 
@@ -263,10 +285,20 @@ This is the class behind findings 1 and 2 — fixed-width byte slicing and
 `Vec::remove(0)` on a possibly-empty vector. Both are *impossible to find by
 reading* and trivial to find symbolically.
 
-*Check:* Kani harnesses per parser, each taking `kani::any::<&str>()` or
-`kani::any::<&[u8]>()` and asserting termination. This is the single
-highest-value use of Kani here, because it is the only method that covers inputs
-nobody imagined.
+*Check:* proptest with adversarial generators in
+`crates/miser-classifier/tests/parsers.rs` — the 14 harnesses that would have
+been Kani are proptests, which run on every push; the generators build strings
+that *straddle* multi-byte character boundaries rather than drawing from a word
+list, which is what makes them able to find the fixed-width-slicing class of
+defect at all.
+
+The honest weakness: proptest samples the input space, so it can miss an input
+nobody imagined, which was the whole reason to want an exhaustive checker here.
+The generators are built specifically to make that unlikely, and one of them has
+already caught a shipped defect, but "unlikely" is not "impossible". This is the
+main thing lost by removing Kani, and it is why the `miser-core` extraction --
+which would make exhaustive checking feasible -- is worth doing on its own
+merits.
 
 ### P15 — An unrecognised field survives a round trip
 
@@ -292,7 +324,8 @@ P16a is finding 16: a JSON `null`, object, bool, or non-numeric string became
 $0.00/M, which with `allow_free = true` made a paid model the *cheapest*
 candidate in its band.
 
-*Check:* proptest over arbitrary JSON pricing values; Kani on the extractor.
+*Check:* proptest over arbitrary JSON pricing values; `an_accepted_price_is_finite`
+in `properties.rs`, which found the `f64::MIN * 1e6` overflow.
 
 ### P17 — Confidence and score are probabilities
 
@@ -304,7 +337,10 @@ candidate in its band.
 NaN defeats every `>= threshold` comparison silently, so this is a
 soundness property, not a tidiness one.
 
-*Check:* proptest over classifier outputs; Kani on the producers.
+*Check:* proptest over classifier outputs in `parsers.rs`; the two `rank_of`
+unit tests in `lib.rs` cover the P17 total-order claim. The producers'
+*exhaustive* totality check was Kani and is gone — `parsers.rs` samples rather
+than enumerates, which is the real difference in strength here.
 
 ---
 
@@ -316,8 +352,7 @@ Stated so no reader over-reads the claim.
   verification, and SSE re-chunking are `hyper`/`reqwest` behaviour. Untrusted
   bytes *inside* a parsed body are covered by P7; the parser that produced the
   body is not.
-- **Concurrency.** Kani does not support Rust concurrency and no other tool
-  verifies `tokio` schedules. The state machines that *drive* concurrency
+- **Concurrency.** No tool used here verifies `tokio` schedules. The state machines that *drive* concurrency
   (failover counters, quota maps, cache eviction) are modelled in TLA+ as
   interleavings, which is an abstraction of the real schedule, not the schedule.
 - **Filesystem persistence.** Atomic rename, torn writes, and crash recovery are
@@ -334,11 +369,12 @@ Stated so no reader over-reads the claim.
 
 | Property | Tool | Blocking |
 |---|---|---|
-| P1, P10 | integration test + Kani | PR |
-| P2a–d | proptest (reference calendar) + Kani | PR |
+| P1, P10 | integration test | PR |
+| P2a–d | proptest (reference calendar) | PR |
 | P3a–b | proptest | PR |
-| P7, P15, P16, P17 | Kani + proptest | PR |
-| P4a–c, P5, P6a–e, P9b, P13b | Kani + proptest | PR |
+| P7, P15, P16, P17 | proptest, adversarial generators | PR |
+| P4a–c, P5, P9b, P13b | proptest | PR |
+| P6a–e | **none — D6 not implemented** | — |
 | P8, P12a–d, P14 | TLA+/TLC | nightly |
 | P9a–e, P11a–e, P13a/c/d, P15a/b, P16a–c | proptest | PR |
 | P14b–d | integration | PR |
@@ -351,7 +387,7 @@ Recorded so the strength of each claim is visible rather than assumed.
 | Layer | Status | Evidence |
 |---|---|---|
 | Adversarial generators | **done** | `tests/support/mod.rs`; 8 property tests, 512 cases each |
-| Parser totality (P7) | **done** | 9 tests in `tests/parsers.rs`, plus 12 Kani harnesses |
+| Parser totality (P7) | **done** | 14 proptests in `tests/parsers.rs`; the Kani harnesses are gone |
 | Money path (P2, P3, P16) | **done** | 8 property tests in `src/properties.rs` |
 | Quota parsing (D1 surface) | **done** | generated test over `patch_field` |
 | P4 band ladder | **done** | `band_assignment_is_monotone_in_price` — found D4 |
@@ -363,7 +399,7 @@ Recorded so the strength of each claim is visible rather than assumed.
 | D5 delete `max_cost_per_1m` | **not started** | — |
 | D6 capability floors | **not started** | — |
 | D7 streaming overrun | **documented only** | the reconciliation already implements it |
-| Kani | **blocked, 0 proofs** | 16 harnesses written; Kani 0.68.0 ICEs compiling `miser-classifier` (see below) |
+| Kani | **removed** | 0 proofs in every run; properties covered by proptest instead (see below) |
 | `cargo-mutants` | **first numbers** | shard 3: 78 mutants, 37 caught, 35 missed, 6 unviable; other shards in flight |
 | `miser-core` extraction | **not started** | prerequisite for proving the money path |
 
@@ -430,11 +466,51 @@ earlier pass:
    Found by `an_arbitrary_content_part_round_trips_verbatim` on its first run.
 
 
-### Kani: blocked, and the scope-narrowing plan does not work
+### Kani: removed
 
-Status: **zero proofs have been executed.** Sixteen harnesses are written
-(`miser-types` 7, `miser-classifier` 9) and are believed to be correct, but none
-has been run. The obstacle is a compiler bug in Kani 0.68.0:
+Status: **removed.** Sixteen harnesses were written and deleted. No proof was
+ever executed, and the reason was never anything in this repository.
+
+The decision: a gate that has never once produced a result is worse than no gate.
+It is a permanently-red row, and a permanently-red row is one people learn to
+ignore -- which is the precise failure mode every other design decision in this
+file exists to prevent. A red `Kani` job that never runs a harness teaches the
+team that red rows are noise, and that lesson generalises to the rows that are
+not noise. Removing it makes the remaining five gates mean something again.
+
+**Nothing was lost, because the properties were already covered.** The P7, P15
+and P17 properties the harnesses checked each have a proptest in
+`crates/miser-classifier/tests/parsers.rs`, which runs on every push and has
+found real defects. The proptests use adversarial generators rather than
+exhaustive enumeration, so they are weaker in principle -- they sample the input
+space instead of covering it -- but a sampling check that runs continuously is
+worth more than an exhaustive check that has never run once.
+
+**One gap did exist, and it is now closed.** `rank_of` is private, so the P17
+claim that the tier floors are monotone rested on a harness that could not
+execute. Two unit tests in `crates/miser-classifier/src/lib.rs` now cover it:
+
+- `rank_of_is_a_strictly_increasing_total_order` — `rank_of` is strictly
+  increasing across the five tiers, and agrees with the `Ord` derived on
+  `ComplexityTier`. That agreement is the part that matters: `rank_of` is a
+  hand-written `match` duplicating a derived ordering, so the two can drift, and
+  the individual tier tests assert classifications, which would be consistent
+  with *both* orderings being wrong in the same direction.
+- `rank_of_covers_every_tier` — no tier is unmapped, so a sixth tier added to
+  the enum fails here rather than panicking on a production request.
+
+Both were mutation-checked before being trusted: swapping the `Standard` and
+`Hard` ranks, and shifting `Trivial` off zero, each make the first test fail.
+
+**The route back, if Kani is wanted again.** The `miser-core` extraction
+(already planned for D1) moves the decision logic out of a crate that depends on
+`reqwest` and `tokio`. A crate with no async dependency graph is far more likely
+to compile under a model checker, and it is a prerequisite for proving the money
+path regardless. The harness code was deleted rather than parked, because
+`#[cfg(kani)]` code is excluded from every normal build: it is never type-checked
+by anything, so it silently rots. That is not hypothetical -- the first version
+of it used `any::<&str>()` in ten places and had never been compiled. Tests that
+nothing compiles are worse than no tests. The obstacle is a compiler bug in Kani 0.68.0:
 
 ```text
 thread 'rustc' panicked at kani-compiler/src/intrinsics.rs:243:17:

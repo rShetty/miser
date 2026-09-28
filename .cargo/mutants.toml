@@ -54,14 +54,17 @@ examine_globs = [
 ]
 
 exclude_globs = [
-    # The Kani harnesses are themselves tests. Mutating a test to see whether
-    # another test notices is a category error: a "surviving" mutant here means
-    # the workspace has no test that fails when a *proof harness* is weakened,
-    # which is not a property anyone wants, and 26 of the 344 mutants (7.6%) were
-    # spent on it. Those files are `#[cfg(kani)]`, so under a normal `cargo test`
-    # they are not even compiled -- a mutant in a file that does not exist at
-    # test time is trivially "unkillable" and would drag the kill rate down
-    # while telling us nothing.
+    # Test support, not decision logic. Mutating a test's own helpers to see
+    # whether another test notices is a category error: a "surviving" mutant
+    # here is a statement about the shape of the test suite, not about the
+    # behaviour of the program. `properties_support.rs` holds the adversarial
+    # proptest generators -- mutating the generator weakens the check rather
+    # than testing the code.
+    #
+    # `**/kani_proofs.rs` is listed for a historical reason and is currently a
+    # no-op: the Kani harnesses were removed in full. It is kept as a guard so
+    # that if Kani is ever reintroduced, this exclusion is already in place --
+    # 26 of the 344 mutants (7.6%) were being spent on those files.
     "**/kani_proofs.rs",
     "**/properties_support.rs",
 ]

@@ -2,14 +2,22 @@ name: Verify
 
 # Tiered deliberately, per docs/SPEC.md section 8.
 #
-#   PR-blocking:  fmt, clippy, cargo test, proptest seeds
-#   nightly:      Kani, TLC (TLA+), mutation testing
+#   PR-blocking:  fmt, clippy, workflow lint, cargo test, corpus accuracy
+#   nightly:      TLC (TLA+), mutation testing, live provider contract
 #
-# Kani and TLC are slow and occasionally time out. Making them block every PR
-# trains people to retry rather than to fix, and a red build on a timeout reads
-# as "the prover is broken" rather than "the property is violated". They run
-# nightly instead, and a *violated property* is escalated loudly by that job --
-# only timeouts are silent.
+# TLC, mutation testing and the live contract are slow. Making them block every
+# PR trains people to retry rather than to fix, so they run nightly instead.
+#
+# Kani was the fourth nightly job and has been removed. It never executed a
+# single proof: 0.68.0's internal compiler ICEs while compiling
+# `miser-classifier`, so every run died during codegen with zero harnesses
+# reached. A gate that has never once produced a result is worse than no gate --
+# it is a permanently-red row that people learn to ignore, which is the exact
+# failure mode the rest of this file is built to prevent. The properties its
+# harnesses checked are covered by proptest, which runs on every push; see
+# docs/SPEC.md section 9 and issue #82. The `miser-core` extraction, already
+# planned, would make the crate provable and is the route back if Kani is
+# wanted.
 on:
   push:
     branches: [main]
@@ -124,98 +132,6 @@ jobs:
         run: cargo run -p miser-evals -- --corpus evals/classifier_cases_large.jsonl --mode heuristic
 
   # -------------------------------------------------------------- nightly ----
-
-  kani:
-    name: Kani ${{ matrix.crate }}
-    strategy:
-      # Not `true`. The default cancels sibling jobs the moment one fails, which
-      # is precisely how 0.68.0's ICE on miser-classifier suppressed
-      # miser-types and left us with no result for either.
-      fail-fast: false
-      matrix:
-        # Only crates that actually have `#[kani::proof]` functions. A crate
-        # without them exits 0 and shows a green row that verified nothing --
-        # miser-policy was in this list until it was caught doing that.
-        crate: [miser-types, miser-classifier]
-    # Only on x86_64. Kani has no aarch64 Linux build, which is why these
-    # harnesses cannot be executed on every development machine.
-    runs-on: ubuntu-latest
-    # Deliberately NOT `needs: [lint, test]`.
-    #
-    # With that dependency, one typo in a fast gate skips every slow gate -- and
-    # a skipped verification job is indistinguishable from a passing one in the
-    # run list. That is not hypothetical: the first run of this workflow failed
-    # on a malformed `cargo build` line and consequently reported Kani, TLC,
-    # cargo-mutants and the live contract as *skipped* rather than failed. The
-    # whole verification program was disabled by a shell-argument error, and the
-    # only symptom was four green-looking rows.
-    #
-    # These jobs are already gated on `schedule || workflow_dispatch`, so they
-    # never run on an ordinary push anyway; making them depend on the fast gates
-    # bought nothing and cost the visibility.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    steps:
-      - uses: actions/checkout@v4
-      # Kani pins its own toolchain; the action installs the verifier and the
-      # matching nightly.
-      - uses: model-checking/kani-github-action@v1
-        with:
-          # Pinned. The default is `latest`, which makes an upstream regression
-          # indistinguishable from a defect in this repo: a Kani release that
-          # ICEs would turn this job red on a commit that changed no proof.
-          # Bump deliberately, in its own commit, with the ICE text in it.
-          kani-version: '0.68.0'
-          working-directory: .
-          # The action is not only an installer. It has its own final step,
-          # "Run Kani", which executes `command args` -- so with the default
-          # `command: cargo-kani` and empty `args` it ran `cargo kani` over the
-          # whole workspace the moment it was used, before the harness step
-          # below had run. That is where the ICE was actually happening, which
-          # is why the job failed without `ci/kani-prove.sh` ever being reached
-          # and why no `::error` annotation from it appeared in the log.
-          #
-          # `true` makes the action's own "Run Kani" step a no-op. It has no
-          # "install only" mode: the step is unconditional, so the only way to
-          # stop it verifying the whole workspace is to hand it a command that
-          # does nothing. (An earlier attempt used `cargo kani --list`, which
-          # 0.68.0 does not have -- it exited 2 with "unexpected argument" and
-          # failed the job before the matrix legs ran.)
-          command: true
-      # One step per crate, each `continue-on-error`, then an explicit gate.
-      #
-      # Not because a failure should be tolerated -- it is not, the gate below
-      # re-fails the job -- but because 0.68.0 ICEs while compiling
-      # miser-classifier, and a hard failure there meant the crate we could not
-      # prove was never attempted, so a single upstream bug hid every result
-      # this job exists to produce. Same reasoning as dropping `needs:` above.
-      # The script is what guarantees a run means something; the matrix is what
-      # guarantees we find out. `fail-fast: false` lets both crates be attempted
-      # even when one fails, so an upstream ICE in one crate cannot hide the
-      # other's result -- each is a separate job with its own conclusion, which
-      # a single job with sequential steps cannot give you.
-      #
-      # (The previous version aggregated with a shell loop that interpolated a
-      # shell variable into a GitHub expression. The expression language has no
-      # shell interpolation, so the workflow failed to validate and ran zero
-      # jobs while reporting `failure`.)
-      - name: Prove
-        run: bash ci/kani-prove.sh '${{ matrix.crate }}'
-      # No `miser-policy` step. It ran `cargo kani -p miser-policy`, and that
-      # crate has no `#[kani::proof]` functions -- so it exited 0 and the run
-      # list showed a third green verification layer that verified nothing.
-      # A row here was a claim, not a result.
-      - name: Upload proofs and logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          # Unique per matrix leg. With a shared name the two legs race to
-          # upload the same artifact name and one set of proofs is lost -- the
-          # first version of this job did exactly that.
-          name: kani-proofs-${{ matrix.crate }}
-          path: |
-            target/kani/
-            kani-*.log
-          retention-days: 30
 
   tlc:
     name: TLA+ model checking

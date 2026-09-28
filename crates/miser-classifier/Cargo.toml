@@ -20,7 +20,3 @@ miser-types = { path = "../miser-types" }
 [dev-dependencies]
 proptest = "1"
 
-# `cfg(kani)` is set by the Kani verifier, not by cargo. Declaring it keeps
-# rustc from warning about an unknown cfg name on every normal build.
-[lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }
