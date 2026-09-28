@@ -6,6 +6,8 @@
 - [Security Model](./SECURITY.md)
 - [Operations Runbook](./OPERATIONS.md)
 - [Evaluation Methodology](./EVALUATION.md)
+- [Correctness Findings](./CORRECTNESS_FINDINGS.md) — defects found by a formal
+  correctness pass, and what is still open
 
 Miser is an OpenAI-compatible gateway. The documentation describes the current Rust MVP and marks planned capabilities explicitly. The default classifier is **Jev** (TypeSafe System One evaluation model) — see [Evaluation Methodology](./EVALUATION.md) for the benchmark evidence and [Operations Runbook](./OPERATIONS.md) for key rotation and fallback detection. For installation, follow the copy-paste guide in [Setup Guide](./SETUP.md).
 
@@ -27,3 +29,13 @@ swallowed by the availability fallback.
   duplicate rows behind 347 unique prompts — and are held at accuracy floors
   instead, because demanding 100% of generated labels would encode label noise
   as truth.
+* **A green corpus is not a correct gateway.** A formal correctness pass
+  ([findings](./CORRECTNESS_FINDINGS.md)) fixed 15 defects — including two
+  remotely-triggerable panics, a tier-allowlist bypass via the response cache,
+  and cross-tenant response leakage — while every corpus score stayed
+  bit-identical. All 2,277 rows are ASCII, so nothing in them exercises a
+  multi-byte-character panic; none contains `improve`/`approved`, so nothing
+  exercises the keyword-substring collision; and none runs `hybrid` mode, so
+  nothing exercises the verification cascade. The corpora measure tier choice on
+  clean English prose. They cannot see a crash, an authorization hole, or an
+  accounting error, and they should not be relied on to.
