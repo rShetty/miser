@@ -12,3 +12,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 miser-types = { path = "../miser-types" }
+
+[dev-dependencies]
+proptest = "1"

@@ -1,0 +1,363 @@
+//! The tier floors: `miser-policy` decides which tier a request may use, and
+//! therefore what it may spend. These tests are about that decision.
+//!
+//! ## Why these exist
+//!
+//! Mutation testing reported 23 surviving mutants in this crate, and the cause
+//! was not an absence of tests -- `lib.rs` already had three. It was that those
+//! three do not *discriminate*. Every one of them uses `confidence: 0.99`, so
+//! the confidence gate
+//!
+//! ```text
+//! if classification.confidence < self.config.classifier.confidence_threshold
+//! ```
+//!
+//! never runs on the interesting side. Mutating `<` to `<=` or to `>` left the
+//! suite green. A test that cannot tell the original from a broken version is
+//! not evidence, which is the same claim the mutation run makes about the rest
+//! of the workspace.
+//!
+//! ## The property that matters
+//!
+//! Every branch of `effective_tier` is a `max_tier` promotion. A floor, never a
+//! ceiling. So the function is monotone in each of its five inputs, and that is
+//! what these assert:
+//!
+//! - raising `confidence` never raises the tier (uncertainty must cost more)
+//! - adding `tools`, `response_format`, a tool history, or a harder task never
+//!   lowers the tier
+//!
+//! Monotonicity is the real safety statement here. It says the gateway cannot be
+//! talked *down* into a cheaper model by any combination of request fields.
+
+use miser_policy::{PolicyEngine, has_tool_history};
+use miser_types::{
+    ChatCompletionRequest, ClassificationResult, ComplexityTier, GatewayConfig, TaskType,
+};
+use proptest::prelude::*;
+use serde_json::json;
+
+/// The shipped configuration. The floors are only meaningful against real
+/// thresholds, and a test that invented its own would pass while the deployed
+/// config did not.
+fn config() -> GatewayConfig {
+    toml::from_str(include_str!("../../../config/miser.toml")).expect("config/miser.toml parses")
+}
+
+fn policy() -> PolicyEngine {
+    PolicyEngine::new(config())
+}
+
+/// The threshold the shipped config actually uses. Hard-coded here on purpose:
+/// if a config change moves it, a test that read it back out of the config would
+/// silently follow and keep passing, which is exactly the failure this file
+/// exists to catch.
+const THRESHOLD: f32 = 0.65;
+
+fn classification(tier: ComplexityTier, confidence: f32) -> ClassificationResult {
+    ClassificationResult {
+        tier,
+        confidence,
+        reasons: vec![],
+        classifier: "test".into(),
+        latency_ms: 0,
+        ..Default::default()
+    }
+}
+
+fn request(value: serde_json::Value) -> ChatCompletionRequest {
+    serde_json::from_value(value).expect("request shape is constructible")
+}
+
+fn plain() -> serde_json::Value {
+    json!({"model": "auto", "messages": [{"role": "user", "content": "hello"}]})
+}
+
+/// Every tier, as a strategy.
+///
+/// Written out rather than `any::<ComplexityTier>()`: `Arbitrary` is not
+/// implemented on the type, and adding it would put a proptest dependency into
+/// `miser-types` for the convenience of one test. An `Arbitrary` derive on a
+/// public enum is also a silent contract -- it says the enum's variants can
+/// grow, and a strategy derived from the variant list would quietly start
+/// generating a new tier before any floor is defined for it. Enumerating the
+/// five here means a sixth tier fails this file to compile.
+fn any_tier() -> impl Strategy<Value = ComplexityTier> {
+    prop_oneof![
+        Just(ComplexityTier::Trivial),
+        Just(ComplexityTier::Simple),
+        Just(ComplexityTier::Standard),
+        Just(ComplexityTier::Hard),
+        Just(ComplexityTier::Reasoning),
+    ]
+}
+
+fn rank(tier: ComplexityTier) -> u8 {
+    match tier {
+        ComplexityTier::Trivial => 0,
+        ComplexityTier::Simple => 1,
+        ComplexityTier::Standard => 2,
+        ComplexityTier::Hard => 3,
+        ComplexityTier::Reasoning => 4,
+    }
+}
+
+// ---------------------------------------------------------------- the floors
+
+/// The confidence gate. Below the threshold the classification is not trusted
+/// and the request is promoted to at least Standard -- this is the test that
+/// distinguishes `<` from `<=`, which no existing test did.
+#[test]
+fn low_confidence_is_promoted_to_at_least_standard() {
+    let engine = policy();
+    for tier in [
+        ComplexityTier::Trivial,
+        ComplexityTier::Simple,
+        ComplexityTier::Standard,
+    ] {
+        let low = classification(tier, THRESHOLD - 0.01);
+        let got = engine.effective_tier(&request(plain()), &low);
+        assert!(
+            rank(got) >= rank(ComplexityTier::Standard),
+            "confidence {} below threshold should floor {tier:?} at Standard, got {got:?}",
+            low.confidence
+        );
+    }
+}
+
+/// The other side: at or above the threshold the classifier's own tier stands.
+/// Together with the test above this pins the comparison to exactly `<` --
+/// `<=` would promote at the threshold, `>` would promote above it.
+#[test]
+fn confidence_at_or_above_the_threshold_keeps_the_classified_tier() {
+    let engine = policy();
+    for confidence in [THRESHOLD, THRESHOLD + 0.01, 0.99] {
+        let c = classification(ComplexityTier::Trivial, confidence);
+        assert_eq!(
+            engine.effective_tier(&request(plain()), &c),
+            ComplexityTier::Trivial,
+            "confidence {confidence} at or above the threshold should not promote"
+        );
+    }
+}
+
+/// `has_tool_history` is a three-way disjunction. The existing test used a
+/// message that satisfies all three at once, so replacing any single `||` with
+/// `&&` still returned true. Each disjunct is checked on its own.
+#[test]
+fn each_tool_history_disjunct_is_independently_sufficient() {
+    // tool_calls present, nothing else
+    assert!(has_tool_history(&request(json!({
+        "model": "auto",
+        "messages": [{"role": "assistant", "content": "ok", "tool_calls": [{"id": "1"}]}]
+    }))));
+    // tool_call_id present, nothing else
+    assert!(has_tool_history(&request(json!({
+        "model": "auto",
+        "messages": [{"role": "tool", "content": "result", "tool_call_id": "1"}]
+    }))));
+    // role == "tool" only
+    assert!(has_tool_history(&request(json!({
+        "model": "auto",
+        "messages": [{"role": "tool", "content": "result"}]
+    }))));
+}
+
+/// ...and a transcript with none of them is not tool history. Without this,
+/// replacing the whole disjunction with a constant `true` would survive.
+#[test]
+fn a_plain_transcript_is_not_tool_history() {
+    assert!(!has_tool_history(&request(json!({
+        "model": "auto",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"}
+        ]
+    }))));
+    assert!(!has_tool_history(&request(
+        json!({"model": "auto", "messages": []})
+    )));
+}
+
+/// `select` must fail closed. If the effective tier has no route, the answer is
+/// an error, never a silent downgrade to something cheaper.
+#[test]
+fn a_tier_with_no_configured_route_is_an_error_not_a_downgrade() {
+    let mut config = config();
+    config.tiers.remove(&ComplexityTier::Hard);
+    let engine = PolicyEngine::new(config);
+
+    let request = request(json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+    let mut c = classification(ComplexityTier::Trivial, 0.99);
+    c.task = Some(TaskType::Agentic); // forces Hard
+
+    let err = engine.select(&request, &c);
+    assert!(
+        err.is_err(),
+        "a request whose floor has no route must error, not be served cheaper"
+    );
+}
+
+/// Escalation stops at the top of the ladder rather than wrapping or returning
+/// the same tier again, which would make the escalation loop non-terminating.
+#[test]
+fn escalation_stops_at_the_top_tier() {
+    let engine = policy();
+    let request = request(plain());
+    let c = classification(ComplexityTier::Reasoning, 0.99);
+    assert_eq!(
+        engine.escalated_tier(&request, &c),
+        None,
+        "there is no tier above Reasoning"
+    );
+}
+
+// ------------------------------------------------------------- monotonicity
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+    /// Raising confidence must never raise the tier. This is the safety
+    /// direction: less certainty is allowed to cost more, never less.
+    #[test]
+    fn raising_confidence_never_raises_the_tier(
+        base_tier in any_tier(),
+        low in 0.0f32..THRESHOLD,
+        high in THRESHOLD..1.0f32,
+    ) {
+        let engine = policy();
+        let req = request(plain());
+        let at_low = engine.effective_tier(&req, &classification(base_tier, low));
+        let at_high = engine.effective_tier(&req, &classification(base_tier, high));
+        prop_assert!(
+            rank(at_low) >= rank(at_high),
+            "confidence {low} gave {at_low:?} but higher confidence {high} gave {at_high:?}"
+        );
+    }
+
+    /// The confidence gate never *lowers* a tier, at any confidence. A floor
+    /// that could demote would make the cheap path reachable by being unsure.
+    #[test]
+    fn confidence_never_demotes_below_the_classified_tier(
+        tier in any_tier(),
+        confidence in 0.0f32..=1.0f32,
+    ) {
+        let engine = policy();
+        let got = engine.effective_tier(&request(plain()), &classification(tier, confidence));
+        prop_assert!(
+            rank(got) >= rank(tier),
+            "confidence {confidence} demoted {tier:?} to {got:?}"
+        );
+    }
+
+    /// Declaring tools can only raise the floor.
+    #[test]
+    fn declaring_tools_never_lowers_the_tier(tier in any_tier(), confidence in 0.0f32..=1.0f32) {
+        let engine = policy();
+        let c = classification(tier, confidence);
+        let bare = engine.effective_tier(&request(plain()), &c);
+        let with_tools = engine.effective_tier(
+            &request(json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "function"}]
+            })),
+            &c,
+        );
+        prop_assert!(
+            rank(with_tools) >= rank(bare),
+            "tools lowered {bare:?} to {with_tools:?}"
+        );
+    }
+
+    /// A tool-call transcript can only raise the floor.
+    #[test]
+    fn tool_history_never_lowers_the_tier(tier in any_tier(), confidence in 0.0f32..=1.0f32) {
+        let engine = policy();
+        let c = classification(tier, confidence);
+        let bare = engine.effective_tier(&request(plain()), &c);
+        let replayed = engine.effective_tier(
+            &request(json!({
+                "model": "auto",
+                "messages": [
+                    {"role": "user", "content": "run it"},
+                    {"role": "assistant", "content": "ok", "tool_calls": [{"id": "1"}]}
+                ]
+            })),
+            &c,
+        );
+        prop_assert!(
+            rank(replayed) >= rank(bare),
+            "tool history lowered {bare:?} to {replayed:?}"
+        );
+    }
+
+    /// `response_format` is a structured-output request; it can only raise the
+    /// floor.
+    #[test]
+    fn response_format_never_lowers_the_tier(tier in any_tier(), confidence in 0.0f32..=1.0f32) {
+        let engine = policy();
+        let c = classification(tier, confidence);
+        let bare = engine.effective_tier(&request(plain()), &c);
+        let structured = engine.effective_tier(
+            &request(json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hello"}],
+                "response_format": {"type": "json_object"}
+            })),
+            &c,
+        );
+        prop_assert!(
+            rank(structured) >= rank(bare),
+            "response_format lowered {bare:?} to {structured:?}"
+        );
+    }
+}
+
+/// An agentic task must reach at least Hard, whatever else is true of the
+/// request. This is the strongest single floor and the easiest to break
+/// accidentally.
+#[test]
+fn an_agentic_task_always_reaches_at_least_hard() {
+    let engine = policy();
+    for tier in [
+        ComplexityTier::Trivial,
+        ComplexityTier::Simple,
+        ComplexityTier::Standard,
+        ComplexityTier::Hard,
+    ] {
+        for confidence in [0.0, 0.5, THRESHOLD, 0.99] {
+            let mut c = classification(tier, confidence);
+            c.task = Some(TaskType::Agentic);
+            let got = engine.effective_tier(&request(plain()), &c);
+            assert!(
+                rank(got) >= rank(ComplexityTier::Hard),
+                "agentic {tier:?} at confidence {confidence} gave {got:?}, below Hard"
+            );
+        }
+    }
+}
+
+/// A reasoning task must reach the Reasoning tier -- the top of the ladder, and
+/// the most expensive. An `improve`-style false positive here is the single
+/// most expensive mistake the policy can make.
+#[test]
+fn a_reasoning_task_reaches_the_reasoning_tier() {
+    let engine = policy();
+    for tier in [
+        ComplexityTier::Trivial,
+        ComplexityTier::Simple,
+        ComplexityTier::Standard,
+    ] {
+        let mut c = classification(tier, 0.99);
+        c.task = Some(TaskType::Reasoning);
+        assert_eq!(
+            engine.effective_tier(&request(plain()), &c),
+            ComplexityTier::Reasoning,
+            "reasoning task from {tier:?} should reach Reasoning"
+        );
+    }
+}
