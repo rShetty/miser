@@ -364,7 +364,7 @@ Recorded so the strength of each claim is visible rather than assumed.
 | D6 capability floors | **not started** | — |
 | D7 streaming overrun | **documented only** | the reconciliation already implements it |
 | Kani | **blocked, 0 proofs** | 16 harnesses written; Kani 0.68.0 ICEs compiling `miser-classifier` (see below) |
-| `cargo-mutants` | **running** | 318 mutants; a full run is hours |
+| `cargo-mutants` | **first numbers** | shard 3: 78 mutants, 37 caught, 35 missed, 6 unviable; other shards in flight |
 | `miser-core` extraction | **not started** | prerequisite for proving the money path |
 
 ### What the model checker actually established
@@ -494,3 +494,47 @@ Until one of those lands, every property in §"Properties" whose only check is
 Kani is **unverified**, and this document should not be read as claiming
 otherwise. The properties checked by proptest, integration tests, and TLC are
 unaffected and did run.
+
+
+### Mutation testing: the first real number
+
+Shard 3 of 4 is the first shard to finish. Over its 78 mutants:
+
+```text
+78 mutants tested in 3m: 35 missed, 37 caught, 6 unviable
+```
+
+which is a **47% kill rate** on this shard. cargo-mutants exits 2 whenever any
+mutant survives, so a red "Mutation kill rate" row here means *the suite has
+gaps*, not *the suite is broken*. That is the intended reading, and it is the
+opposite of every other gate in this file, where red means something is wrong.
+
+**34 of the 35 survivors are mutations of `default_*` configuration
+constants** — `default_confidence_threshold -> 0.0`, `default_failover_threshold
+-> 0`, and so on. There is no test that asserts the default value of a default,
+and that is usually the right answer: these are defaults, deliberately
+overridable, and a test pinning them would be a test that breaks whenever one is
+tuned. They are noise in a kill rate that is supposed to measure the decision
+logic.
+
+They also show the config was right to exclude `kani_proofs.rs` (16 mutants) and
+`properties_support.rs` (10): those are test files, and mutating them measured
+nothing.
+
+**One survivor is real.** `miser-provider/src/lib.rs:195`:
+
+```rust
+pub fn safe_status(status: StatusCode) -> StatusCode { status }
+```
+
+The identity function, and — this is the finding — **called from nowhere**.
+`grep -rn safe_status crates/` returns its definition and no call site. So the
+mutant that replaces it with `StatusCode::default()` survives not because no test
+covers the function, but because the function is dead code. That is a different
+kind of problem: not a gap in the suite, but code that should not be there.
+
+Recorded as a to-do rather than fixed here, because deleting a public function
+is an API decision and this pass is about measurement. It is also worth noting
+what this measurement does *not* cover: the six `unviable` mutants and the fact
+that a 47% figure is one shard of four, not the whole program. The combined
+number is still pending.
