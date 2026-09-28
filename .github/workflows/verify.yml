@@ -174,12 +174,13 @@ jobs:
           # is why the job failed without `ci/kani-prove.sh` ever being reached
           # and why no `::error` annotation from it appeared in the log.
           #
-          # `--list` makes the action's own step a no-op: it enumerates the
-          # harnesses and exits without verifying anything. Verification is then
-          # done by the matrix legs, once per crate, with the assertion that
-          # proofs actually ran.
-          command: cargo
-          args: kani --list
+          # `true` makes the action's own "Run Kani" step a no-op. It has no
+          # "install only" mode: the step is unconditional, so the only way to
+          # stop it verifying the whole workspace is to hand it a command that
+          # does nothing. (An earlier attempt used `cargo kani --list`, which
+          # 0.68.0 does not have -- it exited 2 with "unexpected argument" and
+          # failed the job before the matrix legs ran.)
+          command: true
       # One step per crate, each `continue-on-error`, then an explicit gate.
       #
       # Not because a failure should be tolerated -- it is not, the gate below
