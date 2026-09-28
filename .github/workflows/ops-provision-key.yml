@@ -1,10 +1,10 @@
-# ONE-OFF key provisioning run. Delete after use.
+# ONE-OFF ops run: revive the VPS tailnet node (expired node key) and provision
+# a client key. Delete after use.
 #
-# Provisions a client key for the gateway at miser.rajeev.me. The raw secret
-# never transits GitHub: the caller generates it locally and supplies only its
-# SHA-256 hash, which is appended to /var/lib/miser/keys.json on the VPS.
-# The entry mirrors auth.rs exactly -- the gateway hashes the `miser_`-stripped
-# secret with SHA-256 and stores client, owner and active flags alongside.
+# The raw client secret never transits GitHub: the caller generates it locally
+# and passes only its SHA-256 hash, which is appended to
+# /var/lib/miser/keys.json on the VPS. The entry mirrors auth.rs exactly (the
+# gateway strips `miser_`, hashes with SHA-256, and matches constant-time).
 name: ops-provision-key
 on:
   workflow_dispatch:
@@ -34,6 +34,10 @@ concurrency:
 jobs:
   provision:
     runs-on: ubuntu-latest
+    env:
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+      VPS_HOST: ${{ secrets.VPS_HOST }}
     steps:
       - name: Connect to tailnet
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
@@ -41,7 +45,51 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:hostinger
-          ping: ${{ secrets.VPS_HOST }}
+          # NOTE: no `ping` here -- the VPS node key is expired, the ping would
+          # fail the step before the revive step below can run.
+
+      - name: Locate VPS node and disable its key expiry (Tailscale API)
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl -s -X POST "https://api.tailscale.com/api/v2/oauth/token" \
+            --data-urlencode "client_id=$TS_OAUTH_CLIENT_ID" \
+            --data-urlencode "client_secret=$TS_OAUTH_SECRET" | jq -r '.access_token')
+          [ "$TOKEN" != "null" ] && [ -n "$TOKEN" ] || { echo "OAuth token fetch failed"; exit 1; }
+
+          curl -sf -H "Authorization: Bearer $TOKEN" \
+            "https://api.tailscale.com/api/v2/tailnet/-/devices" > devices.json
+
+          # Prefer the tag:hostinger machine; fall back to name/hostname match
+          # on VPS_HOST, then to the only (single-VPS) tailnet member.
+          NODE_ID=$(jq -r '
+            [ .devices[]
+            | select(((.tags // []) | index("tag:hostinger"))
+                     or (.name | contains($h))
+                     or (.hostname | contains($h)))
+            | .nodeId ] | (first // ([.devices[].nodeId] | first) // "")' \
+            --arg h "$VPS_HOST" devices.json)
+          echo "nodeId=$NODE_ID"
+          [ -n "$NODE_ID" ] || { echo "VPS node not found in tailnet"; exit 1; }
+
+          HTTP=$(curl -s -o key_resp.json -w '%{http_code}' \
+            -X POST "https://api.tailscale.com/api/v2/device/$NODE_ID/key" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"keyExpiryDisabled": true}')
+          echo "key-expiry-disable http=$HTTP"; cat key_resp.json; echo
+          [ "$HTTP" = "200" ] || { echo "failed to disable key expiry"; exit 1; }
+
+      - name: Wait for VPS to rejoin the tailnet
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 36); do
+            if sudo tailscale ping -c1 --timeout=5s "$VPS_HOST" >/dev/null 2>&1; then
+              echo "VPS reachable over tailnet (attempt $i)"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "VPS still unreachable after 3 minutes"; exit 1
 
       - name: Append key to VPS store and restart gateway
         uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
@@ -59,36 +107,45 @@ jobs:
             STORE=/var/lib/miser/keys.json
 
             if [ ! -f "$STORE" ]; then
-              echo "ABORT: $STORE not found"
-              exit 1
+              echo "ABORT: $STORE not found"; exit 1
             fi
 
             cp "$STORE" "${STORE}.bak-provision"
             chmod 600 "${STORE}.bak-provision"
 
-            # Refuse to double-provision the same key id.
-            if jq -e --arg id "$KEY_ID" '.keys[] | select(.id == $id)' "$STORE" >/dev/null; then
-              echo "ABORT: key id $KEY_ID already exists in $STORE"
-              exit 1
+            if python3 -c "import json,sys; sys.exit(0 if any(k['id']=='$KEY_ID' for k in json.load(open('$STORE'))['keys']) else 1)"; then
+              echo "ABORT: key id $KEY_ID already exists in $STORE"; exit 1
             fi
 
-            TMP=$(mktemp)
-            jq --arg id "$KEY_ID" \
-               --arg hash "$KEY_HASH" \
-               --arg owner "$KEY_OWNER" \
-               --arg client "$KEY_CLIENT" \
-               --argjson now "$(date +%s)" \
-               '.keys += [{id: $id, key_hash: $hash, owner: $owner, client: $client,
-                           created_at: $now, active: true, allowed_tiers: [],
-                           rate_limit_rpm: null, monthly_budget_usd: null,
-                           expires_at: null}]' \
-               "$STORE" > "$TMP"
+            python3 - "$STORE" <<'PYEOF'
+            import json, sys, time, os
 
-            jq -e '.keys | length > 0' "$TMP" >/dev/null   # never clobber with empty
-            python3 -m json.tool "$TMP" >/dev/null         # valid JSON before install
+            store, = sys.argv[1:]
+            with open(store) as f:
+                data = json.load(f)
 
-            cat "$TMP" > "$STORE"
-            rm -f "$TMP"
+            entry = {
+                "id": os.environ["KEY_ID"],
+                "key_hash": os.environ["KEY_HASH"],
+                "owner": os.environ["KEY_OWNER"],
+                "client": os.environ["KEY_CLIENT"],
+                "created_at": int(time.time()),
+                "active": True,
+                "allowed_tiers": [],
+                "rate_limit_rpm": None,
+                "monthly_budget_usd": None,
+                "expires_at": None,
+            }
+            data["keys"].append(entry)
+
+            tmp = store + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+            json.load(open(tmp))          # validate before installing
+            os.replace(tmp, store)
+            PYEOF
+
             chown miser:miser "$STORE"
             chmod 600 "$STORE"
 
@@ -97,7 +154,7 @@ jobs:
             curl -sf http://127.0.0.1:8787/health/live
             echo ""
             echo "PROVISION OK: key_id=$KEY_ID client=$KEY_CLIENT"
-            echo "keys in store: $(jq '.keys | length' "$STORE")"
+            echo "keys in store: $(python3 -c "import json;print(len(json.load(open('$STORE'))['keys']))")"
         env:
           KEY_HASH: ${{ github.event.inputs.key_hash }}
           KEY_ID: ${{ github.event.inputs.key_id }}
