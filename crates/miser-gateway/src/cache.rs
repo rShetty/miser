@@ -12,6 +12,15 @@ struct CacheEntry {
     body: bytes::Bytes,
     status: axum::http::StatusCode,
     headers: axum::http::HeaderMap,
+    /// The tier whose route produced this entry.
+    ///
+    /// A cache hit short-circuits classification, so without this the handler
+    /// cannot enforce a per-key `allowed_tiers` allowlist on the hit path --
+    /// the entry would be served to a key that is not permitted to see that
+    /// tier at all. Storing the tier keeps the authorization decision on the
+    /// same footing as the rate-limit and budget checks, which are already
+    /// applied before the lookup.
+    tier: String,
     inserted: Instant,
 }
 
@@ -27,11 +36,21 @@ impl ResponseCache {
     pub fn get(
         &self,
         key: u64,
-    ) -> Option<(bytes::Bytes, axum::http::StatusCode, axum::http::HeaderMap)> {
+    ) -> Option<(
+        bytes::Bytes,
+        axum::http::StatusCode,
+        axum::http::HeaderMap,
+        String,
+    )> {
         let mut entries = self.entries.lock().ok()?;
         if let Some(entry) = entries.get(&key) {
             if entry.inserted.elapsed() < self.ttl {
-                return Some((entry.body.clone(), entry.status, entry.headers.clone()));
+                return Some((
+                    entry.body.clone(),
+                    entry.status,
+                    entry.headers.clone(),
+                    entry.tier.clone(),
+                ));
             }
             entries.remove(&key);
         }
@@ -44,6 +63,7 @@ impl ResponseCache {
         body: bytes::Bytes,
         status: axum::http::StatusCode,
         headers: axum::http::HeaderMap,
+        tier: String,
     ) {
         if let Ok(mut entries) = self.entries.lock() {
             if entries.len() >= self.max_entries {
@@ -61,6 +81,7 @@ impl ResponseCache {
                     body,
                     status,
                     headers,
+                    tier,
                     inserted: Instant::now(),
                 },
             );
@@ -110,6 +131,7 @@ mod tests {
                 bytes::Bytes::from(format!("{body}{i}")),
                 axum::http::StatusCode::OK,
                 axum::http::HeaderMap::new(),
+                "trivial".into(),
             );
         }
     }
@@ -135,11 +157,16 @@ mod tests {
             bytes::Bytes::from_static(b"{\"answer\":42}"),
             axum::http::StatusCode::OK,
             headers.clone(),
+            "trivial".into(),
         );
-        let (body, status, got_headers) = cache.get(key).expect("just-stored entry hits");
+        let (body, status, got_headers, tier) = cache.get(key).expect("just-stored entry hits");
         assert_eq!(body, bytes::Bytes::from_static(b"{\"answer\":42}"));
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(got_headers, headers, "headers must survive the round trip");
+        assert_eq!(
+            tier, "trivial",
+            "the producing tier must survive the round trip"
+        );
     }
 
     #[test]
@@ -151,6 +178,7 @@ mod tests {
             bytes::Bytes::from_static(b"{}"),
             axum::http::StatusCode::OK,
             axum::http::HeaderMap::new(),
+            "trivial".into(),
         );
         assert!(cache.get(key).is_none(), "ttl=0 entries must not be served");
         assert!(
@@ -184,17 +212,20 @@ mod tests {
             bytes::Bytes::from_static(b"old"),
             axum::http::StatusCode::OK,
             axum::http::HeaderMap::new(),
+            "trivial".into(),
         );
         cache.store(
             key,
             bytes::Bytes::from_static(b"new"),
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             axum::http::HeaderMap::new(),
+            "trivial".into(),
         );
-        let (body, status, _) = cache.get(key).unwrap();
+        let (body, status, _, tier) = cache.get(key).unwrap();
         assert_eq!(body, bytes::Bytes::from_static(b"new"));
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(cache.stats().0, 1, "overwrite must not add a second entry");
+        assert_eq!(tier, "trivial", "overwrite must not clear the stored tier");
     }
 
     #[test]

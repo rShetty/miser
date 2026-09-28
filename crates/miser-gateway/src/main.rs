@@ -3,6 +3,10 @@ mod cache;
 mod catalog;
 mod judge;
 mod metrics;
+#[cfg(test)]
+mod properties;
+#[cfg(test)]
+mod properties_support;
 mod semantic_cache;
 mod session;
 mod usage;
@@ -540,33 +544,49 @@ async fn completions_inner(
     let stream_requested = request.stream.unwrap_or(false);
     let body = serde_json::to_value(&request).map_err(internal)?;
     let cache_key = cache::request_hash(&body);
-    if let Some((cached_body, cached_status, cached_headers)) = state.cache.get(cache_key) {
-        state.metrics.cache_hits_total.inc();
-        record_usage(
-            &state,
-            authenticated_key.as_ref(),
-            &request.model,
-            &requested_model,
-            "-",
-            0,
-            0,
-            started.elapsed(),
-            true,
-            cached_status.as_u16(),
-            &request_id,
-        );
-        let mut response = Response::builder().status(cached_status);
-        for (name, value) in &cached_headers {
-            response = response.header(name, value);
+    if let Some((cached_body, cached_status, cached_headers, cached_tier)) =
+        state.cache.get(cache_key)
+    {
+        // A hit short-circuits classification, so the per-key tier allowlist
+        // has to be applied here or not at all. Previously this gate lived
+        // only after classification, so a warm entry was served to a key that
+        // is not allowed to see the tier that produced it -- including an
+        // entry another tenant created. A disallowed tier is treated as a
+        // miss rather than a 403: the request still gets classified and routed
+        // normally below, where an allowed tier can serve it.
+        if tier_permitted(authenticated_key.as_ref(), &cached_tier) {
+            state.metrics.cache_hits_total.inc();
+            record_usage(
+                &state,
+                authenticated_key.as_ref(),
+                &request.model,
+                &requested_model,
+                &cached_tier,
+                0,
+                0,
+                started.elapsed(),
+                true,
+                cached_status.as_u16(),
+                &request_id,
+            );
+            let mut response = Response::builder().status(cached_status);
+            for (name, value) in &cached_headers {
+                response = response.header(name, value);
+            }
+            return response
+                .header(
+                    "x-miser-request-id",
+                    HeaderValue::from_str(&request_id).unwrap(),
+                )
+                .header("x-miser-cache", HeaderValue::from_static("hit-exact"))
+                .body(axum::body::Body::from(cached_body))
+                .map_err(internal);
         }
-        return response
-            .header(
-                "x-miser-request-id",
-                HeaderValue::from_str(&request_id).unwrap(),
-            )
-            .header("x-miser-cache", HeaderValue::from_static("hit-exact"))
-            .body(axum::body::Body::from(cached_body))
-            .map_err(internal);
+        tracing::debug!(
+            key_id = authenticated_key.as_ref().map(|k| k.id.as_str()).unwrap_or("-"),
+            tier = %cached_tier,
+            "exact cache entry skipped: tier not permitted for this API key"
+        );
     }
     // Semantic cache: embedding retrieval flags a candidate, the Jev
     // equivalence judge decides whether the cached response actually
@@ -606,9 +626,10 @@ async fn completions_inner(
         && !stream_requested
     {
         let embedding_text = semantic_cache::request_text_for_embedding(&body);
-        let candidate = state
-            .semantic_cache
-            .lookup(&semantic_cache::embed_prompt(&embedding_text));
+        let candidate = state.semantic_cache.lookup(
+            &semantic_cache::embed_prompt(&embedding_text),
+            &semantic_tenant(authenticated_key.as_ref()),
+        );
         if let Some(hit) = candidate {
             let new_prompt = judge::last_user_text(&request);
             let validated = match state.quality_judge.as_ref() {
@@ -617,14 +638,18 @@ async fn completions_inner(
                 // only, mirroring the exact-match safety bar.
                 None => hit.similarity >= state.config.cache.similarity_threshold,
             };
-            if validated {
+            // Same reason as the exact cache: a hit never classifies, so a key
+            // restricted away from the producing tier must not be served this
+            // body. Checked before the judge round-trip so a disallowed key
+            // cannot even probe the cache by observing judge latency.
+            if validated && tier_permitted(authenticated_key.as_ref(), &hit.tier) {
                 state.metrics.semantic_hits_total.inc();
                 record_usage(
                     &state,
                     authenticated_key.as_ref(),
                     &request.model,
                     &requested_model,
-                    "-",
+                    &hit.tier,
                     0,
                     0,
                     started.elapsed(),
@@ -704,18 +729,12 @@ async fn completions_inner(
     }
     // Per-key tier gating: an empty allowlist means all tiers are allowed.
     if let Some(key) = &authenticated_key {
-        if !key.allowed_tiers.is_empty() {
-            let tier_name = format_tier(effective_tier);
-            if !key
-                .allowed_tiers
-                .iter()
-                .any(|t| t.eq_ignore_ascii_case(&tier_name))
-            {
-                return Err(auth::json_error(
-                    format!("tier '{tier_name}' is not allowed for this API key").as_str(),
-                    StatusCode::FORBIDDEN,
-                ));
-            }
+        let tier_name = format_tier(effective_tier);
+        if !tier_permitted(Some(key), &tier_name) {
+            return Err(auth::json_error(
+                format!("tier '{tier_name}' is not allowed for this API key").as_str(),
+                StatusCode::FORBIDDEN,
+            ));
         }
     }
     if state.config.session.enabled {
@@ -930,6 +949,31 @@ async fn completions_inner(
                                         }
                                     }
                                 }
+                            } else {
+                                // The transport case. Everything else about a
+                                // failed escalation is reported -- the status
+                                // path above calls `report_upstream_outcome`
+                                // with the escalated tier's own model, and a
+                                // 5xx is counted from there -- but a connection
+                                // that never completed had no arm at all, so a
+                                // model that reliably dies on escalated requests
+                                // could never accumulate the failures
+                                // `failover_threshold` needs. That is the
+                                // opposite of the intent recorded above: the
+                                // model is the one being escalated *to*, so it is
+                                // the one that should be retired.
+                                tracing::warn!(
+                                    request_id = %request_id,
+                                    tier = %format_tier(escalated_tier),
+                                    model = %escalated_model,
+                                    "quality gate escalation failed at the transport level"
+                                );
+                                state.metrics.upstream_errors_total.inc();
+                                state.report_upstream_outcome(
+                                    escalated_tier,
+                                    &escalated_model,
+                                    None,
+                                );
                             }
                         }
                     }
@@ -964,11 +1008,16 @@ async fn completions_inner(
             settled_status.as_u16(),
             &request_id,
         );
+        // The tier recorded here is the one that actually produced this
+        // response, i.e. the escalated tier if the quality gate fired, so a
+        // later hit is gated against the tier it is really being credited to.
+        let served_tier = format_tier(effective_tier);
         state.cache.store(
             cache_key,
             payload.clone(),
             settled_status,
             settled_headers.clone(),
+            served_tier.clone(),
         );
         // Semantic cache gets the final (quality-gated, possibly escalated)
         // response so near-duplicate requests reuse the best answer.
@@ -994,10 +1043,14 @@ async fn completions_inner(
             let embedding_text = semantic_cache::request_text_for_embedding(&body);
             state.semantic_cache.store(
                 semantic_cache::embed_prompt(&embedding_text),
-                embedding_text,
-                payload.clone(),
-                settled_status,
-                settled_headers.clone(),
+                semantic_cache::StoredResponse {
+                    prompt_text: embedding_text,
+                    body: payload.clone(),
+                    status: settled_status,
+                    headers: settled_headers.clone(),
+                    tier: served_tier,
+                    tenant: semantic_tenant(authenticated_key.as_ref()),
+                },
             );
         }
         let mut response = Response::builder().status(settled_status);
@@ -1050,16 +1103,13 @@ async fn completions_inner(
     let stream_model = selected_route.model.clone();
     let report_state = Arc::clone(&state);
     let report_tier = effective_tier;
-    let stream = futures_util::StreamExt::map(upstream.bytes_stream(), move |chunk| {
-        if chunk.is_err() {
-            report_state.report_upstream_outcome(report_tier, &stream_model, None);
-        }
-        chunk
-    });
-    // Streaming: token counts arrive inside the stream, so charge and record
-    // the same monotonic estimate the non-streaming path uses. The charge is
-    // what makes a monthly budget cap mean anything -- without it a client
-    // could set `stream: true` and spend without limit.
+    // Streaming: the real token counts only exist once the provider's final
+    // `usage` frame has been relayed, so accounting is finalised when the
+    // stream ends rather than before it. The budget is still *reserved* up
+    // front on the `max_tokens` estimate, because a cap has to hold before the
+    // answer exists -- otherwise N concurrent streams would each pass
+    // `check_budget` and then all spend. The reservation is reconciled to the
+    // real cost on completion.
     //
     // Guarded on a successful status, because this block is also the
     // non-streaming *error* path: a plain request whose upstream answered 4xx
@@ -1067,25 +1117,67 @@ async fn completions_inner(
     // drain its own monthly budget with requests the provider rejected, and
     // would keep a key 402'd for the rest of the month after a transient
     // upstream incident had already recovered.
-    if status.is_success() {
-        if let Some(key) = &authenticated_key {
-            charge_budget(&state, key, estimated_call_tokens(&request));
+    let estimated_tokens = estimated_call_tokens(&request);
+    let reserved_window = auth::QuotaEnforcer::current_window();
+    let reserved_usd = if status.is_success() {
+        price_per_1k(&state).map(|price| estimated_tokens / 1000.0 * price)
+    } else {
+        None
+    };
+    let finalizer = {
+        let state = Arc::clone(&state);
+        let key = authenticated_key.clone();
+        let model = selected_route.model.clone();
+        let requested_model = requested_model.clone();
+        let tier = format_tier(effective_tier);
+        let status = status.as_u16();
+        let price = price_per_1k(&state);
+        let request_id = request_id.clone();
+        // `started` and `estimated_tokens` are `Copy`, so they are captured by
+        // the closure without a rebinding.
+        move |body: &[u8]| {
+            // Fall back to the estimate when the provider sent no usage frame
+            // (the client did not ask for one, or it was cut off). Recording a
+            // confident zero would under-report spend, so the conservative
+            // estimate stands in.
+            let (prompt_tokens, completion_tokens) =
+                usage_from_sse(body).unwrap_or((0, estimated_tokens as u64));
+            let resolved = (prompt_tokens + completion_tokens) as f64;
+
+            if let (Some(key), Some(price)) = (key.as_ref(), price) {
+                // Give back the overestimate. Bounded below by `adjust_spend`.
+                state.quotas.adjust_spend(
+                    &key.id,
+                    (resolved - estimated_tokens) / 1000.0 * price,
+                    reserved_window,
+                );
+            }
+            record_usage(
+                &state,
+                key.as_ref(),
+                &model,
+                &requested_model,
+                &tier,
+                prompt_tokens,
+                completion_tokens,
+                started.elapsed(),
+                false,
+                status,
+                &request_id,
+            );
         }
-    }
-    if let Some(key) = &authenticated_key {
-        record_usage(
-            &state,
-            Some(key),
-            &selected_route.model,
-            &requested_model,
-            &format_tier(effective_tier),
-            0,
-            estimated_call_tokens(&request) as u64,
-            started.elapsed(),
-            false,
-            status.as_u16(),
-            &request_id,
-        );
+    };
+    let relayed = futures_util::StreamExt::map(upstream.bytes_stream(), move |chunk| {
+        if chunk.is_err() {
+            report_state.report_upstream_outcome(report_tier, &stream_model, None);
+        }
+        chunk
+    });
+    let stream = MeteredStream::new(relayed, finalizer);
+    if let (Some(key), Some(reserved)) = (&authenticated_key, reserved_usd) {
+        state
+            .quotas
+            .adjust_spend(&key.id, reserved, reserved_window);
     }
     let mut response = Response::builder().status(status);
     for (name, value) in &safe_headers {
@@ -1118,11 +1210,45 @@ async fn completions_inner(
         .map_err(internal)
 }
 
+/// The cache partition a semantic entry belongs to.
+///
+/// An API key's id, so a hit can only ever be served back to the tenant that
+/// produced it. Open-access mode (no admin key and an empty key store) has no
+/// tenants to separate, and every caller is the same operator, so it shares one
+/// partition rather than each getting a private one that could never hit.
+fn semantic_tenant(key: Option<&auth::ApiKey>) -> String {
+    match key {
+        Some(key) => key.id.clone(),
+        None => OPEN_ACCESS_TENANT.to_owned(),
+    }
+}
+
+/// Partition used when the gateway is in open-access setup mode.
+const OPEN_ACCESS_TENANT: &str = "open-access";
+
 fn format_tier(tier: ComplexityTier) -> String {
     serde_json::to_string(&tier)
         .unwrap()
         .trim_matches('"')
         .to_owned()
+}
+
+/// Whether `key` is allowed to be served by `tier`.
+///
+/// An absent key, or a key with an empty allowlist, permits every tier. Lives
+/// here rather than inline at each call site because it now guards three paths
+/// -- the two cache short-circuits and the post-classification gate -- and a
+/// per-key allowlist that is enforced on one of them and skipped on the others
+/// is an authorization hole, not a style question.
+fn tier_permitted(key: Option<&auth::ApiKey>, tier: &str) -> bool {
+    match key {
+        None => true,
+        Some(key) if key.allowed_tiers.is_empty() => true,
+        Some(key) => key
+            .allowed_tiers
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(tier)),
+    }
 }
 
 fn unix_now() -> u64 {
@@ -1221,6 +1347,143 @@ fn charge_budget(state: &AppState, key: &auth::ApiKey, tokens: f64) {
     }
 }
 
+/// Per-1k price, or `None` when the operator set none.
+///
+/// With no price configured the budget is unenforceable and `cost_usd` is
+/// reported as 0.00, which is LLD section 2's documented behaviour.
+fn price_per_1k(state: &AppState) -> Option<f64> {
+    state
+        .config
+        .extra
+        .get("price_per_1k_usd")
+        .and_then(Value::as_f64)
+}
+
+/// Pull the provider's real token counts out of a relayed SSE body.
+///
+/// Streaming responses carry `usage` in a final frame rather than in a body
+/// envelope, and only when the client asked for it via
+/// `stream_options: {include_usage: true}`. Frames are `data: {json}`, blank
+/// line separated, terminated by `data: [DONE]`; the usage frame has an empty
+/// `choices` array. Returns `None` when the provider sent no usage frame, so
+/// the caller can fall back to the estimate instead of recording a confident
+/// zero.
+fn usage_from_sse(body: &[u8]) -> Option<(u64, u64)> {
+    let text = String::from_utf8_lossy(body);
+    // Scan backwards: the usage frame is the last JSON frame before `[DONE]`,
+    // and a long generation can put megabytes of content ahead of it.
+    for line in text.lines().rev() {
+        let Some(payload) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        let Some(usage) = value.get("usage").filter(|u| u.is_object()) else {
+            continue;
+        };
+        let prompt = usage
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let completion = usage
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if prompt == 0 && completion == 0 {
+            continue;
+        }
+        return Some((prompt, completion));
+    }
+    None
+}
+
+/// Relays the upstream stream and, once it ends, finalises accounting from the
+/// real `usage` frame.
+///
+/// Streaming used to record `prompt_tokens: 0` and the `max_tokens` estimate
+/// as completion tokens, which is not what the client was billed and is not
+/// what LLD section 2 says `/admin/usage/*` reports. With the shipped
+/// `hard` tier at `max_tokens = 8192`, a 200-token answer was reported as
+/// 8,192 -- 41x, and the monthly cap was consumed at the same rate.
+///
+/// Accounting happens on the *end* of the stream, not before it, because the
+/// real figure does not exist until then. The budget is still reserved up
+/// front (see the caller) so the cap cannot be overrun by concurrent streams;
+/// this reconciles the reservation once the truth is known.
+struct MeteredStream<S> {
+    inner: S,
+    /// Bounded tail of the body. The usage frame is always among the last
+    /// frames, so the whole body is never retained.
+    tail: Vec<u8>,
+    finalize: Option<StreamFinalizer>,
+}
+
+/// Called once, with the tail of a finished stream, to settle its accounting.
+type StreamFinalizer = Box<dyn FnOnce(&[u8]) + Send>;
+
+/// Bytes of relayed body kept for usage extraction. An SSE frame carrying a
+/// `usage` block is well under a kilobyte, so this is generous while staying
+/// independent of generation length.
+const USAGE_TAIL_BYTES: usize = 8 * 1024;
+
+impl<S> MeteredStream<S> {
+    fn new(inner: S, finalize: impl FnOnce(&[u8]) + Send + 'static) -> Self {
+        Self {
+            inner,
+            tail: Vec::new(),
+            finalize: Some(Box::new(finalize)),
+        }
+    }
+}
+
+impl<S> futures_util::Stream for MeteredStream<S>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+{
+    type Item = Result<bytes::Bytes, reqwest::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_next(cx);
+        match polled {
+            std::task::Poll::Ready(Some(item)) => {
+                let ended = item.is_err();
+                if let Ok(bytes) = &item {
+                    this.tail.extend_from_slice(bytes);
+                    if this.tail.len() > USAGE_TAIL_BYTES {
+                        let excess = this.tail.len() - USAGE_TAIL_BYTES;
+                        this.tail.drain(..excess);
+                    }
+                }
+                if ended {
+                    // A transport failure ends the body too. Finalise on the
+                    // bytes seen so far: the client got a partial answer, so
+                    // the spend is real even though it is not the full one.
+                    if let Some(finalize) = this.finalize.take() {
+                        finalize(&this.tail);
+                    }
+                }
+                std::task::Poll::Ready(Some(item))
+            }
+            std::task::Poll::Ready(None) => {
+                if let Some(finalize) = this.finalize.take() {
+                    finalize(&this.tail);
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
 /// Parse a reporting window query value ("24h" | "7d" | "30d" | "all")
 /// into a lower-bound unix timestamp; `None` means no lower bound.
 ///
@@ -1262,31 +1525,62 @@ async fn create_key(
             StatusCode::UNAUTHORIZED,
         ));
     }
-    let owner = body
-        .get("owner")
-        .and_then(Value::as_str)
-        .unwrap_or("default");
-    let client = body.get("client").and_then(Value::as_str).unwrap_or("");
-    let allowed_tiers: Vec<String> = body
-        .get("allowed_tiers")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let rate_limit_rpm = body
-        .get("rate_limit_rpm")
-        .and_then(Value::as_u64)
-        .map(|v| v as u32);
-    let monthly_budget_usd = body.get("monthly_budget_usd").and_then(Value::as_f64);
-    let expires_at = body.get("expires_at").and_then(Value::as_u64);
+    // Parsed with `patch_field`, the same helper `update_key` uses, rather
+    // than `Value::as_*`. Those return `None` for a wrong-typed value, which
+    // for a quota field reads as "no restriction" -- so a client that
+    // stringifies its numerics (`{"rate_limit_rpm":"60"}`, which is what a
+    // shell-quoted curl sends) got a key with no rate limit and no budget cap
+    // at all, and a 200 to confirm it. `as u32` also truncated, so
+    // `rate_limit_rpm: 4294967296` became 0 and the key rejected every
+    // request forever. A value that is present but unparseable is a client
+    // error, and must not be guessed at in the operator's favour.
+    let allowed_tiers = patch_field::<Vec<String>>(&body, "allowed_tiers")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?
+        .map(|inner| inner.unwrap_or_default());
+    let rate_limit_rpm = patch_field::<u32>(&body, "rate_limit_rpm")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?
+        .flatten();
+    let monthly_budget_usd = patch_field::<f64>(&body, "monthly_budget_usd")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?
+        .flatten();
+    let expires_at = patch_field::<u64>(&body, "expires_at")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?
+        .flatten();
+    for (field, value) in [
+        ("monthly_budget_usd", monthly_budget_usd),
+        ("rate_limit_rpm", rate_limit_rpm.map(f64::from)),
+    ] {
+        if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
+            return Err(auth::json_error(
+                &format!("{field} must be a finite, non-negative number"),
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+    }
+    let owner = match patch_field::<String>(&body, "owner")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?
+    {
+        // Absent or null keeps the historical "default" attribution rather
+        // than minting a key nobody can be billed back to.
+        None | Some(None) => "default".to_owned(),
+        Some(Some(owner)) if owner.trim().is_empty() => {
+            return Err(auth::json_error(
+                "owner must not be empty",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+        Some(Some(owner)) => owner,
+    };
+    let client = match patch_field::<String>(&body, "client")
+        .map_err(|message| auth::json_error(&message, StatusCode::BAD_REQUEST))?
+    {
+        Some(inner) => inner.unwrap_or_default(),
+        None => String::new(),
+    };
     match state.auth.create_key_full(
-        owner,
-        client,
-        allowed_tiers,
+        &owner,
+        &client,
+        allowed_tiers.unwrap_or_default(),
         rate_limit_rpm,
         monthly_budget_usd,
         expires_at,
@@ -1295,7 +1589,7 @@ async fn create_key(
             let actor = state.admin_actor(&headers);
             let _ = state
                 .audit
-                .append_outcome(&actor, "create_key", owner, "success");
+                .append_outcome(&actor, "create_key", &owner, "success");
             Ok(Json(json!({
                 "id": key_id,
                 "key": raw_key,
@@ -1390,7 +1684,7 @@ async fn get_key(
 /// unparseable is a client error rather than something to guess at. Parsing
 /// into the target type also range-checks for free: an `rpm` above `u32::MAX`
 /// used to truncate via `as u32`.
-fn patch_field<T>(body: &Value, field: &str) -> Result<Option<Option<T>>, String>
+pub(crate) fn patch_field<T>(body: &Value, field: &str) -> Result<Option<Option<T>>, String>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -2070,6 +2364,122 @@ mod integration_tests {
         }
     }
 
+    /// The transport-level escalation failure. A 5xx from the escalated call is
+    /// reported to the failover counter; a connection that never completed had
+    /// no arm at all. So a model that reliably dies on escalated requests could
+    /// never accumulate the `failover_threshold` failures it needed -- the exact
+    /// opposite of the intent recorded on the status path, and the more likely
+    /// failure in practice, since mid-flight connection death is common on long
+    /// generations.
+    #[tokio::test]
+    async fn an_escalation_that_never_completes_is_reported_to_the_failover_counter() {
+        // A raw listener, because the transport failure cannot be produced
+        // through an HTTP handler: answer the first call normally, then drop
+        // the second connection without a response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let served = Arc::clone(&served);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let call = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        if call >= 1 {
+                            // Transport failure: hang up mid-request.
+                            drop(sock);
+                            return;
+                        }
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let mut seen = Vec::new();
+                        loop {
+                            let Ok(n) = sock.read(&mut buf).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            seen.extend_from_slice(&buf[..n]);
+                            if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let payload = json!({
+                            "id": "mock",
+                            "object": "chat.completion",
+                            "model": "mock/model",
+                            "choices": [{"index":0,"finish_reason":"stop",
+                                "message":{"role":"assistant","content":"ok"}}],
+                            "usage": {"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}
+                        })
+                        .to_string()
+                        .into_bytes();
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(&payload).await;
+                        let _ = sock.flush().await;
+                    });
+                }
+            });
+        }
+
+        let app = build_router(test_state_with("secret-admin", base_url, |config| {
+            config.routing.mode = miser_types::RoutingMode::Catalog;
+            config.routing.failover_threshold = 1;
+            config.routing.cache_path = Some(
+                unique_temp_path("miser_test_catalog_transport", "json")
+                    .display()
+                    .to_string(),
+            );
+            config.quality.enabled = true;
+            config.quality.minimum_score = 0.99;
+            config.quality.escalate_on_failure = true;
+        }));
+
+        let (status, _, body) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some("secret-admin"),
+            Some(json!({"model":"auto","messages":[{"role":"user","content":"hi"}]})),
+        )
+        .await;
+        // The first call succeeded, so the client is served that answer; the
+        // escalation's failure is invisible to the client either way.
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the gate should have escalated, and the retry should have dropped"
+        );
+
+        let (status, _, body) =
+            send_raw(app, "GET", "/admin/catalog", Some("secret-admin"), None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let catalog: Value = serde_json::from_slice(&body).unwrap();
+        let simple = catalog["tiers"]
+            .as_array()
+            .expect("tiers array")
+            .iter()
+            .find(|tier| tier["tier"] == json!("simple"))
+            .expect("simple tier present")
+            .clone();
+        assert_eq!(
+            simple["consecutive_failures"],
+            json!(1),
+            "a dropped escalation must count against the escalated tier, \
+             otherwise that model can never be retired: {simple}"
+        );
+    }
+
     /// Regression: the checked-in 30s default `request_timeout_ms` 408'd
     /// legitimate non-streaming completions. Measured hard-tier
     /// generations ran 8-30s upstream alone, before classification and
@@ -2227,6 +2637,181 @@ mod integration_tests {
     /// all, so it could have been broken -- or excluded wholesale by a
     /// regression -- without any test noticing.
     ///
+    /// A semantic hit must never cross an API-key boundary. The cache is
+    /// process-global and its similarity is computed over message text only, so
+    /// two tenants asking *nearly* the same question matched each other at 0.96
+    /// while their system prompts -- the part that says whose data the answer is
+    /// about -- were outvoted by the shared question. One tenant's answer, built
+    /// under its own system prompt, was then served to another, and the second
+    /// request never reached the provider at all.
+    ///
+    /// The exact cache does not have this problem: its key hashes the whole
+    /// request body, so a hit there is a byte-identical request.
+    #[tokio::test]
+    async fn a_semantic_hit_never_crosses_api_keys() {
+        let upstream = spawn_mock_upstream(
+            Duration::from_millis(0),
+            StatusCode::OK,
+            "application/json",
+            None,
+        )
+        .await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state.config.cache.semantic_enabled = true;
+        let tenant_a = state
+            .auth
+            .create_key_with_quotas("acmecorp", "-", vec![], None, None, None)
+            .unwrap();
+        let tenant_b = state
+            .auth
+            .create_key_with_quotas("globex", "-", vec![], None, None, None)
+            .unwrap();
+        let similarity_threshold = state.config.cache.similarity_threshold;
+        let app = build_router(state);
+
+        // A long shared question, so the shared text dominates the cosine and
+        // the differing system prompts do not save us -- which is the realistic
+        // case, and why the similarity score is not a security boundary.
+        let question = "summarise the quarterly reconciliation discrepancies we found across \
+                        the three payment processors we integrate with, and explain which of \
+                        them are ordinary timing differences between the acquiring bank and our \
+                        own ledger rather than genuinely lost or duplicated transactions, \
+                        including whether any of them require a refund or a chargeback and \
+                        what evidence our finance team should pull before deciding";
+        // Assert the premise explicitly: this test is only meaningful if the two
+        // prompts really are similar enough that the *only* thing stopping the
+        // second from being served the first's answer is the tenant boundary.
+        let a_only = semantic_cache::embed_prompt(
+            "You are AcmeCorp billing support. Customer 4471 owes $12,400. summarise the quarterly reconciliation discrepancies we found across the three payment processors we integrate with, and explain which of them are ordinary timing differences between the acquiring bank and our own ledger rather than genuinely lost or duplicated transactions, including whether any of them require a refund or a chargeback and what evidence our finance team should pull before deciding ",
+        );
+        let b_only = semantic_cache::embed_prompt(
+            "Be brief. summarise the quarterly reconciliation discrepancies we found across the three payment processors we integrate with, and explain which of them are ordinary timing differences between the acquiring bank and our own ledger rather than genuinely lost or duplicated transactions, including whether any of them require a refund or a chargeback and what evidence our finance team should pull before deciding ",
+        );
+        let cosine = |x: &[f32], y: &[f32]| {
+            let dot: f32 = x.iter().zip(y).map(|(a, b)| a * b).sum();
+            let mx: f32 = x.iter().map(|a| a * a).sum::<f32>().sqrt();
+            let my: f32 = y.iter().map(|b| b * b).sum::<f32>().sqrt();
+            dot / (mx * my)
+        };
+        assert!(
+            cosine(&a_only, &b_only) > similarity_threshold,
+            "test premise: the two prompts must clear the {} similarity bar ({:.3}), \
+             otherwise this test proves nothing",
+            similarity_threshold,
+            cosine(&a_only, &b_only)
+        );
+        let from_a = json!({
+            "model": "auto",
+            "messages": [
+                {"role": "system", "content": "You are AcmeCorp billing support. Customer 4471 owes $12,400."},
+                {"role": "user", "content": question}
+            ]
+        });
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&tenant_a),
+            Some(from_a),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            upstream.requests().await.len(),
+            1,
+            "the first request must reach the provider"
+        );
+
+        // A near-identical question under a different tenant and a different
+        // system prompt. Whitespace differs so the exact cache misses.
+        let from_b = json!({
+            "model": "auto",
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": question.replace("summarise", "summarise  ")}
+            ]
+        });
+        let (status, headers, body) = send_raw(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&tenant_b),
+            Some(from_b),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            headers.get("x-miser-cache").and_then(|v| v.to_str().ok()),
+            Some("miss"),
+            "another tenant's cached answer must never be served: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            upstream.requests().await.len(),
+            2,
+            "the second tenant's own request must reach the provider"
+        );
+    }
+
+    /// The positive control: the same key asking a near-identical question is
+    /// still served from the cache. Partitioning must not have turned the
+    /// semantic cache off.
+    #[tokio::test]
+    async fn a_semantic_hit_still_fires_within_one_api_key() {
+        let upstream = spawn_mock_upstream(
+            Duration::from_millis(0),
+            StatusCode::OK,
+            "application/json",
+            None,
+        )
+        .await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state.config.cache.semantic_enabled = true;
+        let key = state
+            .auth
+            .create_key_with_quotas("solo", "-", vec![], None, None, None)
+            .unwrap();
+        let app = build_router(state);
+
+        for (attempt, content) in [
+            "what is the weather in paris",
+            "what  is  the  weather  in  paris",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (status, headers, body) = send_raw(
+                app.clone(),
+                "POST",
+                "/v1/chat/completions",
+                Some(&key),
+                Some(json!({
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": content}]
+                })),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "attempt {attempt}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let cache = headers.get("x-miser-cache").and_then(|v| v.to_str().ok());
+            if attempt == 0 {
+                assert_eq!(cache, Some("miss"), "{}", String::from_utf8_lossy(&body));
+            } else {
+                assert_eq!(
+                    cache,
+                    Some("hit-semantic"),
+                    "the same key must still get a semantic hit: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        }
+        assert_eq!(upstream.requests().await.len(), 1);
+    }
+
     /// The two bodies differ only in whitespace, so `request_hash` (which
     /// keeps `messages` in the key) misses the exact-match cache, while
     /// `embed_prompt` normalizes the token bag and lands on cosine 1.0.
@@ -2481,6 +3066,185 @@ mod integration_tests {
         );
     }
 
+    /// A streaming response's real token counts arrive in the provider's final
+    /// `usage` frame. They used to be discarded: the ledger recorded
+    /// `prompt_tokens: 0` and the `max_tokens` *estimate* as completion tokens,
+    /// so a 200-token answer on the shipped `hard` tier (`max_tokens = 8192`)
+    /// was reported as 8,192 completion tokens -- 41x -- and the monthly cap was
+    /// consumed at the same rate, so a paying key was 402'd for work it never
+    /// did. LLD section 2 promises `/admin/usage/*` uses the provider's real
+    /// `usage` block.
+    #[tokio::test]
+    async fn a_streamed_response_is_accounted_from_the_providers_real_usage() {
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":37,\"total_tokens\":1237}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let upstream = spawn_mock_upstream(
+            Duration::ZERO,
+            StatusCode::OK,
+            "text/event-stream",
+            Some(sse.into()),
+        )
+        .await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state
+            .config
+            .extra
+            .insert("price_per_1k_usd".into(), json!(0.001));
+        let raw = state
+            .auth
+            .create_key_with_quotas("stream-usage", "-", vec![], None, Some(10.0), None)
+            .unwrap();
+        let app = build_router(state.clone());
+        let payload = json!({
+            "model": "auto",
+            "stream": true,
+            "max_tokens": 4096,
+            "stream_options": {"include_usage": true},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let (status, body) = send(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let summary = state.usage.summarize(None, None, None);
+        assert_eq!(summary.requests, 1, "exactly one record per client request");
+        assert_eq!(
+            summary.prompt_tokens, 1200,
+            "prompt tokens must come from the provider, not be 0"
+        );
+        assert_eq!(
+            summary.completion_tokens, 37,
+            "completion tokens must be the real count, not the 4096 estimate"
+        );
+    }
+
+    /// The budget is reserved on the estimate so a cap holds before the answer
+    /// exists, then reconciled to the real cost. Without reconciliation a
+    /// streaming tenant burns its cap ~100x faster than it actually spends, and
+    /// a correct ledger still 402s them.
+    #[tokio::test]
+    async fn a_streaming_reservation_is_reconciled_to_the_real_cost() {
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let upstream = spawn_mock_upstream(
+            Duration::ZERO,
+            StatusCode::OK,
+            "text/event-stream",
+            Some(sse.into()),
+        )
+        .await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        // 0.001 per 1k: 105 real tokens = $0.000105. The `standard` route caps
+        // at 1024 max_tokens, so the estimate alone would be $0.001024.
+        state
+            .config
+            .extra
+            .insert("price_per_1k_usd".into(), json!(0.001));
+        let raw = state
+            .auth
+            .create_key_with_quotas("reconcile", "-", vec![], None, Some(0.0005), None)
+            .unwrap();
+        let app = build_router(state.clone());
+        let payload = json!({
+            "model": "auto",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        for attempt in 1..=5 {
+            let (status, body) = send(
+                app.clone(),
+                "POST",
+                "/v1/chat/completions",
+                Some(&raw),
+                Some(payload.clone()),
+            )
+            .await;
+            // Each call really costs $0.000105, so five fit inside a $0.0005
+            // cap. Charged on the 512-token estimate they would total $0.00256
+            // and the *second* call would already be 402.
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "call {attempt} should fit in the cap once reconciled: {body}"
+            );
+        }
+
+        // The sixth exceeds the cap for real, so the cap is still enforced --
+        // reconciliation must not have disarmed it.
+        let (status, body) = send(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "the cap must still bind on the real spend: {body}"
+        );
+    }
+
+    /// No `usage` frame (the client did not ask for one, or the stream was cut
+    /// off) must fall back to the estimate rather than record a confident
+    /// zero. Under-reporting spend is the one direction that must not happen.
+    #[tokio::test]
+    async fn a_stream_without_a_usage_frame_falls_back_to_the_estimate() {
+        let sse = concat!(
+            "data: {\"id\":\"mock-chunk\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let upstream = spawn_mock_upstream(
+            Duration::ZERO,
+            StatusCode::OK,
+            "text/event-stream",
+            Some(sse.into()),
+        )
+        .await;
+        let mut state = test_state_with_upstream("", upstream.base_url.clone());
+        state
+            .config
+            .extra
+            .insert("price_per_1k_usd".into(), json!(0.001));
+        let raw = state
+            .auth
+            .create_key_with_quotas("no-usage", "-", vec![], None, Some(10.0), None)
+            .unwrap();
+        let app = build_router(state.clone());
+
+        let (status, body) = send(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&raw),
+            Some(json!({"model":"auto","stream":true,"max_tokens":2048,"messages":[{"role":"user","content":"hi"}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let summary = state.usage.summarize(None, None, None);
+        assert_eq!(summary.requests, 1);
+        assert_eq!(
+            summary.completion_tokens, 2048,
+            "with no usage frame the conservative estimate must stand in"
+        );
+    }
+
     /// A session must not leak across API keys.
     ///
     /// The session tracker keeps the *highest* tier a conversation has seen and
@@ -2686,6 +3450,98 @@ mod integration_tests {
             "an rpm above u32::MAX must be rejected, not truncated: {}",
             String::from_utf8_lossy(&body)
         );
+    }
+
+    /// A wrong-typed quota field on `POST /admin/keys` used to be silently
+    /// dropped, because the handler read the body with `Value::as_*` and a
+    /// `None` from those means "no restriction". The caller got a `200` and a
+    /// working key that had no rate limit, no budget cap, and every tier
+    /// allowed. `update_key` already rejected exactly this class; only
+    /// `create_key` was left guessing in the operator's favour. `4294967296`
+    /// is the same bug in the other direction: `as u32` truncated it to `0`,
+    /// so the key rejected every request forever.
+    #[tokio::test]
+    async fn create_key_rejects_unusable_quota_fields_instead_of_dropping_them() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let state = test_state_with_upstream("secret-admin", upstream.base_url.clone());
+        let app = build_router(state);
+
+        for body in [
+            // What a shell-quoted curl, or any client that stringifies
+            // numerics, actually sends.
+            json!({"owner": "x", "rate_limit_rpm": "60"}),
+            json!({"owner": "x", "monthly_budget_usd": "10.00"}),
+            json!({"owner": "x", "allowed_tiers": "hard"}),
+            json!({"owner": "x", "expires_at": "1767225600"}),
+            json!({"owner": "x", "rate_limit_rpm": -1}),
+            json!({"owner": "x", "owner": 7}),
+            // Above u32::MAX: truncates to 0 under `as u32`.
+            json!({"owner": "x", "rate_limit_rpm": 4_294_967_296u64}),
+        ] {
+            let (status, _, raw) = send_raw(
+                app.clone(),
+                "POST",
+                "/admin/keys",
+                Some("secret-admin"),
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{body} must be rejected, not silently reinterpreted: {}",
+                String::from_utf8_lossy(&raw)
+            );
+        }
+    }
+
+    /// The positive control: a well-formed body still creates a key that keeps
+    /// every quota it asked for, so the stricter parsing did not start
+    /// rejecting legitimate callers.
+    #[tokio::test]
+    async fn create_key_keeps_well_formed_quota_fields() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let state = test_state_with_upstream("secret-admin", upstream.base_url.clone());
+        let app = build_router(state.clone());
+
+        let (status, _, raw) = send_raw(
+            app.clone(),
+            "POST",
+            "/admin/keys",
+            Some("secret-admin"),
+            Some(json!({
+                "owner": "acme",
+                "client": "cli",
+                "allowed_tiers": ["hard", "reasoning"],
+                "rate_limit_rpm": 120,
+                "monthly_budget_usd": 25.5,
+                "expires_at": 1_767_225_600u64,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&raw));
+        let id = serde_json::from_slice::<Value>(&raw).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let (status, _, raw) = send_raw(
+            app,
+            "GET",
+            &format!("/admin/keys/{id}"),
+            Some("secret-admin"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&raw));
+        let stored = serde_json::from_slice::<Value>(&raw).unwrap();
+        assert_eq!(stored["allowed_tiers"], json!(["hard", "reasoning"]));
+        assert_eq!(stored["rate_limit_rpm"], 120);
+        assert_eq!(stored["monthly_budget_usd"], 25.5);
+        assert_eq!(stored["expires_at"], 1_767_225_600u64);
+        assert_eq!(stored["owner"], "acme");
     }
 
     /// `PATCH` must be able to revoke a key and set an expiry. Both fields used
@@ -3871,6 +4727,109 @@ mod integration_tests {
         )
         .await;
         assert_eq!(second, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    }
+
+    /// The tier allowlist is an authorization control, so it has to bind on
+    /// the cache short-circuit too. It used to be enforced only after
+    /// classification, which a cache hit skips entirely: warm the cache with an
+    /// unrestricted key, then let a second key restricted to Hard send the
+    /// identical request, and it was served the cached Trivial body anyway. The
+    /// sibling quota checks (rate limit, budget) were already hoisted above the
+    /// cache, which is what made the omission look like an oversight rather
+    /// than a decision.
+    #[tokio::test]
+    async fn a_cached_entry_is_not_served_to_a_key_barred_from_its_tier() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let state = test_state_with_upstream("", upstream.base_url.clone());
+        let app = build_router(state.clone());
+
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+
+        // An unrestricted key populates the cache. `hi` classifies as Trivial,
+        // so the entry is recorded against the Trivial tier.
+        let unrestricted = state
+            .auth
+            .create_key_with_quotas("warm", "-", vec![], None, None, None)
+            .unwrap();
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&unrestricted),
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], "test/trivial", "{body}");
+
+        // A second key, allowed only the Hard tier, sends the identical request.
+        // It classifies as Trivial, so the post-classification gate rejects it.
+        let restricted = state
+            .auth
+            .create_key_with_quotas(
+                "restricted",
+                "-",
+                vec!["hard".to_string()],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (status, body) = send(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&restricted),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a cache hit must not bypass the tier allowlist: {body}"
+        );
+    }
+
+    /// A key with an empty allowlist is unrestricted, so a cache hit is served
+    /// to it exactly as before. Guards against the allowlist check being too
+    /// aggressive and quietly turning the cache off.
+    #[tokio::test]
+    async fn a_cached_entry_is_still_served_to_a_key_with_no_allowlist() {
+        let upstream =
+            spawn_mock_upstream(Duration::ZERO, StatusCode::OK, "application/json", None).await;
+        let state = test_state_with_upstream("", upstream.base_url.clone());
+        let app = build_router(state.clone());
+        let key = state
+            .auth
+            .create_key_with_quotas("open", "-", vec![], None, None, None)
+            .unwrap();
+        let payload = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+
+        send(
+            app.clone(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&key),
+            Some(payload.clone()),
+        )
+        .await;
+        let (status, body) = send(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            Some(&key),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // One upstream call for two requests: the second was served from cache,
+        // so the unrestricted path is untouched by the allowlist check.
+        assert_eq!(
+            upstream.requests().await.len(),
+            1,
+            "the unrestricted key must still get the cached body"
+        );
     }
 
     #[tokio::test]
