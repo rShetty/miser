@@ -31,9 +31,18 @@
 # distinguishes the original from this mutation" -- a statement about the tests,
 # not about the code. Read the output as a to-do list, not a grade.
 #
-# `cargo mutants --ci --min-mutants 40` is the nightly invocation. The floor
-# matters: without it, a shrinking `examine_globs` list produces a flattering
-# percentage from a handful of samples.
+# ## The nightly invocation
+#
+# `cargo mutants -j 2 --timeout 300 --shard i/4`, over four parallel CI jobs.
+#
+# An earlier version of this file recommended
+# `cargo mutants --ci --min-mutants 40`. **That flag does not exist in 27.1** --
+# the only `--min*` option is `--minimum-test-timeout`. A command in a config
+# file that has never been run is worse than no command, because the next
+# person copies it. The real floor is `--shard`, plus the `--list` count CI
+# records as the denominator: the kill rate is only meaningful against the
+# number of mutants that were in scope, and a shrinking `examine_globs` list
+# would otherwise silently change that number between runs.
 #
 # Key names are validated against `cargo mutants --emit-schema=config`.
 
@@ -44,7 +53,18 @@ examine_globs = [
     "crates/miser-provider/src/*.rs",
 ]
 
-exclude_globs = []
+exclude_globs = [
+    # The Kani harnesses are themselves tests. Mutating a test to see whether
+    # another test notices is a category error: a "surviving" mutant here means
+    # the workspace has no test that fails when a *proof harness* is weakened,
+    # which is not a property anyone wants, and 26 of the 344 mutants (7.6%) were
+    # spent on it. Those files are `#[cfg(kani)]`, so under a normal `cargo test`
+    # they are not even compiled -- a mutant in a file that does not exist at
+    # test time is trivially "unkillable" and would drag the kill rate down
+    # while telling us nothing.
+    "**/kani_proofs.rs",
+    "**/properties_support.rs",
+]
 
 # Mutating generated-looking noise produces mutants nobody can act on.
 skip_calls = [

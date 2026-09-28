@@ -24,7 +24,20 @@ permissions:
   contents: read
 
 concurrency:
-  group: verify-${{ github.ref }}
+  # The event name is in the group on purpose.
+  #
+  # A manual `workflow_dispatch` and a `push` to the same ref are different
+  # requests: one is "run the full verification now", the other is "the fast
+  # gates on this commit". Grouping them together with `cancel-in-progress`
+  # meant that pushing a commit silently killed a verification run that had
+  # been going for forty minutes -- which is exactly what a nightly job that
+  # takes hours is for. It has now happened three times, each time discarding a
+  # mutation run that was nowhere near finished.
+  #
+  # Two dispatches still cancel each other (correct: no reason to run the same
+  # slow checks twice concurrently) and two pushes still cancel each other
+  # (correct: only the newest commit matters for fast gates).
+  group: verify-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
@@ -247,7 +260,14 @@ jobs:
           echo "the pre-fix model still fails, as it must"
 
   mutants:
-    name: Mutation kill rate
+    name: Mutation kill rate ${{ matrix.shard }}/4
+    strategy:
+      # Same reasoning as the Kani job: the default cancels siblings on the
+      # first failure, which for an hours-long job throws away the shards that
+      # were nearly done.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     # Deliberately NOT `needs: [lint, test]`.
     #
@@ -269,14 +289,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-mutants
         run: cargo install --locked cargo-mutants
+      - name: Count the mutants under test
+        # Recorded so a partial result is still interpretable. The kill rate is
+        # only meaningful against the number of mutants that were in scope; a
+        # run that dies at 60% of 318 is a very different statement from one
+        # that dies at 60% of 200, and a shrinking `examine_globs` list would
+        # otherwise silently change the denominator between runs.
+        run: cargo mutants --list | tee mutants-listed.txt | tail -1
       - name: Mutate the decision core
         # cargo-mutants 27.1 has no minimum-sample flag -- the only `--min*`
         # option is --minimum-test-timeout, which .cargo/mutants.toml already
-        # sets. The sample-size floor this comment originally claimed does not
-        # exist, so it is not faked: the run is bounded by --timeout instead, and
-        # a shrinking examine_globs list would show up as a suspiciously small
-        # mutant count in the log rather than being guarded against here.
-        run: cargo mutants -j 4 --timeout 300
+        # sets. The sample-size floor an earlier comment here claimed does not
+        # exist, so it is not faked.
+        #
+        # Sharded with `--shard i/N` because 318 mutants will not finish inside
+        # GitHub's 6h job limit, and a run that hits the limit yields no kill
+        # rate at all. The shards are complementary, so their reports combine
+        # into one number, and a shard that fails no longer discards the ones
+        # that succeeded. Confirmed against `cargo mutants --help` in 27.1
+        # rather than assumed.
+        run: cargo mutants -j 2 --timeout 300 --shard '${{ matrix.shard }}/4'
+      - name: Upload this shard's report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surviving-mutants-${{ matrix.shard }}
+          path: |
+            mutants/
+            mutants-listed.txt
+          retention-days: 30
       - name: Upload the surviving-mutant report
         if: always()
         uses: actions/upload-artifact@v4
