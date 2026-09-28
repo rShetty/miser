@@ -192,10 +192,6 @@ pub fn safe_response_headers(headers: &HeaderMap) -> HeaderMap {
     safe
 }
 
-pub fn safe_status(status: StatusCode) -> StatusCode {
-    status
-}
-
 pub fn content_type_json() -> HeaderValue {
     HeaderValue::from_static("application/json")
 }
