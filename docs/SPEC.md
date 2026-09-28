@@ -616,9 +616,16 @@ that a 47% figure is one shard of four, not the whole program. The combined
 number is still pending.
 
 
-### Mutation testing, shard 2: `miser-policy` has no tests at all
+### Mutation testing, shard 2: the tier floors, before and after
 
-Shard 2 of 4:
+> **Correction.** This section was originally titled "`miser-policy` has no tests
+> at all". That was false. It has nine (three in `lib.rs`, six in
+> `quality.rs`) — I had grepped for a function name and `#[test]` on the same
+> line, which never matches because `#[test]` sits on its own line. The real
+> finding was narrower and is the more useful one: the tests existed and could
+> not tell the original from a broken version.
+
+Shard 2 of 4, as it was:
 
 ```text
 80 mutants tested in 19m: 23 missed, 48 caught, 7 unviable
@@ -670,3 +677,79 @@ The fix is a `crates/miser-policy/tests/` with property tests over
 `max_tier` promotion and that is the property the whole function is built on.
 That is the same property already asserted for the price band ladder, and it is
 the natural Kani target once Kani works.
+
+
+### What the new tests changed: 23 missed to 5
+
+Three rounds, each verified by re-running the shard rather than by trusting the
+tests I had just written:
+
+| round | missed | caught | what was added |
+|---|---:|---:|---|
+| before | 23 | 48 | — |
+| 1 | 14 | 53 | `tests/tier_floors.rs` — 13 tests, monotonicity of the floors |
+| 2 | 10 | 58 | escalation raises the tier; the quality gate's 7 code markers |
+| 3 | 5 | 64 | the classifier's own `has_tool_history`; `has_multi_step_intent` |
+
+The three rounds each had the same shape, which is the actual lesson. In every
+case a test existed that *passed* and proved nothing:
+
+1. All three pre-existing `lib.rs` tests used `confidence: 0.99`, so the
+   confidence gate never ran on the interesting side. `<` → `>` — meaning every
+   request silently skips its Standard promotion — left the suite green.
+2. My own `escalation_stops_at_the_top_tier` checked only the ceiling. A test that
+   checks only the ceiling cannot distinguish "there is no tier above Reasoning"
+   from "escalation is silently broken", so three mutants survived a commit whose
+   message claimed the escalation path was covered.
+3. My first `tool_history.rs` used the prompt "run the suite", which is *already*
+   a Hard keyword in the heuristic, so the tool-history signal contributed
+   nothing and killed no mutants. The inert prompts ("hello", "thanks" → Trivial
+   bare, Hard with any one marker) are what made it discriminate.
+
+**A test that cannot distinguish the original from a mutation is not evidence**,
+and that applies to the tests written to fix this just as much as to the ones
+found. Two of my own verification passes were also invalid before they were
+re-run: one grepped for a test count that never matched, so reported "killed"
+unconditionally, and one reconstructed the wrong parenthesisation of an operator
+mutation. Both were caught by adding a no-op control that must report SURVIVED.
+
+### The 5 remaining survivors, and why 2 cannot be killed
+
+| site | what it is |
+|---|---|
+| `quality.rs:65` | `\|\|` → `&&` on `content.contains("```bash")` |
+| `provider/lib.rs:178` | `delete !` in `parse_json_response` |
+| 3 more | pending the shard's final tally |
+
+`quality.rs:65` is unkillable by construction. `content.contains("```shell")`
+and `content.contains("```bash")` are subsumed by `content.contains("```")`,
+which is already an operand of the same chain — anything containing either
+necessarily contains a fence, so deleting them is unobservable. Their mutants
+survive because they are dead logic, not because coverage is missing. Left in
+place deliberately: removing them couples the operands to "```" remaining in the
+chain, and if that one is ever dropped the shell/bash checks silently become
+live again.
+
+### A real defect this found: escalation out of Hard is a paid no-op
+
+`next_returns_the_configured_route_for_the_escalated_tier` failed on its first
+run, and not because of a test bug. The shipped config has:
+
+```toml
+[tiers.hard]      model = "z-ai/glm-5.3"
+[tiers.reasoning] model = "z-ai/glm-5.3"
+```
+
+`next_tier(Hard) = Reasoning`, so every quality escalation out of the Hard tier
+issues a second, full-price upstream call to the same model, at a larger token
+budget, for an answer the first call already produced. The top of the ladder —
+the most expensive floor, and reachable from a false positive per finding 11 —
+is not actually stronger than the tier below it.
+
+Recorded as `escalation_is_not_a_paid_no_op`, `#[ignore]`d rather than deleted,
+because the fix is a cost decision. Issue #84.
+
+Worth noting how it surfaced: an earlier version of that test asserted
+`escalated.model != current.model`, which would have *passed* and hidden this
+entirely. Comparing against what the config says the parent tier routes to is
+what made the duplicate visible.
