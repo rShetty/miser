@@ -124,19 +124,49 @@ jobs:
       # matching nightly.
       - uses: model-checking/kani-github-action@v1
         with:
+          # Pinned. The default is `latest`, which makes an upstream regression
+          # indistinguishable from a defect in this repo: a Kani release that
+          # ICEs would turn this job red on a commit that changed no proof.
+          # Bump deliberately, in its own commit, with the ICE text in it.
+          kani-version: '0.68.0'
           working-directory: .
+      # One step per crate, each `continue-on-error`, then an explicit gate.
+      #
+      # Not because a failure should be tolerated -- it is not, the gate below
+      # re-fails the job -- but because 0.68.0 ICEs while compiling
+      # miser-classifier, and a hard failure there meant the crate we could not
+      # prove was never attempted, so a single upstream bug hid every result
+      # this job exists to produce. Same reasoning as dropping `needs:` above.
       - name: Prove miser-types
-        run: cargo kani -p miser-types --output-format terse
+        id: kani_types
+        continue-on-error: true
+        run: bash ci/kani-prove.sh miser-types
       - name: Prove miser-classifier
-        run: cargo kani -p miser-classifier --output-format terse
-      - name: Prove miser-policy
-        run: cargo kani -p miser-policy --output-format terse
-      - name: Upload proofs
+        id: kani_classifier
+        continue-on-error: true
+        run: bash ci/kani-prove.sh miser-classifier
+      - name: Gate
+        run: |
+          failed=0
+          for step in kani_types kani_classifier; do
+            if [ "${{ steps.${step}.outcome }}" != "success" ]; then
+              echo "::error title=Kani::$step did not produce passing proofs"
+              failed=1
+            fi
+          done
+          exit $failed
+      # No `miser-policy` step. It ran `cargo kani -p miser-policy`, and that
+      # crate has no `#[kani::proof]` functions -- so it exited 0 and the run
+      # list showed a third green verification layer that verified nothing.
+      # A row here was a claim, not a result.
+      - name: Upload proofs and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kani-proofs
-          path: target/kani/
+          path: |
+            target/kani/
+            kani-*.log
           retention-days: 30
 
   tlc:
