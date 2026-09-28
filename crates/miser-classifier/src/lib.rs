@@ -4,6 +4,12 @@ use miser_types::{
 };
 use regex::RegexSet;
 use serde::Deserialize;
+// Kani proof harnesses for the pure decision functions. `#[cfg(kani)]` keeps
+// them out of every normal build, so `kani` is never a dependency of one. The
+// `cfg` name is declared in Cargo.toml under `[lints.rust] unexpected_cfgs`.
+#[cfg(kani)]
+mod kani_proofs;
+
 use serde_json::{Value, json};
 use std::time::Instant;
 use thiserror::Error;
@@ -70,6 +76,64 @@ fn tier_key(tier: ComplexityTier) -> &'static str {
 /// opener but is neither brief nor length-constrained. An earlier version matched
 /// brevity markers anywhere in the text and capped both of those; that regressed
 /// the large corpus from 0.9314 to 0.8400.
+/// Copulas and quantifiers: a yes/no question opening with one of these asks for
+/// a *fact*. A binary framing alone does not make a request small -- "true or
+/// false: delete every row in prod and rebuild the index?" and "yes or no:
+/// rewrite the payment service in Rust?" are both binary and both are real work.
+///
+/// The modals are handled by [`is_third_person_modal_question`] instead of here,
+/// because telling "can a primary key be null?" from "can you add retries?"
+/// needs a negative lookahead and this regex engine has none.
+///
+/// That failure was invisible for a while because the pattern is worth only 5 --
+/// when it is the *only* match it still wins 5-to-0 and picks the tier by itself.
+///
+/// Shared by the `trivial` tier weight and the short-definitional override, so
+/// the two cannot drift apart and leave the weaker one deciding alone.
+const FACTUAL_OPENER: &str = r"(is|are|was|were|does|did|has|have|any|all|every)\b";
+
+/// The leading `yes or no` / `true or false` framing, plus any separator, with
+/// the question itself left in `rest`.
+fn strip_binary_opener(text: &str) -> Option<&str> {
+    let lower = text.trim_start();
+    let rest = lower
+        .strip_prefix("just ")
+        .or_else(|| lower.strip_prefix("just\t"))
+        .unwrap_or(lower);
+    let rest = rest.strip_prefix("answer ").unwrap_or(rest).trim_start();
+    let rest = if let Some(rest) = rest.strip_prefix("yes or no") {
+        rest
+    } else {
+        rest.strip_prefix("true or false")?
+    };
+    Some(rest.trim_start_matches([' ', '\t', ':', ',', '-', '–']))
+}
+
+/// `true or false`/`yes or no` plus a modal in the *third* person.
+///
+/// "can a primary key be null?" is a closed-form fact; "can you add retries?" is
+/// a ticket. Only the second person makes a modal a request, so that is the
+/// whole test. Split out of the patterns because `regex` supports neither
+/// look-ahead nor look-behind.
+fn is_third_person_modal_question(text: &str) -> bool {
+    let Some(rest) = strip_binary_opener(text) else {
+        return false;
+    };
+    let lower = rest.to_ascii_lowercase();
+    let Some(after_modal) = ["can ", "could ", "will ", "would "]
+        .iter()
+        .find_map(|modal| lower.strip_prefix(modal))
+    else {
+        return false;
+    };
+    // Closed-form only: one short question, no request attached.
+    if !after_modal.trim_end().ends_with('?') || after_modal.len() > 60 {
+        return false;
+    }
+    !after_modal.trim_start().starts_with("you ")
+        && !after_modal.trim_start().eq_ignore_ascii_case("you?")
+}
+
 fn is_short_definitional(text: &str) -> bool {
     static FORM: std::sync::OnceLock<RegexSet> = std::sync::OnceLock::new();
     let regex = FORM.get_or_init(|| {
@@ -78,8 +142,22 @@ fn is_short_definitional(text: &str) -> bool {
             r"(?i)^\s*(what|who|when|where|which)\b.{0,60}?\b(one|two|three|a few|a couple of)\s+(word|sentence|line)s?\b.{0,30}$",
             // "just say X in a sentence so I can quote it"
             r"(?i)^\s*(just\s+)?(say|answer|reply|tell me)\b[^.]{0,60}\b(in a sentence|in one sentence|one sentence)\b[^.]{0,40}$",
-            // An explicitly binary question.
-            r"(?i)^\s*(just\s+)?(answer\s+)?(yes or no|true or false)\b\s*[:,\-]?\s*.{0,60}\?\s*$",
+            // An explicitly binary question, and only a closed-form *factual*
+            // one. The binary framing alone is not what makes a request small:
+            // "true or false: delete every row in prod and rebuild the index?"
+            // and "yes or no: rewrite the payment service in Rust?" are both
+            // binary and both are real work. This row used to accept any of them
+            // and force Trivial at the 0.95 confidence cap -- above both the
+            // 0.65 tier-floor threshold and the 0.70 verification threshold, so
+            // nothing downstream could recover it.
+            //
+            // The discriminator is a leading interrogative, so the question
+            // asks for a fact rather than requesting an action: "is Python
+            // interpreted?" stays Trivial, "delete every row..." does not.
+            // Third-person modals are added by the check below.
+            &format!(
+                r"(?i)^\s*(just\s+)?(answer\s+)?(yes or no|true or false)\b\s*[:,\-–]?\s*{FACTUAL_OPENER}[^?]{{0,50}}\?\s*$"
+            ),
             // Checking in, with the "no work" signal that makes it small talk.
             r"(?i)^\s*(hello|hi|hey|thanks|thank you|cheers)\b[^.]{0,50}\b(nothing|no need|no changes|just checking)\b[^.]{0,30}$",
             // A bare acknowledgment.
@@ -87,7 +165,7 @@ fn is_short_definitional(text: &str) -> bool {
         ])
         .expect("short-definitional regex")
     });
-    regex.is_match(text)
+    regex.is_match(text) || is_third_person_modal_question(text)
 }
 
 /// Tool names, for the request envelope.
@@ -149,6 +227,33 @@ fn default_confidence() -> f32 {
     0.7
 }
 
+/// Resolve an endpoint's full URL from its `base_url` and optional `path`.
+///
+/// One function, because two call sites used to read this contract
+/// differently and the cascade's copy did not tolerate what `jev`'s did: with
+/// `base_url = "https://api.typesafe.ai/v1"` and `path = "systemone"`, `jev`
+/// built `.../v1/systemone` while the cascade built `.../v1systemone` — a URL
+/// that reaches nothing, so the verification request never happened and the
+/// traffic silently stayed on the unverified cheap tier. An absent or empty
+/// path means `/evaluate`, matching the Jev contract.
+fn endpoint_url(endpoint: &miser_types::ClassifierEndpointConfig) -> String {
+    let path = match endpoint.path.as_deref() {
+        Some("") | None => "/evaluate",
+        Some(path) => path,
+    };
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return path.to_string();
+    }
+    // Tolerate a missing leading slash rather than silently mis-joining onto
+    // the base URL.
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    format!("{}{}", endpoint.base_url.trim_end_matches('/'), path)
+}
+
 impl Classifier {
     pub fn new(config: ClassifierConfig) -> Result<Self, regex::Error> {
         Ok(Self {
@@ -170,8 +275,16 @@ impl Classifier {
                 // Closed-form factual questions: one answer, no concept to
                 // explain, so there is nothing to reason about.
                 r"(?i)^\s*(what year|what version|who (created|wrote|designed|built)|how many|how much|when (was|did|is)|where is)\b[^?]{0,60}\?\s*$",
-                // Explicitly binary questions.
-                r"(?i)^\s*(just\s+)?(answer\s+)?(yes or no|true or false)\b\s*[:,\-–]\s*",
+                // Explicitly binary questions -- but only closed-form factual
+                // ones, using the same opener set as the short-definitional
+                // override. This pattern is worth 5, so when it is the *only*
+                // match it wins 5-to-0 and decides the tier by itself: that is
+                // how "true or false: delete every row in prod and rebuild the
+                // index?" stayed Trivial even after the definitional form was
+                // fixed, because nothing else in the text matched either.
+                &format!(
+                    r"(?i)^\s*(just\s+)?(answer\s+)?(yes or no|true or false)\b\s*[:,\-–]\s*{FACTUAL_OPENER}"
+                ),
                 // Bare git plumbing with no target: a lookup, not a task.
                 r"(?i)^\s*git\s+(remote|stash|branch|show|log|status|diff)\b\s*(-\S+\s*)*$",
                 r"(?i)^\s*no questions?\b.*\b(there|needed)\b\s*$",
@@ -309,65 +422,72 @@ impl Classifier {
                 }
             },
             ClassifierMode::Hybrid => {
+                // Not an early `return`: the dispatch below is wrapped by the
+                // verification cascade, and returning from inside the match
+                // skipped it. A confident heuristic answer was therefore never
+                // verified in Hybrid mode while the *same* answer was verified
+                // in Heuristic mode, so the same prompt routed differently
+                // depending only on which mode was configured.
                 if heuristic.confidence >= self.config.confidence_threshold {
-                    return Ok(heuristic);
-                }
-                let local_fut = if self.config.local_llm.enabled {
-                    Some(Box::pin(self.llm(
-                        request,
-                        &self.config.local_llm,
-                        "local_llm",
-                        started,
-                    )))
+                    Ok(heuristic)
                 } else {
-                    None
-                };
-                let cloud_fut = if self.config.cloud_llm.enabled {
-                    Some(Box::pin(self.llm(
-                        request,
-                        &self.config.cloud_llm,
-                        "cloud_llm",
-                        started,
-                    )))
-                } else {
-                    None
-                };
-                match (local_fut, cloud_fut) {
-                    (Some(local), Some(cloud)) => {
-                        let mut local = local;
-                        let mut cloud = cloud;
-                        tokio::select! {
-                            result = &mut local => match result {
-                                Ok(r) if r.confidence >= self.config.confidence_threshold => Ok(r),
-                                Ok(local_result) => {
-                                    match cloud.as_mut().await {
-                                        Ok(cloud_result) if cloud_result.confidence >= self.config.confidence_threshold => Ok(cloud_result),
-                                        Ok(_) => Ok(local_result),
-                                        Err(_) => Ok(local_result),
+                    let local_fut = if self.config.local_llm.enabled {
+                        Some(Box::pin(self.llm(
+                            request,
+                            &self.config.local_llm,
+                            "local_llm",
+                            started,
+                        )))
+                    } else {
+                        None
+                    };
+                    let cloud_fut = if self.config.cloud_llm.enabled {
+                        Some(Box::pin(self.llm(
+                            request,
+                            &self.config.cloud_llm,
+                            "cloud_llm",
+                            started,
+                        )))
+                    } else {
+                        None
+                    };
+                    match (local_fut, cloud_fut) {
+                        (Some(local), Some(cloud)) => {
+                            let mut local = local;
+                            let mut cloud = cloud;
+                            tokio::select! {
+                                result = &mut local => match result {
+                                    Ok(r) if r.confidence >= self.config.confidence_threshold => Ok(r),
+                                    Ok(local_result) => {
+                                        match cloud.as_mut().await {
+                                            Ok(cloud_result) if cloud_result.confidence >= self.config.confidence_threshold => Ok(cloud_result),
+                                            Ok(_) => Ok(local_result),
+                                            Err(_) => Ok(local_result),
+                                        }
                                     }
-                                }
-                                Err(_) => match cloud.as_mut().await {
-                                    Ok(r) => Ok(r),
-                                    Err(_) => Ok(heuristic),
+                                    Err(_) => match cloud.as_mut().await {
+                                        Ok(r) => Ok(r),
+                                        Err(_) => Ok(heuristic),
+                                    },
                                 },
-                            },
-                            result = &mut cloud => match result {
-                                Ok(r) if r.confidence >= self.config.confidence_threshold => Ok(r),
-                                Ok(cloud_result) => match local.as_mut().await {
-                                    Ok(local_result) if local_result.confidence >= self.config.confidence_threshold => Ok(local_result),
-                                    Ok(_) => Ok(cloud_result),
-                                    Err(_) => Ok(cloud_result),
+                                result = &mut cloud => match result {
+                                    Ok(r) if r.confidence >= self.config.confidence_threshold => Ok(r),
+                                    Ok(cloud_result) => match local.as_mut().await {
+                                        Ok(local_result) if local_result.confidence >= self.config.confidence_threshold => Ok(local_result),
+                                        Ok(_) => Ok(cloud_result),
+                                        Err(_) => Ok(cloud_result),
+                                    },
+                                    Err(_) => match local.as_mut().await {
+                                        Ok(r) => Ok(r),
+                                        Err(_) => Ok(heuristic),
+                                    },
                                 },
-                                Err(_) => match local.as_mut().await {
-                                    Ok(r) => Ok(r),
-                                    Err(_) => Ok(heuristic),
-                                },
-                            },
+                            }
                         }
+                        (Some(mut local), None) => local.as_mut().await.or(Ok(heuristic)),
+                        (None, Some(mut cloud)) => cloud.as_mut().await.or(Ok(heuristic)),
+                        (None, None) => Ok(heuristic),
                     }
-                    (Some(mut local), None) => local.as_mut().await.or(Ok(heuristic)),
-                    (None, Some(mut cloud)) => cloud.as_mut().await.or(Ok(heuristic)),
-                    (None, None) => Ok(heuristic),
                 }
             }
         };
@@ -677,12 +797,7 @@ impl Classifier {
         body: &serde_json::Value,
         endpoint: &miser_types::ClassifierEndpointConfig,
     ) -> Result<serde_json::Value, ClassifierError> {
-        let path = endpoint.path.clone().unwrap_or_else(|| "/evaluate".into());
-        let url = if path.starts_with("http://") || path.starts_with("https://") {
-            path.clone()
-        } else {
-            format!("{}{}", endpoint.base_url.trim_end_matches('/'), path)
-        };
+        let url = endpoint_url(endpoint);
         let raw = self
             .client
             .post(&url)
@@ -745,21 +860,7 @@ impl Classifier {
                 }
             }
         });
-        let path = match endpoint.path.as_deref() {
-            Some("") | None => "/evaluate",
-            Some(p) if p.starts_with("http://") || p.starts_with("https://") => p,
-            Some(p) if p.starts_with('/') => p,
-            Some(p) => {
-                // Tolerate a missing leading slash rather than silently
-                // mis-joining onto the base URL.
-                &format!("/{p}")
-            }
-        };
-        let url = if path.starts_with("http://") || path.starts_with("https://") {
-            path.to_string()
-        } else {
-            format!("{}{}", endpoint.base_url.trim_end_matches('/'), path)
-        };
+        let url = endpoint_url(endpoint);
         let mut body = body;
         // Screening rides in the same request as the tier question. Jev answers
         // independent questions about the same state in parallel, so this costs
@@ -978,7 +1079,9 @@ fn request_text(request: &ChatCompletionRequest) -> String {
             MessageContent::Parts(parts) => parts
                 .iter()
                 .map(|part| match part {
-                    miser_types::ContentPart::Text { text } => text.clone(),
+                    miser_types::ContentPart::Known(miser_types::KnownContentPart::Text {
+                        text,
+                    }) => text.clone(),
                     _ => String::new(),
                 })
                 .collect::<Vec<_>>()
@@ -1033,7 +1136,13 @@ fn override_tier(request: &miser_types::ChatCompletionRequest) -> Option<(Comple
     let directive = first.strip_prefix("@route:").or_else(|| {
         // Case-insensitive, like every other pattern in this file. Accepting
         // only exact lowercase meant `@route:Hard` was ignored without a word.
-        if first.len() < 7 || !first[..7].eq_ignore_ascii_case("@route:") {
+        //
+        // Slice with `get`, never `first[..7]`: byte 7 lands inside a
+        // multi-byte character for ordinary non-ASCII prompts ("日本語で..." is
+        // 6 ASCII-safe bytes then a 3-byte char), and indexing a `str` off a
+        // char boundary panics. That turned a plain greeting into a 500.
+        let prefix = first.get(..7)?;
+        if !prefix.eq_ignore_ascii_case("@route:") {
             return None;
         }
         Some(&first[7..])
@@ -1115,7 +1224,18 @@ fn coding_or_reasoning(lower: &str) -> Option<TaskType> {
     ];
     if CODING.iter().any(|needle| has_word(lower, needle)) {
         Some(TaskType::Coding)
-    } else if lower.contains("prove") || lower.contains("derive") || lower.contains("algorithm") {
+    } else if ["prove", "derive", "algorithm"]
+        .iter()
+        .any(|needle| has_word(lower, needle))
+    {
+        // Word-anchored like every other list in this file, and for a sharper
+        // reason than the Coding one: `miser-policy` turns a Reasoning task
+        // into an *unbounded* `max(tier, Reasoning)` floor, so a false
+        // positive here is the most expensive mistake the classifier can make.
+        // Raw `contains` matched "improve", "approved" and "improvement" and
+        // pinned ordinary chores ("improve the test coverage") to the frontier
+        // tier. The tier itself is still detected separately by the reasoning
+        // regex set, so nothing genuine is lost.
         Some(TaskType::Reasoning)
     } else {
         Some(TaskType::Chat)
@@ -1937,6 +2057,100 @@ mod tests {
         assert!(!has_word("unicode normalization", "code"));
         assert!(!has_word("interest rate", "rest"));
         assert!(!has_word("decode the payload", "code"));
+    }
+
+    /// A `Reasoning` task is an *unbounded* floor to the strongest tier in
+    /// `miser-policy`, so its keyword set has to be word-anchored for the same
+    /// reason the Coding one is. Raw `contains` matched "improve" and
+    /// "approved" and escalated ordinary chores to the frontier model.
+    #[tokio::test]
+    async fn prose_is_not_typed_as_a_reasoning_task() {
+        let classifier = Classifier::new(classifier_config("heuristic")).unwrap();
+        for prompt in [
+            "improve the test coverage of the http client",
+            "improve the parser",
+            "the improvement ticket is approved, ship it",
+            "disprove the marketing claim on the landing page",
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": prompt}]
+            }))
+            .unwrap();
+            let result = classifier.classify(&request).await.unwrap();
+            assert_ne!(
+                result.task,
+                Some(TaskType::Reasoning),
+                "{prompt:?} was typed as a reasoning task, which floors the tier to Reasoning"
+            );
+        }
+    }
+
+    /// The genuine article still has to be detected, or the fix above would
+    /// have quietly traded an over-route for an under-route.
+    #[tokio::test]
+    async fn real_reasoning_prompts_are_still_typed_as_reasoning() {
+        let classifier = Classifier::new(classifier_config("heuristic")).unwrap();
+        for prompt in [
+            "prove that the two formulations are equivalent",
+            "derive the closed form of the recurrence",
+            "design an amortised algorithm for the union-find",
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "user-model",
+                "messages": [{"role": "user", "content": prompt}]
+            }))
+            .unwrap();
+            let result = classifier.classify(&request).await.unwrap();
+            assert_eq!(
+                result.task,
+                Some(TaskType::Reasoning),
+                "{prompt:?} should still be a reasoning task"
+            );
+        }
+    }
+
+    /// The `@route:` case-insensitive probe used to slice `first[..7]`, which
+    /// panics when byte 7 lands inside a multi-byte character. Every ASCII
+    /// prompt has a char boundary there, so the whole existing suite missed
+    /// it; an ordinary greeting in any non-Latin script is enough to 500.
+    #[tokio::test]
+    async fn a_non_ascii_prompt_never_panics_the_route_prefix_probe() {
+        let classifier = Classifier::new(classifier_config("heuristic")).unwrap();
+        for prompt in [
+            "日本語でこんにちは",
+            "abcd😀",
+            "कऋग",
+            "Здравствуйте",
+            "héllo wörld",
+            "🚀 launch",
+            "a",
+            "",
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": prompt}]
+            }))
+            .unwrap();
+            // The assertion is that this returns at all.
+            let result = classifier.classify(&request).await.unwrap();
+            assert!(result.tier <= ComplexityTier::Reasoning);
+        }
+    }
+
+    /// A valid directive must still win regardless of what follows it, and
+    /// the case-insensitive arm must survive a non-ASCII body.
+    #[tokio::test]
+    async fn a_route_directive_still_wins_with_a_non_ascii_body() {
+        let classifier = Classifier::new(classifier_config("heuristic")).unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "@ROUTE:HARD\n日本語で，详细に説明してください"}]
+        }))
+        .unwrap();
+        let result = classifier.classify(&request).await.unwrap();
+        assert_eq!(result.tier, ComplexityTier::Hard);
+        assert_eq!(result.classifier, "override");
     }
 
     #[tokio::test]

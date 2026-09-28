@@ -6,3 +6,6 @@
 # everyone who runs the test benefits from these saved cases.
 cc 86bba21c0e17640a39a0c2dd7f39ff6bfe26247b670e2baf70c0b480a23f3095 # shrinks to text = "prove"
 cc a6058eb5ea8195c4247eb127b25005378294988c51d968333672ef46dafdb061 # shrinks to text = "explain refactor"
+cc fc84ae4fef810a1a82259c4f6ec29d7c9ed1bf29a092a6fd0ebab33e82abe4f0 # shrinks to text = "complexity design refactor"
+cc 07bed7c6130ab573bff9209765c891471dfa7ed67b2f00646f01e42add9d92bd # shrinks to text = "add migrate database endpoint"
+cc 90b66da206501f369cbd293d4fb337f412059504e890688fbd9b2d098674ed72 # shrinks to text = "add debug"

@@ -20,6 +20,9 @@ use proptest::prelude::*;
 use serde_json::json;
 use std::sync::OnceLock;
 
+#[path = "support/mod.rs"]
+mod support;
+
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| tokio::runtime::Runtime::new().expect("runtime"))
@@ -62,89 +65,19 @@ fn rank(tier: ComplexityTier) -> u8 {
     }
 }
 
-/// Text drawn from the vocabulary the tables key on, plus noise, so the
-/// generator actually reaches the pattern-matching paths rather than always
-/// missing every table.
+/// Either the ASCII vocabulary the pattern tables key on, or arbitrary Unicode.
+///
+/// The union matters. The table vocabulary reaches the matching paths — the
+/// original generator was right about that — but every literal in it was ASCII,
+/// which made the whole class of char-boundary defects structurally unreachable.
+/// `arb_straddling_text` in particular places a multi-byte character at a chosen
+/// byte offset, so it cannot miss the fixed-width-slice bug that shipped.
 fn arb_text() -> impl Strategy<Value = String> {
-    let words = prop::sample::select(vec![
-        "add",
-        "optimize",
-        "configure",
-        "split",
-        "upgrade",
-        "implement",
-        "design",
-        "write",
-        "explain",
-        "analyze",
-        "prove",
-        "deploy",
-        "migrate",
-        "refactor",
-        "debug",
-        "the",
-        "a",
-        "auth",
-        "billing",
-        "database",
-        "service",
-        "microservices",
-        "endpoint",
-        "endpoints",
-        "query",
-        "queries",
-        "schema",
-        "capital",
-        "unicode",
-        "restaurant",
-        "interest",
-        "barcode",
-        "api",
-        "code",
-        "rest",
-        "git",
-        "status",
-        "diff",
-        "http",
-        "postmortem",
-        "outage",
-        "complexity",
-        "recurrence",
-        "amortized",
-        "terraform",
-        "nginx",
-        "orm",
-        "tracing",
-        "thanks",
-        "ok",
-        "perfect",
-        "got",
-        "hi",
-        "hello",
-        "yes",
-        "no",
-        "yep",
-        "route",
-        "hard",
-        "trivial",
-        "standard",
-        "simple",
-        "reasoning",
-        "monolith",
-        "n+1",
-        "logging",
-        "ids",
-        "semicolons",
-        "braces",
-        "awk",
-        "sql",
-        "regex",
-        "leap",
-        "year",
-        "created",
-        "many",
-    ]);
-    prop::collection::vec(words, 0..14).prop_map(|ws| ws.join(" "))
+    prop_oneof![
+        support::arb_table_text().boxed(),
+        support::arb_adversarial_text().boxed(),
+        support::arb_straddling_text().boxed(),
+    ]
 }
 
 proptest! {
@@ -418,6 +351,51 @@ async fn a_short_definitional_question_is_trivial() {
 /// The first attempt capped on any brevity marker anywhere in the text, caught
 /// "explain X in one sentence", and cost 9 points of accuracy. These are the
 /// cases that must keep their tier.
+/// A yes/no *framing* is not a synonym for a small request. The binary row in
+/// the short-definitional form used to accept any yes/no question up to 60
+/// characters and force `Trivial` at the 0.95 confidence cap — which is above
+/// both the 0.65 tier-floor threshold and the 0.70 verification threshold, so
+/// neither the policy floor nor the verification cascade could recover it. These
+/// are binary questions about real work, and they must not be capped.
+#[tokio::test]
+async fn a_binary_question_about_real_work_is_not_capped_as_trivial() {
+    let classifier = heuristic();
+    for prompt in [
+        "true or false: delete every row in prod and rebuild the index?",
+        "yes or no: rewrite the payment service in Rust?",
+        "yes or no: should we migrate the ledger to event sourcing?",
+    ] {
+        let result = classifier.classify(&req(prompt)).await.unwrap();
+        assert_ne!(
+            result.tier,
+            ComplexityTier::Trivial,
+            "{prompt:?} was capped to Trivial at confidence {} ({:?})",
+            result.confidence,
+            result.reasons
+        );
+    }
+}
+
+/// The control: a binary question that asks for a *fact* is still trivial. The
+/// corpus pins "just answer yes or no: is Python interpreted?" at Trivial, so
+/// closing the hole above must not have closed this one with it.
+#[tokio::test]
+async fn a_binary_question_about_a_fact_is_still_trivial() {
+    let classifier = heuristic();
+    for prompt in [
+        "just answer yes or no: is Python interpreted?",
+        "yes or no: is the capital of France Paris?",
+    ] {
+        let result = classifier.classify(&req(prompt)).await.unwrap();
+        assert_eq!(
+            result.tier,
+            ComplexityTier::Trivial,
+            "{prompt:?} is a closed-form factual question ({:?})",
+            result.reasons
+        );
+    }
+}
+
 #[tokio::test]
 async fn real_work_is_not_capped_as_definitional() {
     let classifier = heuristic();

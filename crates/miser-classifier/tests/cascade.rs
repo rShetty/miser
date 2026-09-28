@@ -92,6 +92,127 @@ fn cascade_is_off_by_default() {
     assert!(!c.cascade.enabled, "cascade must default to off");
 }
 
+/// The cascade is a second *model* call, so the URL it posts to has to be
+/// resolved the same way `jev` resolves it. The two had separate copies of that
+/// logic and the cascade's was less forgiving: `path = "systemone"` (no
+/// leading slash) produced `.../v1systemone` against a `.../v1` base, which
+/// reaches nothing. The request then failed, the tier stayed where the cheap
+/// stage put it, and `reasons` said `cascade-unavailable` -- so an operator
+/// reading the reason list would conclude the verifier had spoken, when in
+/// fact it had never been reached.
+#[tokio::test]
+async fn the_cascade_reaches_the_endpoint_whether_or_not_the_path_has_a_leading_slash() {
+    for path in ["/systemone", "systemone"] {
+        // Record the path the server actually saw, and answer a disagreement
+        // so a reached verifier has an observable effect.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 8192];
+                let mut data = Vec::new();
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    data.extend_from_slice(&buf[..n]);
+                    if data.windows(4).any(|w| w == b"\r\n\r\n") || n == 0 {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&data[..data.len().min(200)]);
+                *seen.lock().unwrap() = head.lines().next().unwrap_or_default().to_string();
+                let payload = verify(0.04).into_bytes();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.write_all(&payload).await;
+                let _ = sock.flush().await;
+            });
+        }
+
+        let mut c = config(&format!("http://{addr}"));
+        c.jev.path = Some(path.into());
+        c.cascade.enabled = true;
+        c.cascade.verify_below = 1.0;
+        let result = Classifier::new(c)
+            .unwrap()
+            .classify(&req("hello"))
+            .await
+            .unwrap();
+
+        let request_line = seen.lock().unwrap().clone();
+        assert!(
+            request_line.contains("/systemone"),
+            "path {path:?} produced request {request_line:?}, which never reached the endpoint"
+        );
+        assert!(
+            !request_line.contains("/v1systemone"),
+            "path {path:?} was mis-joined onto the base URL: {request_line:?}"
+        );
+        assert_eq!(
+            result.cascade.as_deref(),
+            Some("local-escalated"),
+            "path {path:?}: a reached verifier must be able to change the outcome"
+        );
+    }
+}
+
+/// Every dispatch mode must reach the cascade. `Hybrid` short-circuited on a
+/// confident heuristic with a `return` from inside the mode match, which
+/// skipped the cascade that wraps the dispatch entirely -- so in Hybrid mode a
+/// confident cheap answer was never verified, while the *same* answer in
+/// Heuristic mode was. The same prompt therefore routed differently depending
+/// only on the configured mode.
+#[tokio::test]
+async fn a_confident_cheap_decision_is_verified_in_hybrid_mode_too() {
+    // "kubernetes" scores just above `confidence_threshold` (0.65) and below
+    // `verify_below` (0.70), so the cascade must consult the verifier.
+    let prompt = "kubernetes";
+
+    // First: confirm the prompt really is in the band where the cascade bites,
+    // by showing Heuristic mode escalates it.
+    let base = serve(vec![verify(0.04)]).await;
+    let mut c = config(&base);
+    c.cascade.enabled = true;
+    let heuristic_mode = Classifier::new(c)
+        .unwrap()
+        .classify(&req(prompt))
+        .await
+        .unwrap();
+    assert_eq!(
+        heuristic_mode.cascade.as_deref(),
+        Some("local-escalated"),
+        "test premise: Heuristic mode verifies this prompt, so Hybrid must too"
+    );
+
+    // Now the same prompt in Hybrid mode. The heuristic's confidence clears the
+    // short-circuit, which is exactly the branch that used to skip the cascade.
+    let base = serve(vec![verify(0.04)]).await;
+    let mut c = config(&base);
+    c.mode = ClassifierMode::Hybrid;
+    c.cascade.enabled = true;
+    let hybrid = Classifier::new(c)
+        .unwrap()
+        .classify(&req(prompt))
+        .await
+        .unwrap();
+    assert_eq!(
+        hybrid.cascade.as_deref(),
+        Some("local-escalated"),
+        "Hybrid mode skipped the verification cascade that Heuristic mode applied"
+    );
+    assert_eq!(
+        hybrid.tier, heuristic_mode.tier,
+        "the same prompt must route the same way in both modes"
+    );
+}
+
 /// A verifier that agrees leaves the tier alone but records that it was checked.
 #[tokio::test]
 async fn agreement_leaves_the_tier_and_is_recorded() {
