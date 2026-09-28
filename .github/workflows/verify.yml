@@ -191,12 +191,24 @@ jobs:
     # The only coverage of the real provider's response shape, and the only
     # coverage of the real security-screen wording. Skipped rather than failed
     # when the secret is absent, so a fork still gets a green run.
+    #
+    # The key is bound at *job* level, not step level. A step's own `env` block
+    # is not in scope for that step's `if`, so
+    #
+    #     - if: env.JEV_API_KEY != ''
+    #       env: { JEV_API_KEY: ... }
+    #
+    # evaluates the condition against an empty env and skips the step even when
+    # the secret is set. A job-level `env` is what makes the guard see the value.
+    # That mistake would have made this job permanently green and permanently
+    # silent, which is the worst possible failure for the one layer that has
+    # never been exercised.
+    env:
+      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run the ignored live tests
         if: env.JEV_API_KEY != ''
-        env:
-          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
         run: cargo test --workspace -- --ignored --nocapture
