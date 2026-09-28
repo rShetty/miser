@@ -870,6 +870,7 @@ dependencies = [
  "miser-provider",
  "miser-types",
  "prometheus",
+ "proptest",
  "rand 0.10.2",
  "reqwest",
  "serde",
