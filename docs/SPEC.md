@@ -688,8 +688,27 @@ tests I had just written:
 |---|---:|---:|---|
 | before | 23 | 48 | — |
 | 1 | 14 | 53 | `tests/tier_floors.rs` — 13 tests, monotonicity of the floors |
-| 2 | 10 | 58 | escalation raises the tier; the quality gate's 7 code markers |
+| 2 | 10 | 58 | escalation raises the tier; the quality gate's code markers |
 | 3 | 5 | 64 | the classifier's own `has_tool_history`; `has_multi_step_intent` |
+| 4 | **4** | **67** | `parse_json_response`'s error path in `miser-provider` |
+
+A detour at round 3 that is worth recording because it is the failure mode this
+whole exercise exists to prevent. Commit `f1a0cbd` replaced the last test in
+`tier_floors.rs` using `s = s[:s.index(...)] + new`, which silently truncated
+the quality-gate section that had been appended *after* that point. The local
+suite stayed green, because a deleted test cannot fail. Mutation testing caught
+it -- CI reported 10 missed where 2 were expected, and the 7 unexpected
+survivors were exactly the `has_code` operands whose tests had vanished. The
+commit message did not mention removing any test, because I had not noticed.
+
+Restored in `21a1c10`, and each mutant re-verified individually afterwards.
+
+One verification pass during that restore was itself invalid: replacing
+`|| content.contains("```")` matches nothing, because the fence is the *first*
+operand, written `let has_code = content.contains(...)` rather than with a
+leading `||`. It reported SURVIVED for a mutation that had never been applied.
+The replacement asserts its anchor is present before writing, so a no-op
+mutation can no longer masquerade as a surviving one.
 
 The three rounds each had the same shape, which is the actual lesson. In every
 case a test existed that *passed* and proved nothing:
@@ -713,13 +732,16 @@ re-run: one grepped for a test count that never matched, so reported "killed"
 unconditionally, and one reconstructed the wrong parenthesisation of an operator
 mutation. Both were caught by adding a no-op control that must report SURVIVED.
 
-### The 5 remaining survivors, and why 2 cannot be killed
+### The one remaining survivor, and why it cannot be killed
 
-| site | what it is |
-|---|---|
-| `quality.rs:65` | `\|\|` → `&&` on `content.contains("```bash")` |
-| `provider/lib.rs:178` | `delete !` in `parse_json_response` |
-| 3 more | pending the shard's final tally |
+`quality.rs:65`, the `content.contains("```bash")` operand. As above it is
+subsumed by `content.contains("```")` in the same chain, so no test can observe
+its removal. The same holds for `content.contains("```shell")` and for the
+fence disjunct on the outer condition.
+
+`quality.rs:57`, `60`–`64` are killed: each of the five genuinely independent
+operands (` ``` `, `fn `, `function `, `def `, `tool_call`) now has a test where
+it is the only true term, verified one at a time with a no-op control.
 
 `quality.rs:65` is unkillable by construction. `content.contains("```shell")`
 and `content.contains("```bash")` are subsumed by `content.contains("```")`,
@@ -753,3 +775,13 @@ Worth noting how it surfaced: an earlier version of that test asserted
 `escalated.model != current.model`, which would have *passed* and hidden this
 entirely. Comparing against what the config says the parent tier routes to is
 what made the duplicate visible.
+
+The finding is now encoded as a **characterization test** rather than an
+`#[ignore]`d red one. The first attempt used `#[ignore]`, which was wrong for
+this repository: `#[ignore]` here means "needs a live provider key", and the
+live-contract job runs `cargo test --workspace -- --ignored` precisely to run
+everything so marked. A test meant to fail was therefore picked up by the one
+gate whose whole purpose is to run exactly those tests, and "Live Jev contract"
+went red. The test now asserts the *known* duplicate set, so it passes with the
+defect written into the expectation, and fails the moment someone gives
+Reasoning a stronger model — verified in both directions.
