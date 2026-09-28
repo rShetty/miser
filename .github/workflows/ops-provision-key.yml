@@ -104,34 +104,22 @@ jobs:
             fi
           }
 
-          # 1. Read-only OAuth clients can sometimes upgrade themselves if
-          #    they hold `oauth_keys`. Try it; ignore failure.
-          SELF_KEY_ID=$(jq -r --arg id "$TS_OAUTH_CLIENT_ID" '
-            .keys[]? | select(.id == $id or (.key | startswith($id))) | .id' \
-            <(curl -s -H "Authorization: Bearer $TOKEN" \
-                "https://api.tailscale.com/api/v2/tailnet/-/keys") 2>/dev/null || true)
-          echo "self key id: ${SELF_KEY_ID:-none}"
-          if [ -n "$SELF_KEY_ID" ]; then
-            HTTP=$(api PUT "/tailnet/-/keys/$SELF_KEY_ID" \
-              '{"keyType":"client","scopes":["devices:core","devices:core:read"],"tags":["tag:hostinger"]}')
-            echo "self-upgrade http=$HTTP $(cat .api_body 2>/dev/null || true)"
-          fi
-
-          # 2. Try tagging the VPS node as tag:hostinger (may unlock step 3).
+          # 1. Try tagging the VPS node as tag:hostinger. A tagged OAuth actor
+          #    may only manage devices sharing its tags, so this can unlock
+          #    step 2. Harmless if the tag is already present.
           HTTP=$(api POST "/device/$NODE_ID/tags" '{"tags":["tag:hostinger"]}')
           echo "set-tags http=$HTTP $(cat .api_body 2>/dev/null || true)"
 
-          # 3. Disable node key expiry (documented recovery for expired keys).
+          # 2. Disable node key expiry (documented recovery for expired keys).
           HTTP=$(api POST "/device/$NODE_ID/key" '{"keyExpiryDisabled": true}')
           echo "key-expiry-disable http=$HTTP $(cat .api_body 2>/dev/null || true)"
 
           if [ "$HTTP" != "200" ]; then
             echo ""
-            echo "API path refused (OAuth client is read-only: no devices:core)."
-            echo "FIX: Tailscale admin console -> login.tailscale.com/admin/machines"
-            echo "  -> srv1542935 -> 'Disable key expiry' (or reauthenticate),"
-            echo "  then re-run this workflow. Alternatively edit the OAuth client"
-            echo "  at login.tailscale.com/settings/oauth to add devices:core."
+            echo "API path refused (actor lacks devices:core or tag ownership)."
+            echo "The node key must be renewed from the Tailscale admin console"
+            echo "(login.tailscale.com/admin/machines -> VPS -> reauthenticate/"
+            echo "disable key expiry) or with an API token that has devices:core."
             exit 1
           fi
 
