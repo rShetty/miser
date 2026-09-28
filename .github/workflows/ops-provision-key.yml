@@ -1,0 +1,105 @@
+# ONE-OFF key provisioning run. Delete after use.
+#
+# Provisions a client key for the gateway at miser.rajeev.me. The raw secret
+# never transits GitHub: the caller generates it locally and supplies only its
+# SHA-256 hash, which is appended to /var/lib/miser/keys.json on the VPS.
+# The entry mirrors auth.rs exactly -- the gateway hashes the `miser_`-stripped
+# secret with SHA-256 and stores client, owner and active flags alongside.
+name: ops-provision-key
+on:
+  workflow_dispatch:
+    inputs:
+      key_hash:
+        description: "SHA-256 hex of the miser_-stripped client secret"
+        required: true
+      key_id:
+        description: "Key id, e.g. key_opencode2"
+        required: true
+      owner:
+        description: "Owner attribution for usage rollup"
+        required: false
+        default: "rshetty"
+      client:
+        description: "Client label for usage rollup"
+        required: false
+        default: "opencode2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ops-provision-key
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Connect to tailnet
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:hostinger
+          ping: ${{ secrets.VPS_HOST }}
+
+      - name: Append key to VPS store and restart gateway
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          timeout: 120s
+          command_timeout: 5m
+          envs: KEY_HASH,KEY_ID,KEY_OWNER,KEY_CLIENT
+          script: |
+            set -euo pipefail
+
+            STORE=/var/lib/miser/keys.json
+
+            if [ ! -f "$STORE" ]; then
+              echo "ABORT: $STORE not found"
+              exit 1
+            fi
+
+            cp "$STORE" "${STORE}.bak-provision"
+            chmod 600 "${STORE}.bak-provision"
+
+            # Refuse to double-provision the same key id.
+            if jq -e --arg id "$KEY_ID" '.keys[] | select(.id == $id)' "$STORE" >/dev/null; then
+              echo "ABORT: key id $KEY_ID already exists in $STORE"
+              exit 1
+            fi
+
+            TMP=$(mktemp)
+            jq --arg id "$KEY_ID" \
+               --arg hash "$KEY_HASH" \
+               --arg owner "$KEY_OWNER" \
+               --arg client "$KEY_CLIENT" \
+               --argjson now "$(date +%s)" \
+               '.keys += [{id: $id, key_hash: $hash, owner: $owner, client: $client,
+                           created_at: $now, active: true, allowed_tiers: [],
+                           rate_limit_rpm: null, monthly_budget_usd: null,
+                           expires_at: null}]' \
+               "$STORE" > "$TMP"
+
+            jq -e '.keys | length > 0' "$TMP" >/dev/null   # never clobber with empty
+            python3 -m json.tool "$TMP" >/dev/null         # valid JSON before install
+
+            cat "$TMP" > "$STORE"
+            rm -f "$TMP"
+            chown miser:miser "$STORE"
+            chmod 600 "$STORE"
+
+            systemctl restart miser
+            sleep 5
+            curl -sf http://127.0.0.1:8787/health/live
+            echo ""
+            echo "PROVISION OK: key_id=$KEY_ID client=$KEY_CLIENT"
+            echo "keys in store: $(jq '.keys | length' "$STORE")"
+        env:
+          KEY_HASH: ${{ github.event.inputs.key_hash }}
+          KEY_ID: ${{ github.event.inputs.key_id }}
+          KEY_OWNER: ${{ github.event.inputs.owner }}
+          KEY_CLIENT: ${{ github.event.inputs.client }}
