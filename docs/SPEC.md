@@ -447,14 +447,27 @@ It fires during codegen, so no harness is reached and no property is checked.
 Nothing here is a harness defect: the same ICE occurs on both crates, and it
 occurs while compiling the library rather than in any particular harness.
 
-**The earlier plan to scope the job to `miser-types` is refuted by
-measurement.** The reasoning was that `miser-classifier` is the crate that ICEs,
-so proving `miser-types` alone would at least produce a result. It does not:
-`cargo kani -p miser-types` still compiles `miser-classifier` — the log shows
-`Compiling miser-classifier` inside the `miser-types` job, and the ICE
-`could not compile miser-classifier` from that job. Both matrix legs therefore
-fail identically and neither yields a proof. Scoping by `-p` cannot isolate the
-problem, because the whole workspace is built regardless.
+**Where it happens, and a correction.** The first two runs of the gate were
+misleading in a way worth recording. Both matrix legs failed with this ICE and
+neither produced a proof, and the log appeared to show `cargo kani -p
+miser-types` compiling `miser-classifier` — which looked like proof that
+`--package` cannot isolate the problem.
+
+It was not. `model-checking/kani-github-action` is not only an installer: its
+final composite step is "Run Kani", which executes `cargo-kani` with empty
+arguments, i.e. a bare `cargo kani` over the **whole workspace**, run the instant
+the action is used. The job was therefore verifying the workspace once inside
+the action and again per crate in the matrix, and the ICE was in the action's
+step — which is why `ci/kani-prove.sh` never ran and never emitted its
+annotation. The "scoping cannot isolate it" conclusion was wrong, and it was
+drawn from a log that looked like evidence.
+
+The action's implicit run is now `cargo kani --list`, a no-op that only
+enumerates harnesses. So what remains untested is narrower than it looked: it is
+still unknown whether Kani 0.68.0 can verify `miser-types` when the workspace
+build is not in the way, and whether the classifier's harnesses are reachable
+once the async dependency graph is out of the picture. Both are cheap to test
+now and have not been.
 
 This is the fifth instance of the same failure mode, and the most consequential
 one. A Kani job that reports success while proving nothing is worse than no
