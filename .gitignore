@@ -10,3 +10,13 @@ prototypes/typescript/packages/*/node_modules/
 node_modules/
 catalog/
 server.pid
+
+# cargo-mutants scratch output. Regenerated on every run; a surviving-mutant
+# report is a CI artifact, not a source file.
+mutants/
+mutants.out/
+mutants.out.old/
+states/
+
+# Transient index of audit-finding -> GitHub issue, regenerated per run.
+.audit-issue-index

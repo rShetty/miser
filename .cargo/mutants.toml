@@ -1,0 +1,66 @@
+# Mutation testing configuration.
+#
+# ## Why this exists
+#
+# `cargo test` passing says the assertions agree with the code. It does not say
+# the assertions are *capable* of failing. A suite whose assertions are all
+# vacuous is green forever and catches nothing, and the 289 tests this config
+# was written against had no measurement of that at all.
+#
+# Mutation testing supplies the missing number: inject a small semantic change
+# and see whether any test notices. A surviving mutant is a named, locatable gap
+# in the suite -- which is strictly more actionable than "coverage is 84%".
+#
+# ## Scope
+#
+# Mutating the whole workspace is not affordable, and most of it is not where the
+# risk is. `examine_globs` is the *decision core*: pure functions whose behaviour
+# is a routing, money, quota, or authorization decision, and where a silent
+# regression is most expensive.
+#
+# The gateway is excluded on purpose. `main.rs` is 4,000 lines of axum/tokio
+# wiring, and mutating handler boilerplate yields thousands of mutants that only
+# a full-stack integration test can kill. Those tests exist and cover the
+# behaviour; the marginal information from mutating the plumbing is low compared
+# to the time cost.
+#
+# ## Interpreting the number
+#
+# This is a *sampled* kill rate over a chosen subset, not a whole-program
+# equivalence check. A surviving mutant means "no test in this workspace
+# distinguishes the original from this mutation" -- a statement about the tests,
+# not about the code. Read the output as a to-do list, not a grade.
+#
+# `cargo mutants --ci --min-mutants 40` is the nightly invocation. The floor
+# matters: without it, a shrinking `examine_globs` list produces a flattering
+# percentage from a handful of samples.
+#
+# Key names are validated against `cargo mutants --emit-schema=config`.
+
+examine_globs = [
+    "crates/miser-classifier/src/*.rs",
+    "crates/miser-policy/src/*.rs",
+    "crates/miser-types/src/*.rs",
+    "crates/miser-provider/src/*.rs",
+]
+
+exclude_globs = []
+
+# Mutating generated-looking noise produces mutants nobody can act on.
+skip_calls = [
+    "format",
+    "to_string",
+    "to_owned",
+    "clone",
+    "unwrap",
+    "expect",
+    "len",
+    "is_empty",
+    "iter",
+    "next",
+    "push",
+]
+
+# Treat a mutant that times out as killed. Without this, any test that runs a
+# real HTTP server is scored as a survivor, which is noise rather than signal.
+minimum_test_timeout = 30
