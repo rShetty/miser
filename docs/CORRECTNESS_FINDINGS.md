@@ -374,6 +374,53 @@ reported, but a connection that never completed was dropped entirely.
 
 ---
 
+## Found while diagnosing a local 401
+
+Not part of the audit proper; found on 2026-09-28 while chasing
+`401 invalid API key for miser auto` from the `omp` client.
+
+### `start_server.sh` loaded `.env` through `xargs`
+
+```bash
+export $(cat .env | xargs)     # WRONG
+```
+
+Every value goes through word splitting, so a value containing a space, a `#`,
+a quote or a backslash is silently split or truncated. `export` still exits 0,
+so the gateway comes up with a **wrong secret** rather than refusing to start --
+the worst failure shape, because it looks like a server problem and is really a
+quoting one. The keys in that file are alphanumeric today, which is the only
+reason it has worked.
+
+Replaced with `set -a` + `. ./.env`, which preserves each value verbatim.
+
+### A gateway with no key store rejects *every* key with the same 401
+
+`MISER_KEYS_FILE` unset falls back to `/etc/miser/keys.json`. If that is absent
+or empty the gateway boots cleanly and then answers `401 invalid API key` for
+every request -- indistinguishable from a bad secret, which is exactly how it
+presented. `start_server.sh` now refuses to start in that state instead.
+
+### Two `.env` files, and the client key is in the other one
+
+- `~/Work/miser/.env` -- server side: `MISER_KEYS_FILE`, `MISER_ADMIN_KEY`,
+  `OPENROUTER_API_KEY`, `JEV_API_KEY`
+- `~/.env` -- client side: `MISER_API_KEY`, which is the *only* definition of it
+
+`~/.omp/agent/models.yml` documents this (`apiKey: MISER_API_KEY # resolved from
+~/.env`), so it is intended rather than accidental. But a gateway restarted
+without the project `.env` sourced loses the store, and a client started
+somewhere that loads a different `.env` loses the key -- and both failures
+present as the same 401.
+
+`scripts/why_401.py` reproduces the gateway's `validate` decision locally and
+reports which of the four causes applies, without printing a secret or touching
+the network:
+
+```bash
+python3 scripts/why_401.py
+```
+
 ## Recorded, not fixed
 
 These are real, and none is a small fix. Flagged rather than silently patched.
