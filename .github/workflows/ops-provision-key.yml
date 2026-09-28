@@ -64,20 +64,34 @@ jobs:
           echo "=== tailnet devices (diagnostics) ==="
           jq -r '.devices[] |
             [.name, .nodeId, (.tags // [] | join(",")), .os,
-             (."sshEnabled" // false), (.expires // "?"),
-             (."keyExpiryDisabled" // false), (.connectedToControl // false)]
+             ((.isEphemeral // false) | tostring),
+             ((.connectedToControl // false) | tostring),
+             (.expires // "?"),
+             ((.keyExpiryDisabled // false) | tostring)]
             | @tsv' devices.json
           echo "====================================="
 
-          NODE_ID=$(jq -r '
+          # The runner ALSO joins as tag:hostinger (ephemeral, brand-new,
+          # connected). The VPS is the long-lived tagged node that is offline
+          # (expired node key) -- select exactly that one. Beware: the runner's
+          # own nodeId churns every run, so a name/hostname match alone picks
+          # the wrong node and every mutation 403s.
+          NOW=$(date -u +%s)
+          NODE_ID=$(jq -r --argjson now "$NOW" '
             [ .devices[]
-            | select(((.tags // []) | index("tag:hostinger"))
-                     or (.name | contains($h))
-                     or (.hostname | contains($h)))
-            | .nodeId ] | (first // ([.devices[].nodeId] | first) // "")' \
-            --arg h "$VPS_HOST" devices.json)
+            | select(((.tags // []) | index("tag:hostinger")))
+            | select(((.isEphemeral // false) | not))
+            | select(((.connectedToControl // false) | not))
+            | select((.created | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) < ($now - 600))
+            | .nodeId ]
+            | if length == 1 then .[0]
+              elif length == 0 then ""
+              else "AMBIGUOUS:" + (join(","))
+              end' devices.json)
           echo "nodeId=$NODE_ID"
-          [ -n "$NODE_ID" ] || { echo "VPS node not found in tailnet"; exit 1; }
+          case "$NODE_ID" in
+            ""|AMBIGUOUS:*) echo "candidate selection failed: $NODE_ID"; exit 1 ;;
+          esac
 
           api() { # method path body -> http body
             local method=$1 path=$2 body=${3:-}
