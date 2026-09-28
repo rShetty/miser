@@ -45,12 +45,12 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:hostinger
-          # NOTE: no `ping` here -- the VPS node key is expired, the ping would
-          # fail the step before the revive step below can run.
+          # NOTE: no `ping` -- the VPS node key is expired; the ping would fail
+          # the step before the revive steps below can run.
 
-      - name: Locate VPS node and disable its key expiry (Tailscale API)
+      - name: Revive VPS node via Tailscale API
         run: |
-          set -euo pipefail
+          set -uo pipefail
           TOKEN=$(curl -s -X POST "https://api.tailscale.com/api/v2/oauth/token" \
             --data-urlencode "client_id=$TS_OAUTH_CLIENT_ID" \
             --data-urlencode "client_secret=$TS_OAUTH_SECRET" | jq -r '.access_token')
@@ -59,8 +59,16 @@ jobs:
           curl -sf -H "Authorization: Bearer $TOKEN" \
             "https://api.tailscale.com/api/v2/tailnet/-/devices" > devices.json
 
-          # Prefer the tag:hostinger machine; fall back to name/hostname match
-          # on VPS_HOST, then to the only (single-VPS) tailnet member.
+          # Diagnostics: non-secret fields only. Tells us exactly why an API
+          # mutation was refused and whether Tailscale SSH is even possible.
+          echo "=== tailnet devices (diagnostics) ==="
+          jq -r '.devices[] |
+            [.name, .nodeId, (.tags // [] | join(",")), .os,
+             (."sshEnabled" // false), (.expires // "?"),
+             (."keyExpiryDisabled" // false), (.connectedToControl // false)]
+            | @tsv' devices.json
+          echo "====================================="
+
           NODE_ID=$(jq -r '
             [ .devices[]
             | select(((.tags // []) | index("tag:hostinger"))
@@ -71,13 +79,38 @@ jobs:
           echo "nodeId=$NODE_ID"
           [ -n "$NODE_ID" ] || { echo "VPS node not found in tailnet"; exit 1; }
 
-          HTTP=$(curl -s -o key_resp.json -w '%{http_code}' \
-            -X POST "https://api.tailscale.com/api/v2/device/$NODE_ID/key" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/json" \
-            -d '{"keyExpiryDisabled": true}')
-          echo "key-expiry-disable http=$HTTP"; cat key_resp.json; echo
-          [ "$HTTP" = "200" ] || { echo "failed to disable key expiry"; exit 1; }
+          api() { # method path body -> http body
+            local method=$1 path=$2 body=${3:-}
+            if [ -n "$body" ]; then
+              curl -s -o .api_body -w '%{http_code}' -X "$method" \
+                "https://api.tailscale.com/api/v2$path" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" -d "$body"
+            else
+              curl -s -o .api_body -w '%{http_code}' -X "$method" \
+                "https://api.tailscale.com/api/v2$path" \
+                -H "Authorization: Bearer $TOKEN"
+            fi
+          }
+
+          # 1. Try tagging the VPS node as tag:hostinger. A tagged OAuth actor
+          #    may only manage devices sharing its tags, so this can unlock
+          #    step 2. Harmless if the tag is already present.
+          HTTP=$(api POST "/device/$NODE_ID/tags" '{"tags":["tag:hostinger"]}')
+          echo "set-tags http=$HTTP $(cat .api_body 2>/dev/null || true)"
+
+          # 2. Disable node key expiry (documented recovery for expired keys).
+          HTTP=$(api POST "/device/$NODE_ID/key" '{"keyExpiryDisabled": true}')
+          echo "key-expiry-disable http=$HTTP $(cat .api_body 2>/dev/null || true)"
+
+          if [ "$HTTP" != "200" ]; then
+            echo ""
+            echo "API path refused (actor lacks devices:core or tag ownership)."
+            echo "The node key must be renewed from the Tailscale admin console"
+            echo "(login.tailscale.com/admin/machines -> VPS -> reauthenticate/"
+            echo "disable key expiry) or with an API token that has devices:core."
+            exit 1
+          fi
 
       - name: Wait for VPS to rejoin the tailnet
         run: |
