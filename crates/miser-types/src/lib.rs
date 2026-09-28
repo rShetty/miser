@@ -1,3 +1,9 @@
+// Kani proof harnesses for the wire types -- the gateway's trust boundary.
+// `#[cfg(kani)]` keeps them out of normal builds; the cfg name is declared in
+// Cargo.toml under `[lints.rust] unexpected_cfgs`.
+#[cfg(kani)]
+mod kani_proofs;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -11,9 +17,44 @@ pub enum MessageContent {
     Parts(Vec<ContentPart>),
 }
 
+/// One entry of a structured `content` array.
+///
+/// The unknown arm holds the part's JSON verbatim. It used to be a bare
+/// `#[serde(other)]` unit variant, which is a decoder-only escape hatch: an
+/// internally tagged *unit* variant has nowhere to put the original, so the
+/// `type` tag and every field on the part were dropped and it was re-serialised
+/// as `{"type":"Other"}`. Every part outside the four shapes below -- `file`,
+/// `input_file`, `document`, `video_url`, Anthropic `thinking`/`tool_use`,
+/// Gemini `inline_data` -- therefore reached the upstream provider as that,
+/// which is silent request corruption rather than the pass-through LLD section 2
+/// promises for provider-specific fields.
+///
+/// `Deserialize` is hand-written rather than derived, to make "unrecognised means
+/// verbatim" structural. A derived `#[serde(untagged)]` over an internally tagged
+/// inner enum also accepts serde's *sequence* form, where element 0 is the tag --
+/// and there an integer tag is read as a variant **index**. So `content:
+/// [[0, ""]]` decoded to `Text { text: "" }` and was forwarded as
+/// `{"type":"text","text":""}`: a malformed part silently replaced by a
+/// different, well-formed one. That is the same defect class as the
+/// `{"type":"Other"}` rewrite, found by a generated input rather than by reading.
+/// The rule enforced below is simply: a part is `Known` only if it is an object
+/// whose `type` is one of the four strings below, and `Other` otherwise,
+/// unchanged.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum ContentPart {
+    /// A part shape this build models. The `type` tag survives a round trip.
+    Known(KnownContentPart),
+    /// Any other part, byte-for-byte as it arrived.
+    Other(Value),
+}
+
+/// The content-part shapes this build understands explicitly. Text is the only
+/// one with behaviour attached (`to_text`); the rest are modelled so they are
+/// forwarded recognisably rather than flattened into [`ContentPart::Other`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
-pub enum ContentPart {
+pub enum KnownContentPart {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image_url")]
@@ -22,8 +63,42 @@ pub enum ContentPart {
     InputAudio { input_audio: Value },
     #[serde(rename = "refusal")]
     Refusal { refusal: String },
-    #[serde(other)]
-    Other,
+}
+
+impl<'de> Deserialize<'de> for ContentPart {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Same shape as `deserialize_content` above: go through `Value` so the
+        // unknown arm can hold the original untouched.
+        let original = Value::deserialize(deserializer)?;
+        let name = original
+            .as_object()
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str);
+
+        let known = match name {
+            Some("text" | "image_url" | "input_audio" | "refusal") => {
+                serde_json::from_value::<KnownContentPart>(original.clone()).ok()
+            }
+            _ => None,
+        };
+        Ok(match known {
+            Some(known) => ContentPart::Known(known),
+            None => ContentPart::Other(original),
+        })
+    }
+}
+
+impl KnownContentPart {
+    /// The text of this part, if it carries any.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            KnownContentPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        }
+    }
 }
 
 impl MessageContent {
@@ -39,8 +114,10 @@ impl MessageContent {
             MessageContent::Parts(parts) => parts
                 .iter()
                 .filter_map(|part| match part {
-                    ContentPart::Text { text } => Some(text.clone()),
-                    _ => None,
+                    ContentPart::Known(known) => known.text().map(str::to_string),
+                    // An unmodelled part may still be textual, but this build
+                    // cannot tell, so it contributes nothing to the text.
+                    ContentPart::Other(_) => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -623,8 +700,22 @@ pub struct RoutingBands {
     pub simple_max: f64,
     #[serde(default = "default_standard_max")]
     pub standard_max: f64,
+    /// Upper bound of the `hard` band. Added because there was no bound for it:
+    /// `Hard` was the "everything above `reasoning_max`" fallthrough, which put
+    /// it *above* the Reasoning band in price and therefore *below* it in tier
+    /// strength. The ladder was inverted for the top two tiers — a $1.40 model
+    /// was banded Reasoning while a $2.00 model was banded Hard — and
+    /// `prefer_reasoning_pin` existed only to patch the consequence.
+    #[serde(default = "default_hard_max")]
+    pub hard_max: f64,
     #[serde(default = "default_reasoning_max")]
     pub reasoning_max: f64,
+}
+
+/// Geometric midpoint between the `hard` and `reasoning` anchor models
+/// (glm-5.2 $0.65 and claude-sonnet-4 $3.00): sqrt(0.65 * 3.0) ~= 1.40.
+fn default_hard_max() -> f64 {
+    1.4
 }
 
 fn default_trivial_max() -> f64 {
@@ -636,8 +727,11 @@ fn default_simple_max() -> f64 {
 fn default_standard_max() -> f64 {
     0.36
 }
+/// The top anchor. Anything above this is still `Reasoning` -- there is nothing
+/// stronger to promote it to -- but the bound exists so the ladder stays
+/// strictly increasing and the ordering check has something to verify.
 fn default_reasoning_max() -> f64 {
-    1.4
+    3.0
 }
 
 impl Default for RoutingBands {
@@ -646,6 +740,7 @@ impl Default for RoutingBands {
             trivial_max: default_trivial_max(),
             simple_max: default_simple_max(),
             standard_max: default_standard_max(),
+            hard_max: default_hard_max(),
             reasoning_max: default_reasoning_max(),
         }
     }
@@ -747,6 +842,17 @@ pub struct QualityConfig {
     pub enabled: bool,
     #[serde(default = "default_quality_threshold")]
     pub minimum_score: f32,
+    /// Retry a low-scoring answer against a stronger tier.
+    ///
+    /// The serde default and `QualityConfig::default()` disagreed here: serde
+    /// gave `false` and `Default` gave `true`. Both are unobservable while
+    /// `enabled` is false, so the only place it showed was a config that names
+    /// `[quality]` with `enabled = true` and omits this key -- there the field
+    /// silently became `false` and the documented escalation never ran, while
+    /// dropping the whole table yielded `true`. Naming a table changed the
+    /// meaning of a key inside it. Aligned on `false`: a second, separately
+    /// billed upstream call should be something an operator asks for, not
+    /// something that appears because a heading was typed.
     #[serde(default)]
     pub escalate_on_failure: bool,
     #[serde(default)]
@@ -760,7 +866,7 @@ impl Default for QualityConfig {
         Self {
             enabled: false,
             minimum_score: 0.7,
-            escalate_on_failure: true,
+            escalate_on_failure: false,
             judge: None,
             extra: ExtraFields::new(),
         }
@@ -901,6 +1007,49 @@ mod tests {
         assert_eq!(serde_json::to_value(&message).unwrap(), tool);
     }
 
+    /// The point of modelling a part at all is to be able to hand it back to
+    /// the provider unchanged. An unmodelled part used to round-trip as
+    /// `{"type":"Other"}` -- tag and payload both gone -- so a `file` or
+    /// `tool_use` part silently became garbage on the way upstream while the
+    /// client got a cheerful 200.
+    #[test]
+    fn an_unmodelled_content_part_survives_a_round_trip_verbatim() {
+        let original = json!([
+            {"type":"text","text":"look at this"},
+            {"type":"file","file":{"file_data":"BASE64==","filename":"a.pdf"}},
+            {"type":"thinking","thinking":"hmm","signature":"abc"},
+            {"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}
+        ]);
+        let parts: Vec<ContentPart> = serde_json::from_value(original.clone()).unwrap();
+        let re_encoded = serde_json::to_value(&parts).unwrap();
+        assert_eq!(
+            re_encoded, original,
+            "an unmodelled part must be forwarded exactly as it arrived"
+        );
+    }
+
+    /// A known part keeps its `type` tag on the way out too -- an untagged
+    /// representation would make every part unparseable to the provider.
+    #[test]
+    fn a_known_content_part_keeps_its_type_tag_when_re_encoded() {
+        let original = json!([{"type":"text","text":"hello"}]);
+        let parts: Vec<ContentPart> = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parts).unwrap(), original);
+    }
+
+    /// `to_text` must ignore an unmodelled part rather than panic on it, and
+    /// still return the text parts around it.
+    #[test]
+    fn text_extraction_skips_unmodelled_parts_without_panicking() {
+        let content: MessageContent = serde_json::from_value(json!([
+            {"type":"text","text":"before"},
+            {"type":"file","file":{"file_data":"BASE64=="}},
+            {"type":"text","text":"after"}
+        ]))
+        .unwrap();
+        assert_eq!(content.to_text(), "before\nafter");
+    }
+
     #[test]
     fn content_parts_decode_known_and_unknown_types() {
         let parts: Vec<ContentPart> = serde_json::from_value(json!([
@@ -910,18 +1059,24 @@ mod tests {
             {"type":"hologram","density":3}
         ]))
         .unwrap();
-        assert!(matches!(parts[0], ContentPart::Text { .. }));
+        assert!(matches!(
+            parts[0],
+            ContentPart::Known(KnownContentPart::Text { .. })
+        ));
         match &parts[1] {
-            ContentPart::ImageUrl { image_url } => {
+            ContentPart::Known(KnownContentPart::ImageUrl { image_url }) => {
                 assert_eq!(image_url.url, "https://x/img.png");
                 assert_eq!(image_url.detail.as_deref(), Some("high"));
                 assert_eq!(image_url.extra["dpi"], 144);
             }
             other => panic!("unexpected part: {other:?}"),
         }
-        assert!(matches!(parts[2], ContentPart::Refusal { .. }));
+        assert!(matches!(
+            parts[2],
+            ContentPart::Known(KnownContentPart::Refusal { .. })
+        ));
         // Parts the gateway does not know must not fail the client request.
-        assert!(matches!(parts[3], ContentPart::Other));
+        assert!(matches!(parts[3], ContentPart::Other(_)));
 
         let text: MessageContent = serde_json::from_value(json!("hello")).unwrap();
         assert_eq!(text, MessageContent::Text("hello".into()));
@@ -1160,10 +1315,14 @@ mod tests {
         let quality: QualityConfig = toml::from_str("").unwrap();
         assert!(!quality.enabled);
         assert!((quality.minimum_score - 0.7).abs() < 1e-6);
-        // Serde default (bool::default) — note the divergence from
-        // QualityConfig::default(), which sets this to true.
         assert!(!quality.escalate_on_failure);
         assert!(quality.judge.is_none());
+        // Naming the table must not change the meaning of a key inside it.
+        assert_eq!(
+            serde_json::to_value(QualityConfig::default()).unwrap()["escalate_on_failure"],
+            serde_json::to_value(&quality).unwrap()["escalate_on_failure"],
+            "serde default and Default::default() must agree"
+        );
 
         let cache: CacheConfig = toml::from_str("").unwrap();
         assert!(cache.enabled);
