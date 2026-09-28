@@ -1403,6 +1403,59 @@ mod tests {
         }
     }
 
+    /// `has_multi_step_intent` matches `<something> <anything> and <verb>`, with
+    /// the verb drawn from a fixed list.
+    ///
+    /// This is a unit test rather than an integration test because the tier the
+    /// function feeds is *not* a function of it. "read the config and update the
+    /// port" matches here and classifies as Standard; "run and report" does not
+    /// match and classifies as Hard, because the heuristic has its own keyword
+    /// tiers. An integration test asserting "multi-step implies Hard" passes for
+    /// the wrong reasons and would not survive a change to the keywords.
+    ///
+    /// Previously untested, which is why `has_multi_step_intent -> false`
+    /// survived mutation testing: nothing pinned the regex to a string that must
+    /// match.
+    #[test]
+    fn multi_step_intent_matches_a_genuine_two_step_request() {
+        for prompt in [
+            "run the tests and report the results",
+            "build the binary and deploy it",
+            "read the config and update the port",
+            "check the logs and rollback the deploy",
+            "fix it and verify",
+            "create a branch and push it",
+            "stop the server and start it again",
+        ] {
+            assert!(
+                has_multi_step_intent(prompt),
+                "{prompt:?} is a two-step request and should be detected"
+            );
+        }
+    }
+
+    /// ...and the near-misses, so a regex that matched everything would fail.
+    ///
+    /// "run and report" is the interesting one: it *looks* like it has the
+    /// shape, but there is no content before "and", so it is a single step.
+    #[test]
+    fn multi_step_intent_rejects_a_single_step_request() {
+        for prompt in [
+            "summarise this document",
+            "what does this function do",
+            "and then what",
+            "run and report",
+            "please help",
+            "hello there",
+            "report the results",
+        ] {
+            assert!(
+                !has_multi_step_intent(prompt),
+                "{prompt:?} is a single step and should not be detected"
+            );
+        }
+    }
+
     /// P17: no tier is omitted from `rank_of`, and every tier the classifier can
     /// produce is one of the five in the ladder.
     ///

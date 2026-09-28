@@ -453,7 +453,7 @@ fn next_returns_the_configured_route_for_the_escalated_tier() {
 /// visible: every quality escalation out of the Hard tier is a full-price call
 /// that buys nothing.
 #[test]
-#[ignore = "config defect, not a code defect: [tiers.hard] and [tiers.reasoning] both route to z-ai/glm-5.3. See issue #85. The fix is a stronger reasoning model (a cost decision) or refusing to escalate into a duplicate route; either way it is not a test bug."]
+#[ignore = "config defect, not a code defect: [tiers.hard] and [tiers.reasoning] both route to z-ai/glm-5.3. See issue #84. The fix is a stronger reasoning model (a cost decision) or refusing to escalate into a duplicate route; either way it is not a test bug."]
 fn escalation_is_not_a_paid_no_op() {
     let config = config();
     let parents = [
@@ -548,7 +548,7 @@ const SHORT_PROSE: &str = "here is a short answer with no code in it at all";
 /// behaviour-preserving *today*, but it couples the operands to "```" remaining
 /// in the chain: drop that one later and the shell/bash checks silently become
 /// live again. Kept, and documented, rather than quietly deleted. Tracked in
-/// issue #85.
+/// issue #84.
 #[test]
 fn each_code_marker_alone_satisfies_the_has_code_gate() {
     // Every marker, on its own, must be enough. The whole chain is an `or`, so
