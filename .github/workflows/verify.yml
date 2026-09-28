@@ -47,6 +47,19 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Lint workflow files
+        # An invalid workflow file is a run that reports `failure` with *zero
+        # jobs*. There is no failing step to read, so it is easy to misread as
+        # a flaky infrastructure failure and re-run instead of fixing. It
+        # happened here: interpolating a shell variable into a GitHub
+        # expression (`${{ steps.${step}.outcome }}`) is not valid expression
+        # syntax, the whole file failed to validate, and the run looked like a
+        # repo problem rather than a config problem.
+        #
+        # Linting it here makes it a fast, blocking, readable failure instead.
+        run: |
+          curl -sSfL --max-time 120 https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash -s -- 1.7.12
+          ./actionlint
       - name: Build with warnings denied
         # `cargo build` has no `--` passthrough for rustc flags -- only
         # `cargo clippy` and `cargo rustc` do. Written the obvious way, this
@@ -100,7 +113,17 @@ jobs:
   # -------------------------------------------------------------- nightly ----
 
   kani:
-    name: Kani proof harnesses
+    name: Kani ${{ matrix.crate }}
+    strategy:
+      # Not `true`. The default cancels sibling jobs the moment one fails, which
+      # is precisely how 0.68.0's ICE on miser-classifier suppressed
+      # miser-types and left us with no result for either.
+      fail-fast: false
+      matrix:
+        # Only crates that actually have `#[kani::proof]` functions. A crate
+        # without them exits 0 and shows a green row that verified nothing --
+        # miser-policy was in this list until it was caught doing that.
+        crate: [miser-types, miser-classifier]
     # Only on x86_64. Kani has no aarch64 Linux build, which is why these
     # harnesses cannot be executed on every development machine.
     runs-on: ubuntu-latest
@@ -137,24 +160,18 @@ jobs:
       # miser-classifier, and a hard failure there meant the crate we could not
       # prove was never attempted, so a single upstream bug hid every result
       # this job exists to produce. Same reasoning as dropping `needs:` above.
-      - name: Prove miser-types
-        id: kani_types
-        continue-on-error: true
-        run: bash ci/kani-prove.sh miser-types
-      - name: Prove miser-classifier
-        id: kani_classifier
-        continue-on-error: true
-        run: bash ci/kani-prove.sh miser-classifier
-      - name: Gate
-        run: |
-          failed=0
-          for step in kani_types kani_classifier; do
-            if [ "${{ steps.${step}.outcome }}" != "success" ]; then
-              echo "::error title=Kani::$step did not produce passing proofs"
-              failed=1
-            fi
-          done
-          exit $failed
+      # The script is what guarantees a run means something; the matrix is what
+      # guarantees we find out. `fail-fast: false` lets both crates be attempted
+      # even when one fails, so an upstream ICE in one crate cannot hide the
+      # other's result -- each is a separate job with its own conclusion, which
+      # a single job with sequential steps cannot give you.
+      #
+      # (The previous version aggregated with a shell loop that interpolated a
+      # shell variable into a GitHub expression. The expression language has no
+      # shell interpolation, so the workflow failed to validate and ran zero
+      # jobs while reporting `failure`.)
+      - name: Prove
+        run: bash ci/kani-prove.sh '${{ matrix.crate }}'
       # No `miser-policy` step. It ran `cargo kani -p miser-policy`, and that
       # crate has no `#[kani::proof]` functions -- so it exited 0 and the run
       # list showed a third green verification layer that verified nothing.
