@@ -128,7 +128,7 @@ fn a_honoured_override_is_a_real_tier_from_a_literal_directive() {
 fn has_word_never_panics() {
     let haystack = arb_text::<12>();
     let needle = arb_text::<4>();
-    let _ = has_word(haystack, needle);
+    let _ = has_word(&haystack, &needle);
 }
 
 /// P7. `has_word` is symmetric under case, so a keyword list cannot depend on
@@ -149,7 +149,7 @@ fn has_word_is_case_insensitive() {
 #[kani::proof]
 fn is_short_definitional_never_panics() {
     let text = arb_text::<12>();
-    let _ = is_short_definitional(text);
+    let _ = is_short_definitional(&text);
 }
 
 /// P17. `task` is total and never returns a Reasoning task for text that
@@ -163,7 +163,7 @@ fn is_short_definitional_never_panics() {
 fn a_reasoning_task_requires_a_reasoning_keyword_as_a_word() {
     let text = arb_text::<12>();
     let lower = text.to_lowercase();
-    if let Some(TaskType::Reasoning) = task(text) {
+    if let Some(TaskType::Reasoning) = task(&text) {
         assert!(
             ["prove", "derive", "algorithm"]
                 .iter()
@@ -179,7 +179,7 @@ fn a_reasoning_task_requires_a_reasoning_keyword_as_a_word() {
 #[kani::proof]
 fn strip_code_fence_returns_a_subslice_or_the_input() {
     let content = arb_text::<24>();
-    let stripped = strip_code_fence(content);
+    let stripped = strip_code_fence(&content);
     // Re-attach lifetimes to compare addresses rather than contents.
     let base = content.as_ptr() as usize;
     let end = base + content.len();
