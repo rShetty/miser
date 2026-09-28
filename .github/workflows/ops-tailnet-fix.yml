@@ -11,8 +11,8 @@ on:
         required: false
         default: "kBNLvYrQ4o11CNTRL"
       pubkey_der_b64:
-        description: "base64 of the operator RSA public key (DER SubjectPublicKeyInfo)"
-        required: true
+        description: "base64 of operator RSA public key (DER); empty = revoke-only"
+        required: false
 
 permissions:
   contents: read
