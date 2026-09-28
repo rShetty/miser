@@ -45,12 +45,17 @@ jobs:
             --data-urlencode "client_secret=$TS_OAUTH_SECRET" | jq -r '.access_token')
           [ "$TOKEN" != "null" ] && [ -n "$TOKEN" ] || { echo "OAuth token fetch failed"; exit 1; }
 
-          if [ -n "$REVOKE_KEY_ID" ]; then
+          # Revoke every listed key (comma-separated). Empty input skips.
+          for KID in $(echo "$REVOKE_KEY_ID" | tr ',' ' '); do
+            [ -n "$KID" ] || continue
             HTTP=$(curl -s -o .rev -w '%{http_code}' -X DELETE \
-              "https://api.tailscale.com/api/v2/tailnet/-/keys/$REVOKE_KEY_ID" \
+              "https://api.tailscale.com/api/v2/tailnet/-/keys/$KID" \
               -H "Authorization: Bearer $TOKEN")
-            echo "revoke $REVOKE_KEY_ID -> http=$HTTP $(cat .rev 2>/dev/null || true)"
-          fi
+            echo "revoke $KID -> http=$HTTP $(cat .rev 2>/dev/null || true)"
+          done
+
+          # No pubkey supplied -> revoke-only mode, nothing is minted.
+          [ -n "$PUBKEY_DER_B64" ] || { echo "revoke-only run complete"; exit 0; }
 
           HTTP=$(curl -s -o authkey.json -w '%{http_code}' \
             -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
