@@ -71,18 +71,15 @@ jobs:
             | @tsv' devices.json
           echo "====================================="
 
-          # The runner ALSO joins as tag:hostinger (ephemeral, brand-new,
-          # connected). The VPS is the long-lived tagged node that is offline
-          # (expired node key) -- select exactly that one. Beware: the runner's
-          # own nodeId churns every run, so a name/hostname match alone picks
-          # the wrong node and every mutation 403s.
-          NOW=$(date -u +%s)
-          NODE_ID=$(jq -r --argjson now "$NOW" '
+          # The runner ALSO joins the tailnet (ephemeral, tagged). The VPS is
+          # the long-lived Linux node -- srv1542935 in this tailnet -- whose
+          # node key expired 2026-09-28T13:07Z. The personal devices
+          # (macbooks, iphone) are neither linux nor ephemeral-runner, so
+          # "non-ephemeral + linux" isolates exactly the VPS.
+          NODE_ID=$(jq -r '
             [ .devices[]
-            | select(((.tags // []) | index("tag:hostinger")))
             | select(((.isEphemeral // false) | not))
-            | select(((.connectedToControl // false) | not))
-            | select((.created | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) < ($now - 600))
+            | select(.os == "linux")
             | .nodeId ]
             | if length == 1 then .[0]
               elif length == 0 then ""
